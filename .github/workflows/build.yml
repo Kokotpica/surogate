@@ -1,0 +1,65 @@
+name: Build
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - release-*
+      - dev
+  pull_request:
+    branches:
+      - master
+      - dev
+
+jobs:
+  build:
+    name: Build wheel (${{ matrix.compiler.name }})
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+    strategy:
+      matrix:
+        compiler:
+          - name: gcc
+            cc: gcc-13
+            cxx: g++-13
+            packages: gcc-13 g++-13
+          - name: clang
+            cc: clang-18
+            cxx: clang++-18
+            packages: clang-18 clang-tools-18
+          - name: legacy
+            cc: gcc-12
+            cxx: g++-12
+            packages: gcc-12 g++-12
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_C_COMPILER: ${{ matrix.compiler.cc }}
+      CMAKE_CXX_COMPILER: ${{ matrix.compiler.cxx }}
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CMAKE_CUDA_COMPILER_LAUNCHER: ccache
+      CUDAARCHS: "89"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: apt update && apt install -y git ${{ matrix.compiler.packages }}
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.compiler.name }}-build
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.compiler.name }}
+          path: dist/*.whl

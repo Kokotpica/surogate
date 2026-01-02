@@ -1,0 +1,276 @@
+import sys
+import time
+from typing import List, Optional, Tuple
+
+import numpy as np
+
+from surogate import _surogate
+from surogate.core.config.sft_config import SFTConfig
+from surogate.train.lr_schedule import LRSchedule
+from surogate.train.reporter import training_logger_context
+from surogate.utils.hf import get_model_weights_path, resolve_model_path
+from surogate.utils.logger import get_logger
+from surogate.utils.tensor import to_surogate_dtype
+
+logger = get_logger()
+
+
+class SurogateTrainerWrapper():
+    def __init__(
+            self,
+            config: SFTConfig,
+            train_files: List[str],
+            eval_files: Optional[List[str]] = None
+    ):
+        self.config = config
+
+        model_dir = resolve_model_path(config.model)
+        model_weights_path = get_model_weights_path(model_dir)
+
+        # Setup data loaders
+        self.total_batch_size = config.per_device_train_batch_size * config.sequence_len * config.gpus * config.gradient_accumulation_steps
+        self.chunk_size = config.per_device_train_batch_size * config.sequence_len * config.gpus
+
+        self.train_loader = _surogate.DataLoader(train_files, self.chunk_size, seed=config.train_seed)
+        self.eval_loader = _surogate.DataLoader(eval_files, self.chunk_size,
+                                                seed=config.eval_seed) if eval_files else None
+
+        # Calculate steps
+        self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size
+
+        # Create trainer
+        self.start_step = 0
+        if config.resume_from_checkpoint:
+            self.start_step = _surogate.find_latest_checkpoint(config.checkpoint_dir)
+            if self.start_step >= 0:
+                self.trainer = _surogate.SurogateTrainer(
+                    ngpu=config.gpus,
+                    config=_surogate.PretrainedConfig.from_pretrained(model_dir, config.model_dtype),
+                    options=config.runtime_config,
+                    batch_size=config.per_device_train_batch_size,
+                    seq_len=config.sequence_len,
+                    grad_accum=config.gradient_accumulation_steps,
+                    memcpy_all_gather=config.memcpy_all_gather,
+                    memcpy_send_recv=config.memcpy_send_recv,
+                    lora_config=config.lora_config,
+                    qlora_config=config.qlora_config
+                )
+                logger.info(f"Loading checkpoint from step {self.start_step}...")
+                self.trainer.load_checkpoint(str(config.checkpoint_dir), self.start_step)
+            else:
+                logger.error("No checkpoint found to resume from.")
+                sys.exit(1)
+        elif config.lora_rank and config.lora_alpha and config.lora_target_modules:
+            self.trainer = _surogate.SurogateTrainer(
+                ngpu=config.gpus,
+                config=_surogate.PretrainedConfig.from_pretrained(model_dir, to_surogate_dtype(config.torch_dtype)),
+                options=config.runtime_config,
+                batch_size=config.per_device_train_batch_size,
+                seq_len=config.sequence_len,
+                grad_accum=config.gradient_accumulation_steps,
+                memcpy_all_gather=config.memcpy_all_gather,
+                memcpy_send_recv=config.memcpy_send_recv,
+                lora_config=config.lora_config,
+                qlora_config=config.qlora_config
+            )
+            self.trainer.import_weights(model_weights_path)
+        else:
+            self.trainer = _surogate.SurogateTrainer.from_pretrained(
+                name=model_dir,
+                ngpu=config.gpus,
+                dtype=to_surogate_dtype(config.torch_dtype),
+                options=config.runtime_config,
+                batch_size=config.per_device_train_batch_size,
+                seq_len=config.sequence_len,
+                grad_accum=config.gradient_accumulation_steps,
+                memcpy_all_gather=config.memcpy_all_gather,
+                memcpy_send_recv=config.memcpy_send_recv
+            )
+
+        # Determine max_steps
+        if config.max_steps > 0:
+            self.max_steps = config.max_steps
+        else:
+            self.max_steps = self.steps_per_epoch * self.config.num_epochs
+            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
+
+        # Setup learning rate schedule
+        self.lr_schedule = LRSchedule(
+            base_lr=config.learning_rate,
+            max_steps=self.max_steps,
+            warmup_steps=config.warmup_steps,
+            cooldown_steps=config.cooldown_steps,
+            final_lr=config.learning_rate * config.final_lr_fraction,
+            schedule_type=config.lr_scheduler_type
+        )
+
+    def train(self):
+        with training_logger_context(self.config) as train_logger:
+            # Log dataset information
+            if self.eval_loader:
+                train_logger.log_dataset(self.train_loader, self.eval_loader)
+
+            # Log allocator stats
+            for idx in range(self.config.gpus):
+                alloc_info = self.trainer.get_allocator_info(idx)
+                train_logger.log_allocator(alloc_info)
+
+            # Calculate expected time per token for speed-of-light estimation
+            train_logger.set_expected_time_per_token(self.trainer)
+
+            # Print training info
+            logger.info(f"Starting training from step {self.start_step}...")
+            logger.info(f"Recipe: {self.config.recipe}")
+            logger.info(f"Total batch size: {self.total_batch_size} tokens")
+            logger.info(f"Steps per epoch: {self.steps_per_epoch}")
+            logger.info(f"Max steps: {self.max_steps}")
+            logger.info(
+                f"LR schedule: {self.config.lr_scheduler_type} (warmup={self.config.warmup_steps}, cooldown={self.config.cooldown_steps})")
+
+            # Print LoRA info if enabled
+            if self.config.lora and self.config.lora_config:
+                logger.info(f"LoRA enabled:")
+                logger.info(f"  Rank: {self.config.lora_config.rank}")
+                logger.info(f"  Alpha: {self.config.lora_config.alpha}")
+                logger.info(f"  Scaling: {self.config.lora_config.scaling:.4f}")
+                logger.info(f"  DType: {self.config.lora_dtype}")
+                logger.info(f"  Target modules: {self.config.lora_config.target_modules}")
+                if self.config.qlora_fp8:
+                    logger.info(f"  QLoRA-FP8 enabled: block_size={self.config.qlora_block_size}")
+                elif self.config.qlora_fp4:
+                    logger.info(f"  QLoRA-FP4 enabled: NVFP4 (E2M1)")
+                logger.info("Note: Base model weights are frozen, only LoRA adapters will be trained")
+
+            self.run_training_loop(train_logger)
+
+            # Final evaluation
+            if self.eval_loader and self.config.final_eval_num_steps != 0:
+                logger.info("\nRunning final evaluation...")
+                in_tokens = np.empty(
+                    (self.config.gpus * self.config.per_device_eval_batch_size, self.config.sequence_len),
+                    dtype=np.int32)
+                out_tokens = np.empty(
+                    (self.config.gpus * self.config.per_device_eval_batch_size, self.config.sequence_len),
+                    dtype=np.int32)
+
+                final_eval_steps = self.eval_loader.num_chunks if self.config.final_eval_num_steps < 0 else self.config.final_eval_num_steps
+                final_loss, elapsed_ms = self.run_evaluation(in_tokens, out_tokens, final_eval_steps)
+                logger.info(f"Final validation loss: {final_loss:.4f}")
+                train_logger.log_eval(self.max_steps, self.config.num_epochs,
+                                      final_eval_steps * self.chunk_size, elapsed_ms, final_loss)
+
+            # Save final model
+            if self.config.lora:
+                # Export LoRA adapter in PEFT-compatible format
+                adapter_dir = self.config.output_dir / "adapter"
+                logger.info(f"Saving LoRA adapter to {adapter_dir}...")
+                adapter_dir.mkdir(parents=True, exist_ok=True)
+                self.trainer.export_adapter(str(adapter_dir))
+                logger.info("done")
+                logger.info(f"LoRA adapter saved to {adapter_dir}")
+                logger.info("To use with HuggingFace PEFT, load the base model and apply this adapter.")
+            else:
+                logger.info(f"Saving model to {self.config.output_dir}...")
+                self.trainer.export_model(str(self.config.output_dir))
+                logger.info("done")
+
+            logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
+
+    def run_training_loop(self, train_logger: _surogate.TrainingRunLogger):
+        # Allocate token buffers
+        in_tokens = np.empty((self.config.gpus * self.config.per_device_train_batch_size, self.config.sequence_len),
+                             dtype=np.int32)
+        out_tokens = np.empty((self.config.gpus * self.config.per_device_train_batch_size, self.config.sequence_len),
+                              dtype=np.int32)
+
+        # Preload first batch
+        self.train_loader.load_batch(in_tokens, out_tokens)
+
+        # Training loop
+        for step in range(self.start_step, self.max_steps):
+            # Check if we need to advance epoch
+            if not self.train_loader.has_next(self.config.gradient_accumulation_steps):
+                self.train_loader.advance_epoch()
+                self.train_loader.load_batch(in_tokens, out_tokens)
+
+            # Periodic evaluation (before training step)
+            if self.eval_loader and self.config.eval_steps > 0 and step % self.config.eval_steps == 0 and step > self.start_step:
+                val_loss, elapsed_ms = self.run_evaluation(in_tokens, out_tokens, self.config.eval_num_steps)
+                epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
+                eval_tokens = self.config.eval_num_steps * self.config.per_device_eval_batch_size * self.config.sequence_len * self.config.gpus
+                train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
+
+            # Periodic checkpointing (before training step)
+            if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
+                logger.info(f"Saving checkpoint to {self.config.checkpoint_dir}...")
+                self.trainer.save_checkpoint(self.config.checkpoint_dir, step)
+
+                # Clean old checkpoints
+                if self.config.save_total_limit > 0:
+                    removed = _surogate.clean_old_checkpoints(self.config.checkpoint_dir, self.config.save_total_limit,
+                                                              -1)
+                    if removed:
+                        logger.info(
+                            f"Removed {removed} old checkpoints, keeping the most recent {self.config.save_total_limit}")
+
+            # Training step
+            step_start = time.time()
+
+            for micro_step in range(self.config.gradient_accumulation_steps):
+                self.trainer.step(in_tokens, out_tokens)
+                if self.train_loader.has_next():
+                    self.train_loader.load_batch(in_tokens, out_tokens)
+
+            # Log GPU utilization
+            if self.config.log_gpu_util > 0 and step % self.config.log_gpu_util == 0:
+                infos = self.trainer.get_gpu_info()
+                for i, info in enumerate(infos):
+                    train_logger.log_gpu_state(step, i, info)
+
+            # Optimizer update
+            lr = self.lr_schedule.get_lr(step)
+            result = self.trainer.update(
+                lr, self.config.adamw_beta1, self.config.adamw_beta2, step + 1,
+                self.config.adamw_epsilon, self.config.weight_decay, self.config.max_grad_norm
+            )
+
+            step_time = time.time() - step_start
+            elapsed_ms = int(step_time * 1000)
+
+            # Log training step
+            tokens_processed = self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gradient_accumulation_steps * self.config.gpus
+            epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
+            train_logger.log_step(step, epoch, tokens_processed, elapsed_ms,
+                                  result['norm'], result['loss'], lr)
+
+    def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, max_steps: int) -> Tuple[float, float]:
+        """
+        Run evaluation on test set.
+        Args:
+            in_tokens (np.ndarray): Input token buffer.
+            out_tokens (np.ndarray): Output token buffer.
+            max_steps (int): Maximum number of eval batches to process.
+        Returns:
+            Tuple of (mean_loss, elapsed_ms)
+        """
+        if max_steps == 0:
+            return 0.0, 0
+
+        start_time = time.time()
+        self.eval_loader.set_state(self.eval_loader.seed, 0, 0, 0)
+        total_loss = 0.0
+        batches = 0
+
+        # Determine effective max batches
+        effective_max = self.eval_loader.num_chunks if max_steps < 0 else max_steps
+        while batches < effective_max and batches < self.eval_loader.num_chunks:
+            self.eval_loader.load_batch(in_tokens, out_tokens)
+            loss = self.trainer.validate(in_tokens, out_tokens)
+            total_loss += loss
+            batches += 1
+
+        if batches == 0:
+            logger.warning("Insufficient validation data")
+            return 0.0, 0
+
+        return total_loss / batches, int((time.time() - start_time) * 1000)

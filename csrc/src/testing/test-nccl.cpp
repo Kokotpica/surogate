@@ -1,0 +1,354 @@
+// Copyright (c) 2026, Invergent SA, developed by Flavius Burca
+// SPDX-License-Identifier: Apache-2.0
+//
+// Unit tests for NCCL (NVIDIA Collective Communications Library) functionality
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
+
+#include <vector>
+#include <numeric>
+#include <cstring>
+
+#include <cuda_runtime.h>
+
+#include "utilities/comm.h"
+
+namespace {
+
+// Check if NCCL communication is available (CUDA + proper driver version + NCCL)
+// Returns true only if the full stack works
+bool nccl_available() {
+    static bool checked = false;
+    static bool available = false;
+    
+    if (!checked) {
+        checked = true;
+        try {
+            // Try to run a minimal NCCL operation
+            NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+                available = true;
+            });
+        } catch (...) {
+            available = false;
+        }
+    }
+    return available;
+}
+
+// Check if CUDA is available (basic check)
+bool cuda_available() {
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    return err == cudaSuccess && device_count > 0;
+}
+
+// Get number of available CUDA devices
+int get_cuda_device_count() {
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    return device_count;
+}
+
+} // anonymous namespace
+
+// =============================================================================
+// Basic NCCL Availability Tests
+// =============================================================================
+
+TEST_CASE("CUDA device availability", "[nccl][cuda][basic]") {
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    
+    INFO("CUDA device count: " << device_count);
+    INFO("CUDA error: " << cudaGetErrorString(err));
+    
+    if (err != cudaSuccess || device_count == 0) {
+        SKIP("No CUDA devices available");
+    }
+    
+    REQUIRE(device_count > 0);
+}
+
+TEST_CASE("NCCL communicator can be created with single GPU", "[nccl][basic]") {
+    if (!cuda_available()) {
+        SKIP("CUDA not available");
+    }
+    
+    bool communicator_created = false;
+    
+    try {
+        NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+            communicator_created = true;
+            REQUIRE(comm.rank() == 0);
+            REQUIRE(comm.world_size() == 1);
+        });
+    } catch (const std::exception& e) {
+        INFO("Exception: " << e.what());
+        SKIP("NCCL initialization failed");
+    }
+    
+    REQUIRE(communicator_created == true);
+}
+
+TEST_CASE("NCCL communicator properties with single GPU", "[nccl][basic]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        REQUIRE(comm.rank() == 0);
+        REQUIRE(comm.world_size() == 1);
+        REQUIRE(comm.stream() != nullptr);
+    });
+}
+
+// =============================================================================
+// Multi-GPU NCCL Tests (if multiple GPUs available)
+// =============================================================================
+
+TEST_CASE("NCCL communicator with multiple GPUs", "[nccl][multi-gpu]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    int num_gpus = get_cuda_device_count();
+    if (num_gpus < 2) {
+        SKIP("Need at least 2 GPUs for multi-GPU tests");
+    }
+    
+    // Test with 2 GPUs
+    int test_gpus = std::min(num_gpus, 2);
+    std::vector<int> ranks_seen(test_gpus, 0);
+    
+    NCCLCommunicator::run_threads_communicators(test_gpus, false, false, [&](NCCLCommunicator& comm) {
+        int rank = comm.rank();
+        int world = comm.world_size();
+        
+        REQUIRE(world == test_gpus);
+        REQUIRE(rank >= 0);
+        REQUIRE(rank < world);
+        
+        ranks_seen[rank] = 1;
+    });
+    
+    // Verify all ranks were created
+    for (int i = 0; i < test_gpus; ++i) {
+        REQUIRE(ranks_seen[i] == 1);
+    }
+}
+
+TEST_CASE("NCCL barrier synchronization", "[nccl][sync]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    int num_gpus = get_cuda_device_count();
+    if (num_gpus < 2) {
+        SKIP("Need at least 2 GPUs for barrier test");
+    }
+    
+    int test_gpus = std::min(num_gpus, 2);
+    
+    NCCLCommunicator::run_threads_communicators(test_gpus, false, false, [](NCCLCommunicator& comm) {
+        // Simply test that barrier doesn't hang or crash
+        comm.barrier();
+        
+        // Multiple barriers should also work
+        comm.barrier();
+        comm.barrier();
+    });
+}
+
+// =============================================================================
+// Host Gather Tests
+// =============================================================================
+
+TEST_CASE("NCCL host_gather with single GPU", "[nccl][gather]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        int value = 42;
+        auto result = comm.host_gather(value);
+        
+        // On rank 0, result should contain the gathered value
+        if (comm.rank() == 0) {
+            REQUIRE(result.size() == 1);
+            REQUIRE(result[0] == 42);
+        }
+    });
+}
+
+TEST_CASE("NCCL host_gather with multiple GPUs", "[nccl][gather][multi-gpu]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    int num_gpus = get_cuda_device_count();
+    if (num_gpus < 2) {
+        SKIP("Need at least 2 GPUs for multi-GPU gather test");
+    }
+    
+    int test_gpus = std::min(num_gpus, 2);
+    
+    NCCLCommunicator::run_threads_communicators(test_gpus, false, false, [&](NCCLCommunicator& comm) {
+        // Each rank sends its rank number
+        int value = comm.rank() * 10 + 1;  // e.g., rank 0 -> 1, rank 1 -> 11
+        auto result = comm.host_gather(value);
+        
+        if (comm.rank() == 0) {
+            REQUIRE(result.size() == static_cast<size_t>(test_gpus));
+            for (int i = 0; i < test_gpus; ++i) {
+                REQUIRE(result[i] == i * 10 + 1);
+            }
+        }
+    });
+}
+
+TEST_CASE("NCCL host_all_gather with single GPU", "[nccl][allgather]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        int value = 99;
+        auto result = comm.host_all_gather(value);
+        
+        REQUIRE(result.size() == 1);
+        REQUIRE(result[0] == 99);
+    });
+}
+
+TEST_CASE("NCCL host_all_gather with multiple GPUs", "[nccl][allgather][multi-gpu]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    int num_gpus = get_cuda_device_count();
+    if (num_gpus < 2) {
+        SKIP("Need at least 2 GPUs for multi-GPU all_gather test");
+    }
+    
+    int test_gpus = std::min(num_gpus, 2);
+    
+    NCCLCommunicator::run_threads_communicators(test_gpus, false, false, [&](NCCLCommunicator& comm) {
+        // Each rank sends its rank number
+        int value = comm.rank() + 100;  // e.g., rank 0 -> 100, rank 1 -> 101
+        auto result = comm.host_all_gather(value);
+        
+        // All ranks should have the same result
+        REQUIRE(result.size() == static_cast<size_t>(test_gpus));
+        for (int i = 0; i < test_gpus; ++i) {
+            REQUIRE(result[i] == i + 100);
+        }
+    });
+}
+
+// =============================================================================
+// Host Gather with Struct Tests
+// =============================================================================
+
+TEST_CASE("NCCL host_gather with struct", "[nccl][gather][struct]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    struct TestData {
+        int a;
+        float b;
+        char c;
+    };
+    
+    NCCLCommunicator::run_threads_communicators(1, false, false, [](NCCLCommunicator& comm) {
+        TestData data{42, 3.14f, 'x'};
+        auto result = comm.host_gather(data);
+        
+        if (comm.rank() == 0) {
+            REQUIRE(result.size() == 1);
+            REQUIRE(result[0].a == 42);
+            REQUIRE(result[0].b == Catch::Approx(3.14f));
+            REQUIRE(result[0].c == 'x');
+        }
+    });
+}
+
+// =============================================================================
+// Error Handling Tests
+// =============================================================================
+
+TEST_CASE("NCCL handles zero GPUs gracefully", "[nccl][error]") {
+    if (!cuda_available()) {
+        SKIP("CUDA not available");
+    }
+    
+    // Requesting 0 GPUs should either throw or handle gracefully
+    // This tests that the library doesn't crash on invalid input
+    bool threw_exception = false;
+    try {
+        NCCLCommunicator::run_threads_communicators(0, false, false, [](NCCLCommunicator& comm) {
+            // Should not reach here
+        });
+    } catch (...) {
+        threw_exception = true;
+    }
+    
+    // Either it throws an exception or handles it gracefully (both are acceptable)
+    // The test passes if we get here without crashing
+    INFO("Zero GPUs request threw exception: " << threw_exception);
+}
+
+// =============================================================================
+// Stress Tests
+// =============================================================================
+
+TEST_CASE("NCCL multiple sequential communicator creations", "[nccl][stress]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    // Create and destroy communicators multiple times
+    for (int i = 0; i < 3; ++i) {
+        NCCLCommunicator::run_threads_communicators(1, false, false, [&](NCCLCommunicator& comm) {
+            REQUIRE(comm.rank() == 0);
+            REQUIRE(comm.world_size() == 1);
+        });
+    }
+}
+
+TEST_CASE("NCCL with memcpy_allgather option", "[nccl][options]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    // Test with memcpy_allgather = true
+    NCCLCommunicator::run_threads_communicators(1, true, false, [](NCCLCommunicator& comm) {
+        REQUIRE(comm.rank() == 0);
+        REQUIRE(comm.world_size() == 1);
+    });
+}
+
+TEST_CASE("NCCL with memcpy_send_recv option", "[nccl][options]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    // Test with memcpy_send_recv = true
+    NCCLCommunicator::run_threads_communicators(1, false, true, [](NCCLCommunicator& comm) {
+        REQUIRE(comm.rank() == 0);
+        REQUIRE(comm.world_size() == 1);
+    });
+}
+
+TEST_CASE("NCCL with both memcpy options", "[nccl][options]") {
+    if (!nccl_available()) {
+        SKIP("NCCL not available");
+    }
+    
+    // Test with both options = true
+    NCCLCommunicator::run_threads_communicators(1, true, true, [](NCCLCommunicator& comm) {
+        REQUIRE(comm.rank() == 0);
+        REQUIRE(comm.world_size() == 1);
+    });
+}

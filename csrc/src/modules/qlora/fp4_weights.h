@@ -1,0 +1,136 @@
+// Copyright (c) 2026, Invergent SA, developed by Flavius Burca
+// SPDX-License-Identifier: Apache-2.0
+//
+// FP4 (NVFP4/E2M1) QLoRA weights manager.
+
+#ifndef SUROGATE_SRC_MODULES_QLORA_FP4_WEIGHTS_H
+#define SUROGATE_SRC_MODULES_QLORA_FP4_WEIGHTS_H
+
+#include <string>
+#include <vector>
+
+#include "fp4_block_quantized_tensor.h"
+#include "block_quantized_tensor.h"  // For QLoRAEmbeddingWeights
+#include "qlora_config.h"
+#include "utilities/allocator.h"
+#include "utilities/comm.h"
+#include "utilities/safetensors.h"
+#include "utilities/tensor.h"
+
+namespace modules {
+
+/**
+ * @brief FP4 QLoRA weights manager
+ *
+ * Manages quantized base model weights using FP4 E2M1 format with two-level
+ * block scaling (FP8 E4M3 block scales + FP32 global scale).
+ *
+ * Memory layout:
+ * - Base model weights: FP4 E2M1 packed (2 values per byte)
+ * - Block scales: FP8 E4M3 with F8_128x4 swizzling
+ * - Global amax: FP32 per tensor
+ * - Embeddings/LM head: BF16 (not quantized)
+ *
+ * Usage:
+ * 1. Call import_and_quantize() to load and quantize base model weights
+ * 2. Access quantized blocks via get_fp4_block() for weight provider
+ */
+class FP4WeightsManager {
+public:
+    struct Config {
+        int num_layers;
+        int hidden_size;
+        int intermediate_size;
+        int num_query_heads;
+        int num_kv_heads;
+        int head_size;
+        int vocab_size;
+        QLoRAConfig qlora_config;
+        bool use_qk_norm = false;
+        bool tied_embeddings = true;
+        int shard_idx = 0;
+        int num_shards = 1;
+    };
+
+    FP4WeightsManager(const Config& config, TensorAllocator& allocator,
+                      const cudaDeviceProp& device_props);
+    ~FP4WeightsManager();
+
+    /**
+     * @brief Import base model weights from safetensors and quantize to FP4
+     */
+    void import_and_quantize(const std::string& file_name, NCCLCommunicator& comm,
+                             cudaStream_t stream);
+
+    /**
+     * @brief Get FP4 quantized block weights
+     */
+    [[nodiscard]] const FP4BlockWeights& get_fp4_block(int layer_idx) const {
+        return mFP4Blocks[layer_idx];
+    }
+
+    [[nodiscard]] FP4BlockWeights& get_fp4_block(int layer_idx) {
+        return mFP4Blocks[layer_idx];
+    }
+
+    /**
+     * @brief Get embedding weights (not quantized)
+     */
+    [[nodiscard]] const QLoRAEmbeddingWeights& get_embeddings() const { return mEmbeddings; }
+    [[nodiscard]] QLoRAEmbeddingWeights& get_embeddings() { return mEmbeddings; }
+
+    /**
+     * @brief Get QLoRA configuration
+     */
+    [[nodiscard]] const QLoRAConfig& qlora_config() const { return mConfig.qlora_config; }
+
+    /**
+     * @brief Check if FP4 quantization is active
+     */
+    [[nodiscard]] bool is_fp4() const { return mConfig.qlora_config.is_fp4(); }
+
+    /**
+     * @brief Get total memory usage for quantized weights in bytes
+     */
+    [[nodiscard]] std::size_t quantized_weights_bytes() const;
+
+    /**
+     * @brief Get memory savings compared to BF16 storage
+     */
+    [[nodiscard]] float memory_savings_ratio() const;
+
+private:
+    Config mConfig;
+    TensorAllocator* mAllocator;
+    const cudaDeviceProp* mDeviceProps;
+
+    // FP4 quantized base model weights
+    std::vector<FP4BlockWeights> mFP4Blocks;
+
+    // Embedding weights (not quantized)
+    QLoRAEmbeddingWeights mEmbeddings;
+
+    // Temporary buffer for loading BF16 weights before quantization
+    Tensor mLoadBuffer;
+    std::size_t mLoadBufferBytes = 0;
+
+    // Global amax storage (device memory)
+    std::vector<float*> mGlobalAmaxPtrs;
+
+    // Allocation helpers
+    void allocate_fp4_blocks();
+    float* allocate_global_amax();
+
+    // Quantization helpers
+    void quantize_fp4_and_store(FP4BlockQuantizedWeight& dest, const Tensor& src,
+                                 int M, int K, cudaStream_t stream);
+
+    // Weight loading helpers
+    void load_and_quantize_block(int layer_idx, SafeTensorsReader& reader,
+                                 cudaStream_t stream);
+    void load_embeddings(SafeTensorsReader& reader, cudaStream_t stream);
+};
+
+} // namespace modules
+
+#endif // SUROGATE_SRC_MODULES_QLORA_FP4_WEIGHTS_H

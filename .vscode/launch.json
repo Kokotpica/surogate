@@ -1,0 +1,56 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Surogate CLI - Tokenize",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "surogate.cli.main",
+            "args": ["tokenize", "--config", "${workspaceFolder}/examples/sft/qwen3-0.6b.yaml", "--debug"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"}
+        },
+        {
+            "name": "Surogate CLI - SFT",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "surogate.cli.main",
+            "args": ["sft", "--config", "${workspaceFolder}/examples/sft/qwen3-0.6b.yaml"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"}
+        },
+        {
+            "name": "train",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/train",
+            "args": ["--model=Qwen/Qwen2.5-0.5B", "--lr=2e-4", "--train-file='data/tiny-stories-qwen/train-*.bin'", 
+                    "--eval-file='data/tiny-stories-qwen/eval.bin'", "--batch-size=2", "--grad-accumulation=4",
+                    "--seq-length=1024", "--model-dtype=bf16",
+                    "--gpus=1", "--lora", "--lora-rank=16", "--lora-alpha=32",
+                    "--lora-target-modules=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+
+    ]
+}
