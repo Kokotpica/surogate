@@ -35,7 +35,8 @@ See reproducible comparisons in [`./benchmarks`](./benchmarks/speed.md).
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
-- **⚡ Native multi-GPU** training
+- **🖥️...🖥️ Native multi-GPU** training
+- **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
 - **⚖️ Smart CPU Offloading** for weights, gradients, activations, quants
 - **📜 Pre-built training recipes**: 
   - [**💎 BF16**](./csrc/src/recipes/bf16/README.md): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
@@ -44,6 +45,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - **⚡ FP8/NVFP4 QLoRA** to maximize SOL on Hopper/Blackwell GPUs
 - **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
+- **🧠 Supported models**: Qwen2.5, Qwen3 Dense, LLama 3.2, more to come shortly
 
 ---
 
