@@ -95,10 +95,11 @@ jobs:
             # Create a venv and install build dependencies since we're using --no-build-isolation
             uv venv .build-venv --python=3.12
             source .build-venv/bin/activate
-            uv pip install scikit-build-core nanobind setuptools-scm
+            uv pip install scikit-build-core nanobind setuptools-scm build
             export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"
             export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SUROGATE="$VERSION"
-            uv build --wheel --no-build-isolation
+            # Use python -m build instead of uv build to ensure env vars are passed
+            python -m build --wheel --no-isolation
           else
             echo "No version set, using setuptools-scm to determine version from git"
             uv build --wheel
