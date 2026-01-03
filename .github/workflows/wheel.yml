@@ -45,6 +45,10 @@ jobs:
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
       CUDAARCHS: ${{ matrix.archs }}
 
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -60,6 +64,8 @@ jobs:
 
       - name: Fetch tags
         run: |
+          echo "Working directory: $(pwd)"
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
           git fetch --tags --force
           echo "Current ref: $GITHUB_REF"
           echo "Git describe: $(git describe --tags --always)"
