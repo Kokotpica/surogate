@@ -1,7 +1,18 @@
 #!/bin/bash
-# install.sh - Auto-detect CUDA and install appropriate dependencies
+# install.sh - Auto-detect CUDA and install appropriate surogate package
 
-# Check if uv is installed, if not install it
+set -e
+
+REPO="invergent-ai/surogate"
+VENV_DIR=".venv"
+
+# Check for required tools
+if ! command -v curl &> /dev/null; then
+    echo "Error: curl is required but not installed."
+    exit 1
+fi
+
+# Install uv if not available
 if ! command -v uv &> /dev/null; then
     echo "uv not found. Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -17,7 +28,29 @@ else
     echo "uv is already installed."
 fi
 
+# Create virtual environment with Python 3.12 if it doesn't exist
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating virtual environment with Python 3.12..."
+    uv venv --python 3.12 "$VENV_DIR"
+else
+    echo "Using existing virtual environment: $VENV_DIR"
+fi
+
+# Activate the virtual environment
+source "$VENV_DIR/bin/activate"
+echo "Virtual environment activated: $VENV_DIR"
+
+# Check if surogate is already installed and get current version
+INSTALLED_VERSION=""
+if python -c "import surogate" 2>/dev/null; then
+    INSTALLED_VERSION=$(python -c "import surogate; print(surogate.__version__)" 2>/dev/null || echo "")
+    # Strip any CUDA suffix from version for comparison (e.g., "0.0.1+cu129" -> "0.0.1")
+    INSTALLED_VERSION_BASE="${INSTALLED_VERSION%%+*}"
+    echo "Currently installed surogate version: $INSTALLED_VERSION"
+fi
+
 # Detect CUDA version
+CUDA_VERSION=""
 if command -v nvcc &> /dev/null; then
     CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
 elif [ -f /usr/local/cuda/version.txt ]; then
@@ -26,22 +59,125 @@ elif command -v nvidia-smi &> /dev/null; then
     CUDA_VERSION=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+')
 fi
 
+if [ -z "$CUDA_VERSION" ]; then
+    echo "Error: Could not detect CUDA version. Please ensure CUDA is installed."
+    exit 1
+fi
+
 CUDA_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1)
 CUDA_MINOR=$(echo $CUDA_VERSION | cut -d. -f2)
 
 echo "Detected CUDA version: $CUDA_VERSION"
 
-# Map to PyTorch CUDA version
+# Map to supported CUDA version suffix
 if [[ "$CUDA_MAJOR" -ge 13 ]]; then
-    EXTRA="cu130"
+    CUDA_SUFFIX="cu130"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 9 ]]; then
-    EXTRA="cu129"
+    CUDA_SUFFIX="cu129"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 8 ]]; then
-    EXTRA="cu128"
+    CUDA_SUFFIX="cu128"
 else
     echo "Warning: CUDA $CUDA_VERSION may not be fully compatible. Using cu128."
-    EXTRA="cu128"
+    CUDA_SUFFIX="cu128"
 fi
 
-echo "Installing with PyTorch for CUDA $EXTRA..."
-uv sync --extra dev --extra $EXTRA
+echo "Using CUDA suffix: $CUDA_SUFFIX"
+
+# Fetch the latest release info from GitHub API
+echo "Fetching latest release from GitHub..."
+RELEASE_JSON=$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest")
+
+if [ -z "$RELEASE_JSON" ] || echo "$RELEASE_JSON" | grep -q '"message": "Not Found"'; then
+    echo "Error: Could not fetch release information from GitHub."
+    exit 1
+fi
+
+# Extract the version tag (e.g., "v0.0.1" or "0.0.1")
+TAG_NAME=$(echo "$RELEASE_JSON" | grep -oP '"tag_name":\s*"\K[^"]+')
+# Remove leading 'v' if present
+VERSION="${TAG_NAME#v}"
+
+echo "Latest version: $VERSION"
+
+# Construct the wheel filename pattern (URLs have %2B instead of +)
+WHEEL_NAME="surogate-${VERSION}+${CUDA_SUFFIX}-cp312-abi3-manylinux_2_39_x86_64.whl"
+WHEEL_PATTERN="surogate-${VERSION}%2B${CUDA_SUFFIX}-cp312-abi3-manylinux_2_39_x86_64.whl"
+
+# Find the download URL for the matching wheel (GitHub URLs use %2B for +)
+DOWNLOAD_URL=$(echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep "$WHEEL_PATTERN" || true)
+
+if [ -z "$DOWNLOAD_URL" ]; then
+    echo "Error: Could not find wheel for CUDA $CUDA_SUFFIX (looking for $WHEEL_NAME)"
+    echo "Available wheels:"
+    echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep '\.whl$' || echo "  (none found)"
+    exit 1
+fi
+
+echo "Downloading: $WHEEL_NAME"
+echo "URL: $DOWNLOAD_URL"
+
+# Download and install the wheel
+TEMP_DIR=$(mktemp -d)
+WHEEL_PATH="${TEMP_DIR}/${WHEEL_NAME}"
+
+curl -L -o "$WHEEL_PATH" "$DOWNLOAD_URL"
+
+if [ ! -f "$WHEEL_PATH" ]; then
+    echo "Error: Failed to download wheel."
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+# Install or upgrade surogate
+if [ -n "$INSTALLED_VERSION" ]; then
+    echo "Upgrading surogate from $INSTALLED_VERSION to $VERSION..."
+    uv pip install --reinstall "$WHEEL_PATH"
+else
+    echo "Installing surogate..."
+    uv pip install "$WHEEL_PATH"
+fi
+
+# Cleanup
+rm -rf "$TEMP_DIR"
+
+echo ""
+if [ -n "$INSTALLED_VERSION" ]; then
+    echo "Successfully upgraded surogate from $INSTALLED_VERSION to $VERSION for CUDA $CUDA_SUFFIX"
+else
+    echo "Successfully installed surogate $VERSION for CUDA $CUDA_SUFFIX"
+fi
+
+# Clone examples
+EXAMPLES_DIR="examples"
+if [ ! -d "$EXAMPLES_DIR" ]; then
+    echo ""
+    echo "Downloading examples..."
+    mkdir -p "$EXAMPLES_DIR"
+
+    # Download SFT examples using GitHub API to get directory contents
+    EXAMPLES_API_URL="https://api.github.com/repos/${REPO}/contents/examples/sft?ref=main"
+    EXAMPLES_JSON=$(curl -sL "$EXAMPLES_API_URL")
+
+    if echo "$EXAMPLES_JSON" | grep -q '"download_url"'; then
+        mkdir -p "$EXAMPLES_DIR/sft"
+        # Extract file URLs and download each file
+        echo "$EXAMPLES_JSON" | grep -oP '"download_url":\s*"\K[^"]+' | while read -r file_url; do
+            filename=$(basename "$file_url")
+            echo "  Downloading $filename..."
+            curl -sL "$file_url" -o "$EXAMPLES_DIR/sft/$filename"
+        done
+        echo "Examples downloaded to $EXAMPLES_DIR/sft/"
+    else
+        echo "Warning: Could not download examples from GitHub."
+    fi
+else
+    echo "Examples directory already exists: $EXAMPLES_DIR"
+fi
+
+echo ""
+echo "To activate the virtual environment, run:"
+echo "  source $VENV_DIR/bin/activate"
+echo ""
+echo "To run your first Qwen3-0.6B fine-tune run:"
+echo "  uv run surogate examples/sft/qwen3-lora-bf16.yaml"
+echo ""
