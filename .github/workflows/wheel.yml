@@ -93,14 +93,18 @@ jobs:
         run: |
           echo "Patching pyproject.toml with version: $VERSION"
           # Replace dynamic version with static version
-          python3 << EOF
+          python3 << 'PYEOF'
           import re
           import os
 
           version = os.environ['VERSION']
+          print(f"Python received version: {version}")
 
           with open('pyproject.toml', 'r') as f:
               content = f.read()
+
+          print("Before patching - first 300 chars:")
+          print(content[:300])
 
           # Remove 'version' from dynamic list and add static version
           content = re.sub(r'dynamic = \["version"\]', f'version = "{version}"', content)
@@ -115,13 +119,20 @@ jobs:
           with open('pyproject.toml', 'w') as f:
               f.write(content)
 
-          print("Patched pyproject.toml:")
-          print(content[:500])
-          EOF
+          print("\nAfter patching - first 300 chars:")
+          print(content[:300])
+          PYEOF
+
+          echo "Verifying pyproject.toml content:"
+          head -5 pyproject.toml
 
       - name: Build wheel
         shell: bash
-        run: uv build --wheel
+        run: |
+          echo "Building wheel..."
+          echo "pyproject.toml version line:"
+          grep -E "^version|^dynamic" pyproject.toml || true
+          uv build --wheel
 
       - name: Repair wheel with auditwheel
         run: |
