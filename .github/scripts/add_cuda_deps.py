@@ -25,23 +25,35 @@ def add_dependencies(deps_str, cuda_tag=None):
         if 'version' in data['project']:
             current_version = data['project']['version']
         else:
-            # Get version from setuptools-scm via git describe
+            # First check if we're exactly on a tag
             result = subprocess.run(
-                ['git', 'describe', '--tags', '--match', 'v*'],
+                ['git', 'describe', '--tags', '--exact-match', '--match', 'v*'],
                 capture_output=True, text=True
             )
             if result.returncode == 0:
-                # Convert git describe output (e.g., v0.1.0-5-gabcdef) to PEP 440
-                git_version = result.stdout.strip().lstrip('v')
-                # If it's a clean tag, use as-is; otherwise extract base version
-                if '-' in git_version:
-                    current_version = git_version.split('-')[0]
-                else:
-                    current_version = git_version
+                # We're on an exact tag - use it directly
+                current_version = result.stdout.strip().lstrip('v')
+                print(f"On exact tag, using version: {current_version}")
             else:
-                # Fallback version from setuptools_scm config
-                fallback = data.get('tool', {}).get('setuptools_scm', {}).get('fallback_version', '0.0.1')
-                current_version = fallback
+                # Not on exact tag, use git describe
+                result = subprocess.run(
+                    ['git', 'describe', '--tags', '--match', 'v*'],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    # Convert git describe output (e.g., v0.1.0-5-gabcdef) to PEP 440
+                    git_version = result.stdout.strip().lstrip('v')
+                    # Extract base version (before the commit count)
+                    if '-' in git_version:
+                        current_version = git_version.split('-')[0]
+                    else:
+                        current_version = git_version
+                    print(f"From git describe, using version: {current_version}")
+                else:
+                    # Fallback version from setuptools_scm config
+                    fallback = data.get('tool', {}).get('setuptools_scm', {}).get('fallback_version', '0.0.1')
+                    current_version = fallback
+                    print(f"Using fallback version: {current_version}")
 
         # Remove 'version' from dynamic list if present
         if 'dynamic' in data['project'] and 'version' in data['project']['dynamic']:
