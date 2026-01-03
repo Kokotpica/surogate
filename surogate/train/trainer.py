@@ -1,5 +1,6 @@
 import sys
 import time
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -8,6 +9,7 @@ from surogate import _surogate
 from surogate.core.config.sft_config import SFTConfig
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.reporter import training_logger_context
+from surogate.train.training_plot import generate_training_plot
 from surogate.utils.hf import get_model_weights_path, resolve_model_path
 from surogate.utils.logger import get_logger
 from surogate.utils.tensor import to_surogate_dtype
@@ -138,41 +140,29 @@ class SurogateTrainerWrapper():
                 if self.config.qlora_fp8:
                     logger.info(f"  QLoRA-FP8 enabled: block_size={self.config.qlora_block_size}")
                 elif self.config.qlora_fp4:
-                    logger.info(f"  QLoRA-FP4 enabled: NVFP4 (E2M1)")
+                    logger.info("  QLoRA-FP4 enabled: NVFP4 (E2M1)")
                 logger.info("Note: Base model weights are frozen, only LoRA adapters will be trained")
 
             self.run_training_loop(train_logger)
 
-            # Final evaluation
-            if self.eval_loader and self.config.final_eval_num_steps != 0:
-                logger.info("\nRunning final evaluation...")
-                in_tokens = np.empty(
-                    (self.config.gpus * self.config.per_device_eval_batch_size, self.config.sequence_len),
-                    dtype=np.int32)
-                out_tokens = np.empty(
-                    (self.config.gpus * self.config.per_device_eval_batch_size, self.config.sequence_len),
-                    dtype=np.int32)
-
-                final_eval_steps = self.eval_loader.num_chunks if self.config.final_eval_num_steps < 0 else self.config.final_eval_num_steps
-                final_loss, elapsed_ms = self.run_evaluation(in_tokens, out_tokens, final_eval_steps)
-                logger.info(f"Final validation loss: {final_loss:.4f}")
-                train_logger.log_eval(self.max_steps, self.config.num_epochs,
-                                      final_eval_steps * self.chunk_size, elapsed_ms, final_loss)
-
             # Save final model
             if self.config.lora:
                 # Export LoRA adapter in PEFT-compatible format
-                adapter_dir = self.config.output_dir / "adapter"
+                adapter_dir = Path(self.config.output_dir) / "adapter"
                 logger.info(f"Saving LoRA adapter to {adapter_dir}...")
                 adapter_dir.mkdir(parents=True, exist_ok=True)
                 self.trainer.export_adapter(str(adapter_dir))
                 logger.info("done")
                 logger.info(f"LoRA adapter saved to {adapter_dir}")
                 logger.info("To use with HuggingFace PEFT, load the base model and apply this adapter.")
+                # Generate training plot in adapter directory
+                generate_training_plot(self.config.log_file, adapter_dir / "training_plot.png")
             else:
                 logger.info(f"Saving model to {self.config.output_dir}...")
                 self.trainer.export_model(str(self.config.output_dir))
                 logger.info("done")
+                # Generate training plot in output directory
+                generate_training_plot(self.config.log_file, Path(self.config.output_dir) / "training_plot.png")
 
             logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
 
@@ -204,6 +194,10 @@ class SurogateTrainerWrapper():
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
                 logger.info(f"Saving checkpoint to {self.config.checkpoint_dir}...")
                 self.trainer.save_checkpoint(self.config.checkpoint_dir, step)
+
+                # Generate training plot in checkpoint directory
+                checkpoint_plot_path = Path(self.config.checkpoint_dir) / f"step_{step:08d}" / "training_plot.png"
+                generate_training_plot(self.config.log_file, checkpoint_plot_path)
 
                 # Clean old checkpoints
                 if self.config.save_total_limit > 0:

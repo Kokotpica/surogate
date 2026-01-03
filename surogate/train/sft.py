@@ -112,8 +112,8 @@ class SurogateSFT(TokenizeDatasets):
             logger.error(f"Training failed after {max_attempts} attempts")
             raise RuntimeError(f"Could not complete training after {max_attempts} OOM recovery attempts")
 
-        final_batch = self.config.trainer_args.per_device_train_batch_size
-        final_grad_accum = self.config.trainer_args.gradient_accumulation_steps
+        final_batch = self.config.per_device_train_batch_size
+        final_grad_accum = self.config.gradient_accumulation_steps
 
         if final_batch != original_batch_size or final_grad_accum != original_grad_accum:
             logger.info("Training completed with adjusted batch size and/or gradient accumulation steps:")

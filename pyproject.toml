@@ -38,6 +38,7 @@ dependencies = [
     "rich>=13.0.0",
     "aim",
     "psutil",
+    "matplotlib",
     "bitsandbytes>=0.49.0",
     "qwen-vl-utils==0.0.14",
     "pydantic",
