@@ -176,6 +176,10 @@ sPerfSpecs RTX_3070 = {
 sPerfSpecs B200_HGX = {
     .Chip = "GB100", .SMs = 264, .CoresPerSM = 128, .TensorPerSM = 4, .BoostClock = 1837, .TF32_TFlops = 1100, .BF16_TFlops = 2200, .FP16_32_TFlops = 2200, .FP16_16_TFlops = 2200, .INT8_TFlops = 4500, .INT4_TFlops = -1, .FP8_32_TFlops = 4500, .FP8_16_TFlops = 4500, .FP4_32_TFlops = 9000};
 
+// source: https://www.nvidia.com/en-us/data-center/b300/
+sPerfSpecs B300_SXM = {
+    .Chip = "GB100", .SMs = 264, .CoresPerSM = 128, .TensorPerSM = 4, .BoostClock = 2100, .TF32_TFlops = 1250, .BF16_TFlops = 2500, .FP16_32_TFlops = 2500, .FP16_16_TFlops = 2500, .INT8_TFlops = 5000, .INT4_TFlops = -1, .FP8_32_TFlops = 5000, .FP8_16_TFlops = 5000, .FP4_32_TFlops = 10000};
+
 // These are mostly guesswork at this point!
 // the spec sheet claims 1 pFLOP fp4+sparsity; assume this is mostly like a 5090;
 // TODO get better estimates for these values
@@ -251,6 +255,9 @@ std::unordered_map<std::string_view, sPerfSpecs> create_device_map() {
 
     device_map["NVIDIA H100 PCIe"] = H100_PCI;
     device_map["NVIDIA H100 80GB HBM3"] = H100_SXM;
+    device_map["NVIDIA H200"] = H200_SXM;
+    device_map["NVIDIA B200"] = B200_HGX;
+    device_map["NVIDIA B300 SXM6 AC"] = B300_SXM;
 
     device_map["NVIDIA GeForce RTX 5090"] = RTX_5090;
     device_map["NVIDIA GeForce RTX 5080"] = RTX_5080;
