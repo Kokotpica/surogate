@@ -1,14 +1,5 @@
 # Surogate vs Unsloth
 
-* Across all model sizes, Surogate beats Unsloth  by a large margin for every listed precision format.
-* Surogate FP4 is the best throughput option, delivering about +107% to +125% vs Unsloth NF4 across all model sizes
-* Overall average speed improvement vs Unsloth NF4:
-  * Surogate BF16: +32%
-  * Surogate FP8: +77%
-  * Surogate QFP8: +64%
-  * Surogate FP4: +115%
-  * Surogate QFP4: +72%
-
 
 ## GPU: 1x NVIDIA RTX 5090 32GB (tok/sec)
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
@@ -17,22 +8,95 @@
 | **Qwen3 1.7B** | 11,7k       | 12,1k        | 15,2k         | 20,7k        | 19,0k         | 24,2k        | 19,5k         |
 | **Qwen3 4B**   | 5,6k        | 5,8k         | 7,2k          | 9,5k         | 8,8k          | 12,0k        | 9,1k          |
 | **Qwen3 8B**   | 3,6k        | 3,4k         | 4,2k          | 5,9k         | 5,3k          | 8,2k         | 5,5k          | 
+ 
+* Across all model sizes, Surogate beats Unsloth by a large margin for every listed precision format.
+* Surogate FP4 is the best throughput option, delivering about +107% to +128% vs Unsloth NF4 across all model sizes
+* Overall average speed improvement vs Unsloth NF4:
+  * Surogate BF16: +36%
+  * Surogate FP8: +78%
+  * Surogate QFP8: +61%
+  * Surogate FP4: +116%
+  * Surogate QFP4: +68%
 
-Configurations used:
-- Surogate BF16: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" bf16
-- Surogate FP8: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" fp8
-- Surogate QFP8: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" qfp8
-- Surogate FP4: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" fp4
-- Surogate QFP4: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" qfp4
-- 
 ## GPU: 1x NVIDIA H100 SXM (tok/sec)
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
 |----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
-| **Qwen3 0.6B** | 21k         | 24,5k        |               |              |               |              |               |
-| **Qwen3 1.7B** | 20k         | 23k          |               |              |               |              |               |
-| **Qwen3 4B**   | 12,6k       | 13,1k        |               |              |               |              |               |
-| **Qwen3 8B**   | 8,6k        | 9,1k         |               |              |               |              |               | 
+| **Qwen3 0.6B** | 21k         | 24,5k        | 62k           | 58k          | 45,6k         | -            | -             |
+| **Qwen3 1.7B** | 20k         | 23k          | 37,5k         | 37,5k        | 30.6k         | -            | -             |
+| **Qwen3 4B**   | 12,6k       | 13,1k        | 17,5k         | 18.7k        | 15,5k         | -            | -             |
+| **Qwen3 8B**   | 8,6k        | 9,1k         | 11,5          | 12,8k        | 10,2k         | -            | -             |
 
+* Surogate BF16 achieves up to 3x throughput on small models (0.6B) due to better memory bandwidth utilization on datacenter GPUs.
+* FP8 matches BF16 throughput while enabling larger batch sizes through reduced memory footprint.
+* Overall average speed improvement vs Unsloth NF4:
+  * Surogate BF16: +89%
+  * Surogate FP8: +90%
+  * Surogate QFP8: +53%
+
+## GPU: 1x NVIDIA H200 (tok/sec)
+| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
+|----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
+| **Qwen3 0.6B** | 18,3k       | 21,7k        | 65,2k         | 62k          | 48k           | -            | -             |
+| **Qwen3 1.7B** | 18,3k       | 21,4k        | 39k           | 40,8k        | 32,8k         | -            | -             |
+| **Qwen3 4B**   | 12,1k       | 12,8k        | 18,3k         | 20,5k        | 16,5k         | -            | -             |
+| **Qwen3 8B**   | 8,4k        | 9,1k         | 11,7k         | 14k          | 10,9k         | -            | -             |
+
+* H200's higher memory bandwidth amplifies Surogate's advantage, with BF16 reaching 3.5x throughput on small models (0.6B).
+* FP8 slightly outperforms BF16 on H200, suggesting better utilization of the Transformer Engine.
+* Overall average speed improvement vs Unsloth NF4:
+  * Surogate BF16: +115%
+  * Surogate FP8: +124%
+  * Surogate QFP8: +77%
+
+WARNING: unknown device NVIDIA H200
+
+
+## GPU: 1x NVIDIA B200 (CUDA 12.8)
+| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
+|----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
+| **Qwen3 0.6B** |             |              | 77k           | 70,6k        | 51,8k         |              | 60k           |
+| **Qwen3 1.7B** |             |              | 55,1k         | 53,7k        | 37,9k         |              | 44,1k         |
+| **Qwen3 4B**   |             |              | 27,5k         | 28k          | 19k           |              | 22,3k         |
+| **Qwen3 8B**   |             |              | 19,5k         | 21,4k        | 12,9k         |              | 15,7k         | 
+
+WARNING: unknown device NVIDIA B200
+
+FP4:
+ File "/root/.venv/lib/python3.12/site-packages/surogate/train/trainer.py", line 214, in run_training_loop
+    self.trainer.step(in_tokens, out_tokens)
+RuntimeError: CUTLASS FP4 GEMM (alpha-ptr) not compiled for this architecture. Ensure CUDA_ARCHITECTURES includes 120 or 121.
+terminate called after throwing an instance of 'cuda_error'
+  what():  Cuda Error in /__w/surogate/surogate/csrc/src/binding/py_train.cpp:81 (cudaSetDevice(ctx.Communicator->rank())): cudaErrorInvalidDevice: invalid device ordinal
+
+compute_cap
+10.0
+
+## GPU: 1x NVIDIA B300 SXM6 AC (CUDA 13.0)
+| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
+|----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
+| **Qwen3 0.6B** |          |                 | 82,5k         | 75,5k        |               |              |               |
+| **Qwen3 1.7B** |          |                 | 59,3k         | 57k          |               |              |               |
+| **Qwen3 4B**   |          |                 | 29,9k         | 30k          |               |              |               |
+| **Qwen3 8B**   |          |                 | 21k           | 22,7k        |               |              |               | 
+
+WARNING: unknown device NVIDIA B300 SXM6 AC
+
+qfp8:
+[NVML WARNING] NVML_ERROR_NOT_SUPPORTED
+480 tps
+
+fp4:
+  File "/root/.venv/lib/python3.12/site-packages/surogate/train/trainer.py", line 214, in run_training_loop
+    self.trainer.step(in_tokens, out_tokens)
+RuntimeError: CUTLASS FP4 GEMM (alpha-ptr) not compiled for this architecture. Ensure CUDA_ARCHITECTURES includes 120 or 121.
+terminate called after throwing an instance of 'cuda_error'
+  what():  Cuda Error in /__w/surogate/surogate/csrc/src/binding/py_train.cpp:81 (cudaSetDevice(ctx.Communicator->rank())): cudaErrorInvalidDevice: invalid device ordinal
+
+qfp4:
+very slow
+
+compute_cap
+10.3
 
 
 ## GPU Memory Usage (Gb)
@@ -59,7 +123,29 @@ max_seq_length=2048
 per_device_train_batch_size = 2
 gradient_accumulation_steps = 4
 packing = True
-lora rank = 32
+lora rank = 16
 lora_alpha = 32
 lora_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+```
+
+# Surogate install
+```shell
+curl -sSL https://surogate.ai/install.sh | bash
+source .venv/bin/activate
+```
+
+Configurations used:
+- Surogate BF16: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" bf16
+- Surogate FP8: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" fp8
+- Surogate QFP8: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" qfp8
+- Surogate FP4: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" fp4
+- Surogate QFP4: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" qfp4
+
+
+# Unsloth install
+```shell
+apt install -y python3-dev
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source .venv/bin/activate
+uv pip install unsloth
 ```
