@@ -18,7 +18,7 @@ jobs:
     strategy:
       matrix:
         compiler:
-          - name: clang
+          - name: gcc
             cc: gcc-13
             cxx: g++-13
             packages: gcc-13 g++-13
@@ -29,10 +29,13 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
-      CUDAARCHS: "89"
+      CUDAARCHS: "80;86;89;90;100;120"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install deps
         run: apt update && apt install -y git wget build-essential cmake ninja-build git python3-dev ${{ matrix.compiler.packages }} libopenmpi-dev
