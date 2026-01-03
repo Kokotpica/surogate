@@ -38,7 +38,7 @@ jobs:
           fetch-tags: true
 
       - name: Install deps
-        run: apt update && apt install -y git wget build-essential cmake ninja-build git python3-dev ${{ matrix.compiler.packages }} libopenmpi-dev
+        run: apt update && apt install -y git wget build-essential cmake ninja-build git python3-dev ccache ${{ matrix.compiler.packages }} libopenmpi-dev
 
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@v7
