@@ -10,5 +10,6 @@
         "type_traits": "cpp",
         "limits": "cpp"
     },
-    "makefile.configureOnOpen": false
+    "makefile.configureOnOpen": false,
+    "C_Cpp.default.compilerPath": "/usr/bin/clang++-18"
 }
