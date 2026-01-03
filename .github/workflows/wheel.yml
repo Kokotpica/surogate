@@ -24,7 +24,7 @@ jobs:
           - cuda_version: "12.8"
             cuda_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu128"
-            archs: "89;90;100;120"
+            archs: "80;86;89;90;100;120"
             runtime_deps: |
               nvidia-cuda-runtime-cu12>=12.8
               nvidia-cudnn-cu12>=9.0
@@ -34,7 +34,7 @@ jobs:
           - cuda_version: "12.9"
             cuda_image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu129"
-            archs: "89;90;100;120"
+            archs: "80;86;89;90;100;120"
             runtime_deps: |
               nvidia-cuda-runtime-cu12>=12.9
               nvidia-cudnn-cu12>=9.0
@@ -44,7 +44,7 @@ jobs:
           - cuda_version: "13.0"
             cuda_image: "nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu130"
-            archs: "89;90;100f;120f"
+            archs: "80;86;89;90;100;120"
             runtime_deps: |
               cuda-toolkit[cudart,cublas,cufile]>=13.0
               nvidia-cudnn-cu13>=9.0
@@ -52,8 +52,8 @@ jobs:
 
     env:
       CMAKE_GENERATOR: Ninja
-      CMAKE_C_COMPILER: gcc-12
-      CMAKE_CXX_COMPILER: g++-12
+      CMAKE_C_COMPILER: gcc-13
+      CMAKE_CXX_COMPILER: g++-13
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
@@ -64,7 +64,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install deps
-        run: apt update && apt install -y git g++-12
+        run: apt update && apt install -y git g++-13 wget build-essential cmake ninja-build git python3-dev ccache libopenmpi-dev
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
