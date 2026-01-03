@@ -346,6 +346,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.adamw_beta2 = float(cfg.get('adamw_beta2', self.adamw_beta2))
         self.adamw_epsilon = float(cfg.get('adamw_epsilon', self.adamw_epsilon))
         self.eval_steps = cfg.get('eval_steps', self.eval_steps)
+        self.per_device_train_batch_size = cfg.get('per_device_train_batch_size', self.per_device_train_batch_size)
         self.per_device_eval_batch_size = cfg.get('per_device_eval_batch_size', self.per_device_eval_batch_size)
         self.report_to = cfg.get('report_to', self.report_to)
         self.warmup_ratio = float(cfg.get('warmup_ratio', self.warmup_ratio))
