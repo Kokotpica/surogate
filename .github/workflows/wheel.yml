@@ -85,25 +85,39 @@ jobs:
             echo "version=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build wheel
+      - name: Patch version in pyproject.toml
+        if: steps.version.outputs.version != ''
         shell: bash
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          if [[ -n "$VERSION" ]]; then
-            echo "Building with version: $VERSION"
-            echo "Using --no-build-isolation to pass environment variables"
-            # Create a venv and install build dependencies since we're using --no-build-isolation
-            uv venv .build-venv --python=3.12
-            source .build-venv/bin/activate
-            uv pip install scikit-build-core nanobind setuptools-scm build
-            export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"
-            export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SUROGATE="$VERSION"
-            # Use python -m build instead of uv build to ensure env vars are passed
-            python -m build --wheel --no-isolation
-          else
-            echo "No version set, using setuptools-scm to determine version from git"
-            uv build --wheel
-          fi
+          echo "Patching pyproject.toml with version: $VERSION"
+          # Replace dynamic version with static version
+          python3 << EOF
+          import re
+
+          with open('pyproject.toml', 'r') as f:
+              content = f.read()
+
+          # Remove 'version' from dynamic list and add static version
+          content = re.sub(r'dynamic = \["version"\]', f'version = "{VERSION}"', content)
+
+          # Comment out the setuptools_scm version provider
+          content = re.sub(
+              r'metadata\.version\.provider = "scikit_build_core\.metadata\.setuptools_scm"',
+              '# metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"  # disabled for release',
+              content
+          )
+
+          with open('pyproject.toml', 'w') as f:
+              f.write(content)
+
+          print("Patched pyproject.toml:")
+          print(content[:500])
+          EOF
+
+      - name: Build wheel
+        shell: bash
+        run: uv build --wheel
 
       - name: Repair wheel with auditwheel
         run: |
