@@ -4,6 +4,7 @@
 # Seems reasonable, but apparently too much of a niche case for PyPy ?!
 # So the solution is to edit the pyproject.toml as part of the build script in the
 # workflow :(
+import subprocess
 import sys
 import tomlkit
 
@@ -20,7 +21,34 @@ def add_dependencies(deps_str, cuda_tag=None):
 
     # Add CUDA tag to version if provided
     if cuda_tag:
-        current_version = data['project']['version']
+        # Version may be dynamic (computed by setuptools-scm), so we need to get it
+        if 'version' in data['project']:
+            current_version = data['project']['version']
+        else:
+            # Get version from setuptools-scm via git describe
+            result = subprocess.run(
+                ['git', 'describe', '--tags', '--match', 'v*'],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                # Convert git describe output (e.g., v0.1.0-5-gabcdef) to PEP 440
+                git_version = result.stdout.strip().lstrip('v')
+                # If it's a clean tag, use as-is; otherwise extract base version
+                if '-' in git_version:
+                    current_version = git_version.split('-')[0]
+                else:
+                    current_version = git_version
+            else:
+                # Fallback version from setuptools_scm config
+                fallback = data.get('tool', {}).get('setuptools_scm', {}).get('fallback_version', '0.0.1')
+                current_version = fallback
+
+        # Remove 'version' from dynamic list if present
+        if 'dynamic' in data['project'] and 'version' in data['project']['dynamic']:
+            data['project']['dynamic'].remove('version')
+            if not data['project']['dynamic']:
+                del data['project']['dynamic']
+
         data['project']['version'] = f"{current_version}+{cuda_tag}"
 
     with open('pyproject.toml', 'w') as f:
