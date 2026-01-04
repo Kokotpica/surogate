@@ -5,6 +5,7 @@
 #include "nvfp4_recipe.h"
 
 #include <stdexcept>
+#include <tuple>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -547,16 +548,44 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
     const size_t inp_scale_size = compute_nvfp4_cutlass_scale_size(BT, C_in);
     Tensor inp_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(C_in / 2)});
     Tensor inp_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(inp_scale_size)});
-    Tensor inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
 
-    // Step 2: Quantize input to FP4 with two-level scaling
-    quantize_nvfp4_cutlass_auto_scale(
-        inp_fp4_data.get<uint8_t>(),
-        inp_fp4_scales.get<uint8_t>(),
-        inp_global_amax.get<float>(),
-        ctx.inp->get<nv_bfloat16>(),
-        BT, C_in,
-        rs.DeviceProp, ctx.stream);
+    // Step 2: Quantize input to FP4 with two-level scaling.
+    //
+    // Fast path: reuse global amax computed in preceding fused ops (e.g., RMSNorm/SwiGLU)
+    // to avoid a separate abs_max reduction over the full activation tensor. This is
+    // especially important on very fast GPUs (B200) where GEMM is no longer dominant.
+    float* inp_global_amax_ptr = nullptr;
+    Tensor inp_global_amax{};
+    bool inp_amax_is_temp = false;
+    {
+        Tensor* unused_data = nullptr;
+        Tensor* unused_scales = nullptr;
+        float* precomputed_amax = nullptr;
+        std::tie(unused_data, unused_scales, precomputed_amax) =
+            rs.get_fp4_forward_buffers(static_cast<int>(ctx.op));
+
+        if (precomputed_amax) {
+            inp_global_amax_ptr = precomputed_amax;
+            quantize_nvfp4_cutlass_from_amax(
+                inp_fp4_data.get<uint8_t>(),
+                inp_fp4_scales.get<uint8_t>(),
+                inp_global_amax_ptr,
+                ctx.inp->get<nv_bfloat16>(),
+                BT, C_in,
+                rs.DeviceProp, ctx.stream);
+        } else {
+            inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+            inp_global_amax_ptr = inp_global_amax.get<float>();
+            inp_amax_is_temp = true;
+            quantize_nvfp4_cutlass_auto_scale(
+                inp_fp4_data.get<uint8_t>(),
+                inp_fp4_scales.get<uint8_t>(),
+                inp_global_amax_ptr,
+                ctx.inp->get<nv_bfloat16>(),
+                BT, C_in,
+                rs.DeviceProp, ctx.stream);
+        }
+    }
 
     // Step 3: Get FP4 weight (cached or quantize on-the-fly)
     const uint8_t* weight_fp4_data_ptr;
@@ -597,7 +626,7 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
     Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
     compute_fp4_alpha(
         alpha.get<float>(),
-        inp_global_amax.get<float>(),
+        inp_global_amax_ptr,
         weight_amax_ptr,
         ctx.stream);
 
@@ -631,7 +660,9 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
         rs.temp_free(weight_fp4_scales);
         rs.temp_free(weight_fp4_data);
     }
-    rs.temp_free(inp_global_amax);
+    if (inp_amax_is_temp) {
+        rs.temp_free(inp_global_amax);
+    }
     rs.temp_free(inp_fp4_scales);
     rs.temp_free(inp_fp4_data);
 }

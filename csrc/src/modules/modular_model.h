@@ -885,10 +885,12 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
         // For L=0: just normalize encoded (no residual accumulation)
         // For L>0: accumulate prev.residual_att + prev.mlp_down into get_residual(l-1)
         // Determine abs_max pointer for RMSNorm: for FP8 forward, we need abs_max computed
-        // so forward_qmm_fp8 can use it for input quantization.
+        // so the recipe can reuse it for input quantization (FP8/FP4).
         float* ln1_abs_max_ptr = nullptr;
         if (rs.has_fp8_forward()) {
             ln1_abs_max_ptr = rs.fp8_forward_quants().ln1.abs_max();
+        } else if (rs.has_fp4_forward()) {
+            ln1_abs_max_ptr = rs.fp4_forward_quants().ln1_global_amax;
         } else if (rs.has_activation_quants()) {
             ln1_abs_max_ptr = q.ln1.abs_max();
         }
@@ -988,9 +990,11 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
             attention_forward_cudnn(acts.att, acts.lse, qkv_for_attn, rs.CuBlasWorkspace,
                                     rs.CudnnHandle, B, T, Hq, Hkv, Hs, main_stream);
 
-            // Compute abs_max for attention output (needed for FP8 quantization in output projection)
+            // Compute abs_max for attention output (used by FP8/FP4 recipes for output projection quantization)
             if (rs.has_fp8_forward()) {
                 abs_max(rs.fp8_forward_quants().att.abs_max(), acts.att, (long)acts.att.nelem(), rs.DeviceProp, main_stream);
+            } else if (rs.has_fp4_forward()) {
+                abs_max(rs.fp4_forward_quants().att_global_amax, acts.att, (long)acts.att.nelem(), rs.DeviceProp, main_stream);
             } else if (rs.has_activation_quants()) {
                 abs_max(q.att.abs_max(), acts.att, (long)acts.att.nelem(), rs.DeviceProp, main_stream);
             }
@@ -1031,6 +1035,8 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
             float* ln2_abs_max_ptr = nullptr;
             if (rs.has_fp8_forward()) {
                 ln2_abs_max_ptr = rs.fp8_forward_quants().ln2.abs_max();
+            } else if (rs.has_fp4_forward()) {
+                ln2_abs_max_ptr = rs.fp4_forward_quants().ln2_global_amax;
             } else if (rs.has_activation_quants()) {
                 ln2_abs_max_ptr = q.ln2.abs_max();
             }
@@ -1081,10 +1087,12 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     }
 
                     // 8) SwiGLU activation
-                    // Determine abs_max pointer for swiglu output (for FP8 quantization in MLP down)
+                    // Determine abs_max pointer for swiglu output (used by FP8/FP4 recipes for MLP down quantization)
                     float* swiglu_abs_max_ptr = nullptr;
                     if (rs.has_fp8_forward()) {
                         swiglu_abs_max_ptr = rs.fp8_forward_quants().swiglu.abs_max();
+                    } else if (rs.has_fp4_forward()) {
+                        swiglu_abs_max_ptr = rs.fp4_forward_quants().swiglu_global_amax;
                     } else if (rs.has_activation_quants()) {
                         swiglu_abs_max_ptr = q.swiglu.abs_max();
                     }
@@ -1159,10 +1167,12 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     }
 
                     // 8) SwiGLU activation
-                    // Determine abs_max pointer for swiglu output (for FP8 quantization in MLP down)
+                    // Determine abs_max pointer for swiglu output (used by FP8/FP4 recipes for MLP down quantization)
                     float* swiglu_abs_max_ptr2 = nullptr;
                     if (rs.has_fp8_forward()) {
                         swiglu_abs_max_ptr2 = rs.fp8_forward_quants().swiglu.abs_max();
+                    } else if (rs.has_fp4_forward()) {
+                        swiglu_abs_max_ptr2 = rs.fp4_forward_quants().swiglu_global_amax;
                     } else if (rs.has_activation_quants()) {
                         swiglu_abs_max_ptr2 = q.swiglu.abs_max();
                     }
@@ -1913,8 +1923,14 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
                                   mConfig.RmsNormEps, B, T, C, stream);
             // Note: a.ln1 not needed in recompute mode, only quantized buffer q.ln1
         } else {
+            float* ln1_abs_max_ptr = nullptr;
+            if (rs.has_fp4_forward()) {
+                ln1_abs_max_ptr = rs.fp4_forward_quants().ln1_global_amax;
+            } else if (rs.has_activation_quants()) {
+                ln1_abs_max_ptr = q.ln1.abs_max();
+            }
             rmsnorm_forward(a.ln1, a.ln1_rstd, residual, weights.ln1.weight,
-                            rs.has_activation_quants() ? q.ln1.abs_max() : nullptr,
+                            ln1_abs_max_ptr,
                             mConfig.RmsNormEps, B, T, C, stream);
         }
     }
@@ -1979,9 +1995,11 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
         attention_forward_cudnn(a.att, a.lse, a.qkv, rs.CuBlasWorkspace,
                                 rs.CudnnHandle, B, T, Hq, Hkv, Hs, stream);
 
-        // Compute abs_max for attention output (needed for FP8 quantization in output projection)
+        // Compute abs_max for attention output (used by FP8/FP4 recipes for output projection quantization)
         if (rs.has_fp8_forward()) {
             abs_max(rs.fp8_forward_quants().att.abs_max(), a.att, (long)a.att.nelem(), rs.DeviceProp, stream);
+        } else if (rs.has_fp4_forward()) {
+            abs_max(rs.fp4_forward_quants().att_global_amax, a.att, (long)a.att.nelem(), rs.DeviceProp, stream);
         } else if (rs.has_activation_quants()) {
             abs_max(q.att.abs_max(), a.att, (long)a.att.nelem(), rs.DeviceProp, stream);
         }
@@ -2015,6 +2033,12 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
 
     // Recompute LN2
     if (recompute_ln2) {
+        float* ln2_abs_max_ptr = nullptr;
+        if (rs.has_fp4_forward()) {
+            ln2_abs_max_ptr = rs.fp4_forward_quants().ln2_global_amax;
+        } else if (rs.has_activation_quants()) {
+            ln2_abs_max_ptr = q.ln2.abs_max();
+        }
         if (mOptions.recompute_block) {
             fused_residual_rmsnorm_forward(
                 a.residual_att,
@@ -2023,7 +2047,7 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
                 residual,
                 a.att_out,
                 weights.ln2.weight,
-                rs.has_activation_quants() ? q.ln2.abs_max() : nullptr,
+                ln2_abs_max_ptr,
                 mConfig.RmsNormEps,
                 B * T,
                 C,
@@ -2031,7 +2055,7 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
             );
         } else {
             rmsnorm_forward(a.ln2, a.ln2_rstd, a.residual_att, weights.ln2.weight,
-                            rs.has_activation_quants() ? q.ln2.abs_max() : nullptr,
+                            ln2_abs_max_ptr,
                             mConfig.RmsNormEps, B, T, C, stream);
         }
     }
@@ -2078,6 +2102,8 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
             float* swiglu_abs_max_ptr = nullptr;
             if (rs.has_fp8_forward()) {
                 swiglu_abs_max_ptr = rs.fp8_forward_quants().swiglu.abs_max();
+            } else if (rs.has_fp4_forward()) {
+                swiglu_abs_max_ptr = rs.fp4_forward_quants().swiglu_global_amax;
             } else if (rs.has_activation_quants()) {
                 swiglu_abs_max_ptr = q.swiglu.abs_max();
             }

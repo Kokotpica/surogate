@@ -919,6 +919,33 @@ void quantize_nvfp4_cutlass_auto_scale(
 }
 
 /**
+ * @brief Host launcher for NVFP4 quantization using a pre-computed global amax.
+ *
+ * This skips the abs_max reduction and directly uses `global_amax` for two-level scaling.
+ * Intended to reuse amax computed in preceding fused ops (e.g., RMSNorm/SwiGLU) to
+ * reduce extra memory traffic on fast GPUs.
+ */
+void quantize_nvfp4_cutlass_from_amax(
+    uint8_t* out_fp4,
+    uint8_t* block_scales,
+    const float* global_amax,
+    const nv_bfloat16* in,
+    int M, int K,
+    const cudaDeviceProp& dp,
+    cudaStream_t stream)
+{
+    (void)dp;
+    const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
+
+    dim3 grid(div_ceil(M, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
+    const int threads_per_block = 256;
+
+    quantize_nvfp4_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
+        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
  * @brief Host launcher for NVFP4 stochastic quantization with two-level scaling.
  */
 void quantize_nvfp4_stochastic_cutlass_auto_scale(
@@ -946,6 +973,30 @@ void quantize_nvfp4_stochastic_cutlass_auto_scale(
 }
 
 /**
+ * @brief Host launcher for NVFP4 stochastic quantization using a pre-computed global amax.
+ */
+void quantize_nvfp4_stochastic_cutlass_from_amax(
+    uint8_t* out_fp4,
+    uint8_t* block_scales,
+    const float* global_amax,
+    const nv_bfloat16* in,
+    int M, int K,
+    unsigned int seed,
+    const cudaDeviceProp& dp,
+    cudaStream_t stream)
+{
+    (void)dp;
+    const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
+
+    dim3 grid(div_ceil(M, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
+    const int threads_per_block = 256;
+
+    quantize_nvfp4_stochastic_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
+        out_fp4, block_scales, global_amax, in, M, K, num_scale_cols, seed);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
  * @brief Host launcher for NVFP4 weight quantization with two-level scaling.
  */
 void quantize_nvfp4_weight_cutlass_auto_scale(
@@ -961,6 +1012,29 @@ void quantize_nvfp4_weight_cutlass_auto_scale(
     abs_max(global_amax, in, (long)N * K, dp, stream);
 
     // 2) Quantize with on-device auto-scaling
+    const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
+
+    dim3 grid(div_ceil(N, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));
+    const int threads_per_block = 256;
+
+    quantize_nvfp4_weight_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
+        out_fp4, block_scales, global_amax, in, N, K, num_scale_cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
+ * @brief Host launcher for NVFP4 weight quantization using a pre-computed global amax.
+ */
+void quantize_nvfp4_weight_cutlass_from_amax(
+    uint8_t* out_fp4,
+    uint8_t* block_scales,
+    const float* global_amax,
+    const nv_bfloat16* in,
+    int N, int K,
+    const cudaDeviceProp& dp,
+    cudaStream_t stream)
+{
+    (void)dp;
     const int num_scale_cols = div_ceil(K, kNVFP4BlockSize);
 
     dim3 grid(div_ceil(N, kNVFP4TileDim), div_ceil(K, kNVFP4TileDim));

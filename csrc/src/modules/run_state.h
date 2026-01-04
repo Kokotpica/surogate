@@ -16,6 +16,7 @@
 #include "fp8_scaling_config.h"
 #include "fp8_scaling_state.h"
 #include "module_concept.h"
+#include "modules/matmul_context.h"
 #include "training/model.h"  // For IRunState base class
 #include "utilities/allocator.h"
 #include "utilities/tensor.h"
@@ -454,6 +455,34 @@ public:
     [[nodiscard]] bool has_fp4_hadamard() const override { return mConfig.enable_fp4_hadamard; }
     [[nodiscard]] bool has_scaled_swiglu() const override { return mConfig.enable_scaled_swiglu; }
     FP4ForwardQuantActivations& fp4_forward_quants() { return mFP4ForwardQuants; }
+
+    /// @brief Provide FP4 forward buffers to recipes (data, scales, global amax).
+    ///
+    /// Note: The returned (data, scales) buffers are allocated for the cuDNN FP4 layout.
+    /// Recipes that only need the global amax (e.g., CUTLASS NVFP4) can still reuse the
+    /// amax pointer to avoid a separate abs_max reduction.
+    [[nodiscard]] std::tuple<Tensor*, Tensor*, float*> get_fp4_forward_buffers(int op) override {
+        if (!has_fp4_forward()) return {nullptr, nullptr, nullptr};
+        const auto matmul_op = static_cast<MatmulOp>(op);
+        switch (matmul_op) {
+            case MatmulOp::QKV:
+                return {&mFP4ForwardQuants.ln1_data, &mFP4ForwardQuants.ln1_scales, mFP4ForwardQuants.ln1_global_amax};
+            case MatmulOp::MLPUp:
+                return {&mFP4ForwardQuants.ln2_data, &mFP4ForwardQuants.ln2_scales, mFP4ForwardQuants.ln2_global_amax};
+            case MatmulOp::AttnOut:
+                return {&mFP4ForwardQuants.att_data, &mFP4ForwardQuants.att_scales, mFP4ForwardQuants.att_global_amax};
+            case MatmulOp::MLPDown:
+                return {&mFP4ForwardQuants.swiglu_data, &mFP4ForwardQuants.swiglu_scales, mFP4ForwardQuants.swiglu_global_amax};
+            default:
+                return {nullptr, nullptr, nullptr};
+        }
+    }
+
+    [[nodiscard]] Tensor* get_hadamard_workspace() override {
+        if (!has_fp4_hadamard()) return nullptr;
+        if (!mFP4ForwardQuants.hadamard_workspace.Data) return nullptr;
+        return &mFP4ForwardQuants.hadamard_workspace;
+    }
 
     // ========================================================================
     // CUDA synchronization resources

@@ -781,17 +781,36 @@ void quantize_nvfp4_cutlass_auto_scale(uint8_t* out_fp4, uint8_t* block_scales,
                                         int M, int K,
                                         const cudaDeviceProp& dp, cudaStream_t stream);
 
+/// @brief NVFP4 quantization using a pre-computed global amax (skips abs_max reduction).
+/// Useful on fast GPUs (e.g., B200) where separate amax kernels dominate runtime.
+void quantize_nvfp4_cutlass_from_amax(uint8_t* out_fp4, uint8_t* block_scales,
+                                       const float* global_amax, const nv_bfloat16* in,
+                                       int M, int K,
+                                       const cudaDeviceProp& dp, cudaStream_t stream);
+
 /// @brief NVFP4 stochastic quantization with two-level scaling (global + block).
 void quantize_nvfp4_stochastic_cutlass_auto_scale(uint8_t* out_fp4, uint8_t* block_scales,
                                                    float* global_amax, const nv_bfloat16* in,
                                                    int M, int K, unsigned int seed,
                                                    const cudaDeviceProp& dp, cudaStream_t stream);
 
+/// @brief NVFP4 stochastic quantization using a pre-computed global amax (skips abs_max reduction).
+void quantize_nvfp4_stochastic_cutlass_from_amax(uint8_t* out_fp4, uint8_t* block_scales,
+                                                  const float* global_amax, const nv_bfloat16* in,
+                                                  int M, int K, unsigned int seed,
+                                                  const cudaDeviceProp& dp, cudaStream_t stream);
+
 /// @brief NVFP4 weight quantization with two-level scaling (global + block).
 void quantize_nvfp4_weight_cutlass_auto_scale(uint8_t* out_fp4, uint8_t* block_scales,
                                                float* global_amax, const nv_bfloat16* in,
                                                int N, int K,
                                                const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief NVFP4 weight quantization using a pre-computed global amax (skips abs_max reduction).
+void quantize_nvfp4_weight_cutlass_from_amax(uint8_t* out_fp4, uint8_t* block_scales,
+                                              const float* global_amax, const nv_bfloat16* in,
+                                              int N, int K,
+                                              const cudaDeviceProp& dp, cudaStream_t stream);
 
 /// @brief NVFP4 dequantization with CUTLASS-compatible scale layout.
 /// Converts FP4 E2M1 with UE4M3 block scales back to BF16 (fake quantization).
