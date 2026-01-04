@@ -220,9 +220,26 @@ auto lookup_cache_or_build_graph_bwd(int B, int Hq, int Hkv, int T, int HS, cudn
                             .set_is_pass_by_value(true)
                             .set_uid(Attn_scale_UID)
                             .set_data_type(fe::DataType_t::FLOAT));
+    // Deterministic algorithm requires cuDNN 9.18.0+ on Blackwell (SM100+)
+    // Check at runtime whether we can enable it
+    bool use_deterministic = false;
+#if CUDNN_FRONTEND_MAJOR_VERSION > 1 || CUDNN_FRONTEND_MINOR_VERSION >= 5
+    {
+        int device;
+        cudaGetDevice(&device);
+        cudaDeviceProp props;
+        cudaGetDeviceProperties(&props, device);
+        int sm_version = props.major * 10 + props.minor;
+        size_t cudnn_version = cudnnGetVersion();
+        // Blackwell (SM100+) requires cuDNN 9.18.0 (91800) for deterministic backward
+        if (sm_version < 100 || cudnn_version >= 91800) {
+            use_deterministic = true;
+        }
+    }
+#endif
     auto sdpa_backward_options = fe::graph::SDPA_backward_attributes().set_name("flash_attention_backward")
 #if CUDNN_FRONTEND_MAJOR_VERSION > 1 || CUDNN_FRONTEND_MINOR_VERSION >= 5
-                            .set_deterministic_algorithm(true) // 1.5+ needs this for determinism
+                            .set_deterministic_algorithm(use_deterministic)
 #endif
                             .set_causal_mask(true)
                             .set_attn_scale(attn_scale);
