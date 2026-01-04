@@ -5,7 +5,7 @@
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
 |----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
 | **Qwen3 0.6B** | 19k         | 22,9k        | 32k           | 38,3k        | 33,6k         | 41k          | 35.9k         |
-| **Qwen3 1.7B** | 11,7k       | 12,1k        | 15,2k         | 20,7k        | 19,0k         | 24,2k        | 19,5k         |
+| **Qwen3 1.7B** | 11,7k       | 12,1k        | 15,2k         | 20,7k        | 19,0k         | 24,6k        | 19,5k         |
 | **Qwen3 4B**   | 5,6k        | 5,8k         | 7,2k          | 9,5k         | 8,8k          | 12,0k        | 9,1k          |
 | **Qwen3 8B**   | 3,6k        | 3,4k         | 4,2k          | 5,9k         | 5,3k          | 8,2k         | 5,5k          | 
  
@@ -24,7 +24,8 @@
 | **Qwen3 0.6B** | 21k         | 24,5k        | 62k           | 58k          | 45,6k         | -            | -             |
 | **Qwen3 1.7B** | 20k         | 23k          | 37,5k         | 37,5k        | 30.6k         | -            | -             |
 | **Qwen3 4B**   | 12,6k       | 13,1k        | 17,5k         | 18.7k        | 15,5k         | -            | -             |
-| **Qwen3 8B**   | 8,6k        | 9,1k         | 11,5          | 12,8k        | 10,2k         | -            | -             |
+| **Qwen3 8B**   | 8,6k        | 9,1k         | 11,6k         | 12,9k        | 10,2k         | -            | -             |
+| **Qwen3 14B**  | 5,2k        | 5,6k         | 6,8k          | 8k           | 6,2k          | -            | -             |
 
 * Surogate BF16 achieves up to 3x throughput on small models (0.6B) due to better memory bandwidth utilization on datacenter GPUs.
 * FP8 matches BF16 throughput while enabling larger batch sizes through reduced memory footprint.
@@ -48,28 +49,19 @@
   * Surogate FP8: +124%
   * Surogate QFP8: +77%
 
-WARNING: unknown device NVIDIA H200
 
-
-## GPU: 1x NVIDIA B200 (CUDA 12.8)
+## GPU: 1x NVIDIA B200 (CUDA 13, cuDNN 9.17)
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
 |----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
-| **Qwen3 0.6B** |             |              | 77k           | 70,6k        | 51,8k         |              | 60k           |
-| **Qwen3 1.7B** |             |              | 55,1k         | 53,7k        | 37,9k         |              | 44,1k         |
-| **Qwen3 4B**   |             |              | 27,5k         | 28k          | 19k           |              | 22,3k         |
-| **Qwen3 8B**   |             |              | 19,5k         | 21,4k        | 12,9k         |              | 15,7k         | 
+| **Qwen3 0.6B** | 17k         | 19,1k        | 95k           | 86k          | 51,8k         | 67k          |               |
+| **Qwen3 1.7B** | 16,7k       | 20,3K        | 65k           | 62k          | 43k           | 46,9k        |               |
+| **Qwen3 4B**   | 13,1k       | 14,8K        | 32k           | 33,5k        | 21,4k         | 24,5k        |               |
+| **Qwen3 8B**   | 11,3k       | 12,4K        | 21,3k         | 24,2k        | 13,8k         | 18k          |               | 
+| **Qwen3 14B**  |             | 8,6k         | 12,9k         | 15k          | 8,1k          | 11,5k        |               | 
+| **Qwen3 32B**  |             | 4,2k         | 5,8k          | 6,8k         |               | 5,3k         | 4,8k          | 
 
-WARNING: unknown device NVIDIA B200
+* If FP4 underperforms FP8 on B200, it’s usually overhead-dominated: FP4 needs a global amax (two-level scaling), and older builds computed that amax with a full-tensor `abs_max` reduction per matmul. On very fast SM100 GPUs this extra memory pass can outweigh the FP4 GEMM speedup; the fix is to reuse amax computed inside RMSNorm/SwiGLU/attention and skip the extra reduction in the FP4 quantizer.
 
-FP4:
- File "/root/.venv/lib/python3.12/site-packages/surogate/train/trainer.py", line 214, in run_training_loop
-    self.trainer.step(in_tokens, out_tokens)
-RuntimeError: CUTLASS FP4 GEMM (alpha-ptr) not compiled for this architecture. Ensure CUDA_ARCHITECTURES includes 120 or 121.
-terminate called after throwing an instance of 'cuda_error'
-  what():  Cuda Error in /__w/surogate/surogate/csrc/src/binding/py_train.cpp:81 (cudaSetDevice(ctx.Communicator->rank())): cudaErrorInvalidDevice: invalid device ordinal
-
-compute_cap
-10.0
 
 ## GPU: 1x NVIDIA B300 SXM6 AC (CUDA 13.0)
 | Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
@@ -105,8 +97,9 @@ compute_cap
 | **Qwen3 0.6B** | 4.0         | 5.4          | 5.0           | 5.5          | 4.8           |
 | **Qwen3 1.7B** | 5.0         | 8.8          | 7.4           | 9            | 6.9           |
 | **Qwen3 4B**   | 7.6         | 16           | 12.0          | 16           | 10.7          |
-| **Qwen3 8B**   | 11.8        | 26.7         | 20.1          | 27.3         | 17.5          |
-
+| **Qwen3 8B**   | 11.8        | 27.0         | 32.0          | 27.3         | 17.5          |
+| **Qwen3 14B**  | 11.8        | 43.0         | 59.0          | 42,6         | hang on 100% gpu usage          |
+| **Qwen3 32B**  |             | 84,6         |               | 84.0         | 105           |
 
 --
 
@@ -145,7 +138,7 @@ Configurations used:
 # Unsloth install
 ```shell
 apt install -y python3-dev
-curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv --python=3.12
 source .venv/bin/activate
 uv pip install unsloth
 ```
