@@ -21,9 +21,14 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
             string(REGEX REPLACE "^([0-9]+)\\.([0-9]+)$" "\\1\\2" _SUROGATE_CUDA_CC_DIGITS "${_SUROGATE_NVIDIA_SMI_CC0}")
 
             # Some CUTLASS kernels use "arch-conditional" MMA instructions which
-            # require targeting the feature-variant architecture (e.g. `90a`, `120a`).
+            # require targeting the feature-variant architecture (e.g. `90a`, `100a`, `103a`, `120a`).
+            # The 'a' suffix enables tcgen05.mma and block-scaled MMA features (FP4).
             if(_SUROGATE_CUDA_CC_DIGITS STREQUAL "90")
                 set(CMAKE_CUDA_ARCHITECTURES 90a)
+            elseif(_SUROGATE_CUDA_CC_DIGITS STREQUAL "100")
+                set(CMAKE_CUDA_ARCHITECTURES 100a)
+            elseif(_SUROGATE_CUDA_CC_DIGITS STREQUAL "103")
+                set(CMAKE_CUDA_ARCHITECTURES 103a)
             elseif(_SUROGATE_CUDA_CC_DIGITS STREQUAL "120")
                 set(CMAKE_CUDA_ARCHITECTURES 120a)
             elseif(_SUROGATE_CUDA_CC_DIGITS STREQUAL "121")
@@ -66,7 +71,7 @@ FetchContent_Declare(
 FetchContent_Declare(
         cudnn-fe
         GIT_REPOSITORY https://github.com/NVIDIA/cudnn-frontend.git
-        GIT_TAG v1.12.0
+        GIT_TAG v1.17.0
         EXCLUDE_FROM_ALL
 )
 
@@ -107,10 +112,11 @@ set(CUTLASS_ENABLE_TOOLS OFF CACHE BOOL "Enable CUTLASS tools")
 set(CUTLASS_ENABLE_PROFILER OFF CACHE BOOL "Enable CUTLASS profiler")
 # set(CUTLASS_ENABLE_LIBRARY OFF CACHE BOOL "Enable CUTLASS library")
 # set(CUTLASS_LIBRARY_KERNELS "" CACHE STRING "Comma-separated list of kernel name filters")
-# Only build for SM80+ (Ampere/Hopper/Blackwell/Next-gen): 80, 86, 87, 89, 90, 90a, 100, 103, 120
-# SM80-87: Ampere, SM89: Ada, SM90/90a: Hopper, SM100: Blackwell B200, SM103: Blackwell B300, SM120: RTX 50x0/DGX Spark
-set(CUTLASS_NVCC_ARCHS "89;90;90a;100;103;120;120a;121;121a" CACHE STRING "CUDA architectures for CUTLASS")
-set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100;103;120;120a;121;121a" CACHE STRING "NVCC archs to build library kernels")
+# Only build for SM80+ (Ampere/Hopper/Blackwell/Next-gen): 80, 86, 87, 89, 90, 90a, 100a, 103a, 120a
+# SM80-87: Ampere, SM89: Ada, SM90/90a: Hopper, SM100a: Blackwell B200, SM103a: Blackwell B300, SM120a: RTX 50x0/DGX Spark
+# Note: SM100/103/120 require 'a' suffix for tcgen05.mma and block-scaled MMA features (FP4)
+set(CUTLASS_NVCC_ARCHS "89;90;90a;100a;103a;120a;121a" CACHE STRING "CUDA architectures for CUTLASS")
+set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100a;103a;120a;121a" CACHE STRING "NVCC archs to build library kernels")
 
 FetchContent_Declare(
         cutlass
