@@ -2239,6 +2239,14 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
                 ctx.skip_weight_grad = lora_only;
                 ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
 
+                // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+                if (mWeights->has_fp4_dgrad_cache()) {
+                    auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+                    ctx.cached_fp4_data = &fp4_t.mlp_down_weight.data;
+                    ctx.cached_fp4_scales = &fp4_t.mlp_down_weight.scales;
+                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 3;
+                }
+
                 mRecipe->backward_matmul(ctx);
             } else {
                 // BF16/FP4 backward (used by NVFP4Recipe, NVFP4SimpleRecipe)
@@ -2320,6 +2328,14 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
                 ctx.skip_weight_grad = lora_only;
                 ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
 
+                // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+                if (mWeights->has_fp4_dgrad_cache()) {
+                    auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+                    ctx.cached_fp4_data = &fp4_t.mlp_up_weight.data;
+                    ctx.cached_fp4_scales = &fp4_t.mlp_up_weight.scales;
+                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 2;
+                }
+
                 mRecipe->backward_matmul(ctx);
             } else {
                 // BF16/FP4 backward (used by NVFP4Recipe, NVFP4SimpleRecipe)
@@ -2391,6 +2407,14 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
                 ctx.accumulate = accumulate;
                 ctx.skip_weight_grad = lora_only;
                 ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
+
+                // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+                if (mWeights->has_fp4_dgrad_cache()) {
+                    auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+                    ctx.cached_fp4_data = &fp4_t.o_weight.data;
+                    ctx.cached_fp4_scales = &fp4_t.o_weight.scales;
+                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 1;
+                }
 
                 mRecipe->backward_matmul(ctx);
             } else {
@@ -2585,6 +2609,14 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
                 ctx.accumulate = accumulate;
                 ctx.skip_weight_grad = lora_only;
                 ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
+
+                // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
+                if (mWeights->has_fp4_dgrad_cache()) {
+                    auto& fp4_t = mWeights->fp4_weight_cache_transposed();
+                    ctx.cached_fp4_data = &fp4_t.qkv_weight.data;
+                    ctx.cached_fp4_scales = &fp4_t.qkv_weight.scales;
+                    ctx.cached_fp4_amax = mWeights->fp4_weight_amax().template get<float>() + 0;
+                }
 
                 mRecipe->backward_matmul(ctx);
             } else {
@@ -2909,6 +2941,13 @@ template<typename Block>
 void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& options, NCCLCommunicator& comm,
                                                          int B, int T, bool allocate_optimizer) {
     NVTX_RANGE_FN();
+
+    // B200/B300 optimization: persist FP4 base weights across steps in LoRA/frozen-base mode.
+    // This avoids re-quantizing/transposing BF16 base weights every iteration, which can make
+    // NVFP4 slower than FP8 on very fast datacenter GPUs.
+    if (options.enable_fp4_forward) {
+        mWeights->maybe_enable_fp4_persistent_cache(/*weights_static=*/options.skip_base_gradients);
+    }
 
     // Create run state config
     typename ModularRunState<Block>::Config rs_config;

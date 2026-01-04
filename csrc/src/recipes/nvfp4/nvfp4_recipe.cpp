@@ -701,28 +701,50 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
             BT, OC, sr_seed,
             rs.DeviceProp, ctx.stream);
 
-        // Quantize W^T (B) for dgrad with two-level scaling.
-        // Fused path: quantize-and-transpose directly from the original (OC, C) BF16 weight,
-        // avoiding an explicit BF16 transpose (which is costly on bandwidth-rich GPUs like B200).
-        const size_t w_scale_size = compute_nvfp4_cutlass_scale_size(C, OC);
-        Tensor w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)});
-        Tensor w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)});
-        Tensor w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        // Prepare W (B) for dgrad with two-level scaling.
+        // Preferred path on B200/B300: use a cached FP4 W^T (transposed layout) produced by the weight manager.
+        // Fallback: quantize-and-transpose directly from the original (OC, C) BF16 weight.
+        const bool use_cached_wt = (ctx.cached_fp4_data != nullptr &&
+                                    ctx.cached_fp4_scales != nullptr &&
+                                    ctx.cached_fp4_amax != nullptr);
 
-        quantize_nvfp4_weight_cutlass_transpose_auto_scale(
-            w_fp4.get<uint8_t>(),
-            w_scales.get<uint8_t>(),
-            w_amax.get<float>(),
-            ctx.weight->get<nv_bfloat16>(),
-            /*N=*/OC, /*K=*/C,
-            rs.DeviceProp, ctx.stream);
+        const uint8_t* w_fp4_ptr = nullptr;
+        const uint8_t* w_scales_ptr = nullptr;
+        const float* w_amax_ptr = nullptr;
+
+        Tensor w_fp4{};
+        Tensor w_scales{};
+        Tensor w_amax{};
+
+        if (use_cached_wt) {
+            w_fp4_ptr = ctx.cached_fp4_data->get<uint8_t>();
+            w_scales_ptr = ctx.cached_fp4_scales->get<uint8_t>();
+            w_amax_ptr = ctx.cached_fp4_amax;
+        } else {
+            const size_t w_scale_size = compute_nvfp4_cutlass_scale_size(C, OC);
+            w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)});
+            w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)});
+            w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+
+            quantize_nvfp4_weight_cutlass_transpose_auto_scale(
+                w_fp4.get<uint8_t>(),
+                w_scales.get<uint8_t>(),
+                w_amax.get<float>(),
+                ctx.weight->get<nv_bfloat16>(),
+                /*N=*/OC, /*K=*/C,
+                rs.DeviceProp, ctx.stream);
+
+            w_fp4_ptr = w_fp4.get<uint8_t>();
+            w_scales_ptr = w_scales.get<uint8_t>();
+            w_amax_ptr = w_amax.get<float>();
+        }
 
         // Compute alpha on device
         Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
         compute_fp4_alpha(
             alpha.get<float>(),
             dout_amax.get<float>(),
-            w_amax.get<float>(),
+            w_amax_ptr,
             ctx.stream);
 
         // dinp = dout @ W^T with alpha fused in epilogue (direct BF16 output)
@@ -733,9 +755,9 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
         matmul_cutlass_fp4_alpha(
             ctx.dinp->get<nv_bfloat16>(),
             dout_fp4.get<uint8_t>(),   // A = dout (BT, OC)
-            w_fp4.get<uint8_t>(),      // B = W^T (C, OC) column-major
+            w_fp4_ptr,                 // B = W^T (C, OC) column-major
             dout_scales.get<uint8_t>(),
-            w_scales.get<uint8_t>(),
+            w_scales_ptr,
             alpha.get<float>(),
             rs.CuBlasWorkspace.get<std::byte>(),
             rs.CuBlasWorkspace.bytes(),
@@ -743,9 +765,11 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
             ctx.stream);
 
         rs.temp_free(alpha);
-        rs.temp_free(w_amax);
-        rs.temp_free(w_scales);
-        rs.temp_free(w_fp4);
+        if (!use_cached_wt) {
+            rs.temp_free(w_amax);
+            rs.temp_free(w_scales);
+            rs.temp_free(w_fp4);
+        }
         rs.temp_free(dout_amax);
         rs.temp_free(dout_scales);
         rs.temp_free(dout_fp4);

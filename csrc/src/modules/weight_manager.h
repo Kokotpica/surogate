@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -362,6 +363,40 @@ public:
     }
 
     /**
+     * @brief Check if FP4 dgrad (transposed) weight caching is enabled.
+     *
+     * When enabled, we keep per-layer FP4 weights in transposed layout for the dgrad GEMM
+     * (dinp = dout @ W). This avoids re-quantizing/transposing BF16 weights every backward pass
+     * and is primarily beneficial on B200/B300 where FP4 GEMMs are so fast that weight prep
+     * becomes the bottleneck.
+     */
+    [[nodiscard]] bool has_fp4_dgrad_cache() const {
+        return mFP4PersistentCacheEnabled;
+    }
+
+    /**
+     * @brief Get FP4 weights in transposed layout for the current layer (dgrad B matrix).
+     *
+     * Valid only after get_block() is called for the same layer.
+     */
+    [[nodiscard]] FP4WeightCache& fp4_weight_cache_transposed() {
+        return mFP4WeightCacheT;
+    }
+    [[nodiscard]] const FP4WeightCache& fp4_weight_cache_transposed() const {
+        return mFP4WeightCacheT;
+    }
+
+    /**
+     * @brief Enable per-layer FP4 weight caching for Blackwell datacenter GPUs.
+     *
+     * Allocates persistent FP4 caches for all layers (forward + transposed/dgrad layouts).
+     * Intended for LoRA/frozen-base training on B200/B300 where FP4 can be overhead-dominated.
+     *
+     * @param weights_static When true, cached FP4 weights are treated as immutable across steps.
+     */
+    void maybe_enable_fp4_persistent_cache(bool weights_static);
+
+    /**
      * @brief Get the FP4 weight global amax tensor
      *
      * Contains 4 floats: [qkv_amax, o_amax, mlp_up_amax, mlp_down_amax]
@@ -484,8 +519,19 @@ private:
     // Holds FP4 quantized weights with CUTLASS layout for fast forward pass matmuls.
     // Optimizes datacenter GPUs where weight quantization overhead dominates.
     FP4WeightCache mFP4WeightCache{};
+    FP4WeightCache mFP4WeightCacheT{};   ///< FP4 weights in transposed layout (dgrad GEMM)
     Tensor mFP4WeightAmax{};           ///< Device buffer for global amax values (4 floats)
     int mFP4CacheLayerIdx = -1;        ///< Which layer is currently in the FP4 cache
+
+    // Persistent per-layer FP4 caches (opt-in, for Blackwell datacenter GPUs).
+    bool mFP4PersistentCacheEnabled = false;
+    bool mFP4PersistentCacheStatic = false;
+    std::vector<int> mFP4PersistentCacheVersion;  ///< Per-layer version tracking (-1 = not cached)
+    Tensor mFP4WeightAmaxAll{};                   ///< (num_layers*4,) global amax storage for all layers
+    std::array<Tensor, 4> mFP4WeightDataAll{};    ///< Forward FP4 packed weights for all layers
+    std::array<Tensor, 4> mFP4WeightScalesAll{};  ///< Forward FP4 block scales for all layers
+    std::array<Tensor, 4> mFP4WeightDataAllT{};   ///< Transposed FP4 packed weights for dgrad
+    std::array<Tensor, 4> mFP4WeightScalesAllT{}; ///< Transposed FP4 block scales for dgrad
 
     // Cache versioning
     int mVersion = 0;
@@ -501,6 +547,7 @@ private:
 
     // FP4 weight cache helpers
     void quantize_weights_to_fp4_cache(const BlockWeights& src, cudaStream_t stream);
+    void quantize_weights_to_fp4_cache_transposed(const BlockWeights& src, cudaStream_t stream);
 };
 
 // ============================================================================
@@ -829,6 +876,111 @@ ModularWeightManager<Block>::~ModularWeightManager() {
     if (mEmbeddingsStatus.done_event) cudaEventDestroy(mEmbeddingsStatus.done_event);
     if (mFinalNormStatus.done_event) cudaEventDestroy(mFinalNormStatus.done_event);
     if (mLMHeadStatus.done_event) cudaEventDestroy(mLMHeadStatus.done_event);
+}
+
+template<typename Block>
+void ModularWeightManager<Block>::maybe_enable_fp4_persistent_cache(bool weights_static) {
+    if (!mConfig.enable_fp4_forward) return;
+
+    // Already enabled: keep it enabled; if any caller marks weights as static, treat as static.
+    if (mFP4PersistentCacheEnabled) {
+        mFP4PersistentCacheStatic = mFP4PersistentCacheStatic || weights_static;
+        return;
+    }
+
+    // Enable only on Blackwell datacenter GPUs by default (B200/B300).
+    const int sm_version = mDeviceProp.major * 10 + mDeviceProp.minor;
+    if (sm_version != 100 && sm_version != 103) {
+        return;
+    }
+
+    // Don't enable for ZeRO-3/FSDP weight streaming: persistent caches would defeat the purpose.
+    if (mStreamWeights) {
+        return;
+    }
+
+    const auto& bc = mConfig.block_config;
+    const long C = bc.hidden_size;
+    const long Hq = bc.num_query_heads;
+    const long Hkv = bc.num_kv_heads;
+    const long Hs = bc.head_size;
+    const long D = bc.intermediate_size;
+    const long QKV_C = (Hq + 2 * Hkv) * Hs;
+
+    // Helper to compute CUTLASS scale size (matches compute_nvfp4_cutlass_scale_size()).
+    auto cutlass_scale_size = [](long rows, long cols) -> long {
+        constexpr int kBlockSize = 16;
+        constexpr int kTileDim = 128;
+        long num_scale_cols = (cols + kBlockSize - 1) / kBlockSize;
+        long aligned_rows = ((rows + kTileDim - 1) / kTileDim) * kTileDim;
+        long aligned_cols = ((num_scale_cols + 3) / 4) * 4;
+        return aligned_rows * aligned_cols;
+    };
+
+    const long L = mConfig.num_layers;
+
+    // Amax storage: 4 floats per layer [qkv, o, mlp_up, mlp_down]
+    mFP4WeightAmaxAll = mAllocator->allocate(
+        ETensorDType::FP32, "fp4_weight_amax_all", EAllocationType::ON_DEVICE, {L * 4});
+
+    // Forward (W) caches
+    mFP4WeightDataAll[0] = mAllocator->allocate(
+        ETensorDType::BYTE, "fp4_qkv_data_all", EAllocationType::ON_DEVICE, {L * QKV_C, C / 2});
+    mFP4WeightScalesAll[0] = mAllocator->allocate(
+        ETensorDType::BYTE, "fp4_qkv_scales_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(QKV_C, C)});
+
+    mFP4WeightDataAll[1] = mAllocator->allocate(
+        ETensorDType::BYTE, "fp4_o_data_all", EAllocationType::ON_DEVICE, {L * C, (Hq * Hs) / 2});
+    mFP4WeightScalesAll[1] = mAllocator->allocate(
+        ETensorDType::BYTE, "fp4_o_scales_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(C, Hq * Hs)});
+
+    if constexpr (has_mlp_weights<BlockWeights>::value) {
+        mFP4WeightDataAll[2] = mAllocator->allocate(
+            ETensorDType::BYTE, "fp4_mlp_up_data_all", EAllocationType::ON_DEVICE, {L * (2 * D), C / 2});
+        mFP4WeightScalesAll[2] = mAllocator->allocate(
+            ETensorDType::BYTE, "fp4_mlp_up_scales_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(2 * D, C)});
+
+        mFP4WeightDataAll[3] = mAllocator->allocate(
+            ETensorDType::BYTE, "fp4_mlp_down_data_all", EAllocationType::ON_DEVICE, {L * C, D / 2});
+        mFP4WeightScalesAll[3] = mAllocator->allocate(
+            ETensorDType::BYTE, "fp4_mlp_down_scales_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(C, D)});
+    }
+
+    // Transposed (W^T) caches for dgrad
+    mFP4WeightDataAllT[0] = mAllocator->allocate(
+        ETensorDType::BYTE, "fp4_qkv_data_t_all", EAllocationType::ON_DEVICE, {L * C, QKV_C / 2});
+    mFP4WeightScalesAllT[0] = mAllocator->allocate(
+        ETensorDType::BYTE, "fp4_qkv_scales_t_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(C, QKV_C)});
+
+    mFP4WeightDataAllT[1] = mAllocator->allocate(
+        ETensorDType::BYTE, "fp4_o_data_t_all", EAllocationType::ON_DEVICE, {L * (Hq * Hs), C / 2});
+    mFP4WeightScalesAllT[1] = mAllocator->allocate(
+        ETensorDType::BYTE, "fp4_o_scales_t_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(Hq * Hs, C)});
+
+    if constexpr (has_mlp_weights<BlockWeights>::value) {
+        mFP4WeightDataAllT[2] = mAllocator->allocate(
+            ETensorDType::BYTE, "fp4_mlp_up_data_t_all", EAllocationType::ON_DEVICE, {L * C, (2 * D) / 2});
+        mFP4WeightScalesAllT[2] = mAllocator->allocate(
+            ETensorDType::BYTE, "fp4_mlp_up_scales_t_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(C, 2 * D)});
+
+        mFP4WeightDataAllT[3] = mAllocator->allocate(
+            ETensorDType::BYTE, "fp4_mlp_down_data_t_all", EAllocationType::ON_DEVICE, {L * D, C / 2});
+        mFP4WeightScalesAllT[3] = mAllocator->allocate(
+            ETensorDType::BYTE, "fp4_mlp_down_scales_t_all", EAllocationType::ON_DEVICE, {L * cutlass_scale_size(D, C)});
+    }
+
+    mFP4PersistentCacheVersion.assign((std::size_t)L, -1);
+    mFP4PersistentCacheEnabled = true;
+    mFP4PersistentCacheStatic = weights_static;
+
+    if (mConfig.shard_idx == 0) {
+        std::fprintf(
+            stderr,
+            "FP4 persistent weight cache enabled (SM%d): caching FP4 weights for %ld layers (forward + dgrad, %s).\n",
+            sm_version,
+            L,
+            weights_static ? "static" : "versioned");
+    }
 }
 
 template<typename Block>
@@ -1221,9 +1373,97 @@ typename Block::Weights& ModularWeightManager<Block>::get_block(int layer_idx, c
     // Quantize weights to FP4 cache if FP4 forward mode is enabled.
     // Pre-quantized FP4 weights eliminate per-forward quantization overhead
     // on datacenter GPUs (B200) where quantization dominates runtime.
-    if (mConfig.enable_fp4_forward && mFP4CacheLayerIdx != layer_idx) {
-        quantize_weights_to_fp4_cache(*result, stream);
-        mFP4CacheLayerIdx = layer_idx;
+    if (mConfig.enable_fp4_forward) {
+        if (mFP4PersistentCacheEnabled) {
+            // Persistent per-layer FP4 caches: reuse weights across forward/backward (and across steps if static).
+            const auto& cfg = mConfig.block_config;
+            const long C = cfg.hidden_size;
+            const long Hq = cfg.num_query_heads;
+            const long Hkv = cfg.num_kv_heads;
+            const long Hs = cfg.head_size;
+            const long D = cfg.intermediate_size;
+            const long QKV_C = (Hq + 2 * Hkv) * Hs;
+
+            // Helper to compute CUTLASS scale size (matches compute_nvfp4_cutlass_scale_size()).
+            auto cutlass_scale_size = [](long rows, long cols) -> long {
+                constexpr int kBlockSize = 16;
+                constexpr int kTileDim = 128;
+                long num_scale_cols = (cols + kBlockSize - 1) / kBlockSize;
+                long aligned_rows = ((rows + kTileDim - 1) / kTileDim) * kTileDim;
+                long aligned_cols = ((num_scale_cols + 3) / 4) * 4;
+                return aligned_rows * aligned_cols;
+            };
+
+            const long qkv_scale_size = cutlass_scale_size(QKV_C, C);
+            const long o_scale_size = cutlass_scale_size(C, Hq * Hs);
+            const long qkv_scale_size_t = cutlass_scale_size(C, QKV_C);
+            const long o_scale_size_t = cutlass_scale_size(Hq * Hs, C);
+
+            long mlp_up_scale_size = 0;
+            long mlp_down_scale_size = 0;
+            long mlp_up_scale_size_t = 0;
+            long mlp_down_scale_size_t = 0;
+            if constexpr (has_mlp_weights<BlockWeights>::value) {
+                mlp_up_scale_size = cutlass_scale_size(2 * D, C);
+                mlp_down_scale_size = cutlass_scale_size(C, D);
+                mlp_up_scale_size_t = cutlass_scale_size(C, 2 * D);
+                mlp_down_scale_size_t = cutlass_scale_size(D, C);
+            }
+
+            auto set_views = [&](int l) {
+                // Amax view: (4,) for this layer
+                mFP4WeightAmax = slice(mFP4WeightAmaxAll, 0, l * 4, l * 4 + 4);
+
+                // Forward weights (W)
+                mFP4WeightCache.qkv_weight.data = slice(mFP4WeightDataAll[0], 0, l * QKV_C, (l + 1) * QKV_C);
+                mFP4WeightCache.qkv_weight.scales = slice(mFP4WeightScalesAll[0], 0, l * qkv_scale_size, (l + 1) * qkv_scale_size);
+
+                mFP4WeightCache.o_weight.data = slice(mFP4WeightDataAll[1], 0, l * C, (l + 1) * C);
+                mFP4WeightCache.o_weight.scales = slice(mFP4WeightScalesAll[1], 0, l * o_scale_size, (l + 1) * o_scale_size);
+
+                if constexpr (has_mlp_weights<BlockWeights>::value) {
+                    mFP4WeightCache.mlp_up_weight.data = slice(mFP4WeightDataAll[2], 0, l * (2 * D), (l + 1) * (2 * D));
+                    mFP4WeightCache.mlp_up_weight.scales = slice(mFP4WeightScalesAll[2], 0, l * mlp_up_scale_size, (l + 1) * mlp_up_scale_size);
+
+                    mFP4WeightCache.mlp_down_weight.data = slice(mFP4WeightDataAll[3], 0, l * C, (l + 1) * C);
+                    mFP4WeightCache.mlp_down_weight.scales = slice(mFP4WeightScalesAll[3], 0, l * mlp_down_scale_size, (l + 1) * mlp_down_scale_size);
+                }
+
+                // Transposed weights (W^T) for dgrad
+                mFP4WeightCacheT.qkv_weight.data = slice(mFP4WeightDataAllT[0], 0, l * C, (l + 1) * C);
+                mFP4WeightCacheT.qkv_weight.scales = slice(mFP4WeightScalesAllT[0], 0, l * qkv_scale_size_t, (l + 1) * qkv_scale_size_t);
+
+                mFP4WeightCacheT.o_weight.data = slice(mFP4WeightDataAllT[1], 0, l * (Hq * Hs), (l + 1) * (Hq * Hs));
+                mFP4WeightCacheT.o_weight.scales = slice(mFP4WeightScalesAllT[1], 0, l * o_scale_size_t, (l + 1) * o_scale_size_t);
+
+                if constexpr (has_mlp_weights<BlockWeights>::value) {
+                    mFP4WeightCacheT.mlp_up_weight.data = slice(mFP4WeightDataAllT[2], 0, l * C, (l + 1) * C);
+                    mFP4WeightCacheT.mlp_up_weight.scales = slice(mFP4WeightScalesAllT[2], 0, l * mlp_up_scale_size_t, (l + 1) * mlp_up_scale_size_t);
+
+                    mFP4WeightCacheT.mlp_down_weight.data = slice(mFP4WeightDataAllT[3], 0, l * D, (l + 1) * D);
+                    mFP4WeightCacheT.mlp_down_weight.scales = slice(mFP4WeightScalesAllT[3], 0, l * mlp_down_scale_size_t, (l + 1) * mlp_down_scale_size_t);
+                }
+
+                mFP4CacheLayerIdx = l;
+            };
+
+            // Ensure views are set for this layer (so callers can access cache tensors).
+            if (mFP4CacheLayerIdx != layer_idx) {
+                set_views(layer_idx);
+            }
+
+            const int wanted_version = mFP4PersistentCacheStatic ? 0 : mVersion;
+            if (mFP4PersistentCacheVersion.at((std::size_t)layer_idx) != wanted_version) {
+                // Quantize weights into the persistent per-layer buffers.
+                quantize_weights_to_fp4_cache(*result, stream);
+                quantize_weights_to_fp4_cache_transposed(*result, stream);
+                mFP4PersistentCacheVersion.at((std::size_t)layer_idx) = wanted_version;
+            }
+        } else if (mFP4CacheLayerIdx != layer_idx) {
+            // Single-buffer cache (legacy): quantize per get_block
+            quantize_weights_to_fp4_cache(*result, stream);
+            mFP4CacheLayerIdx = layer_idx;
+        }
     }
 
     return *result;
@@ -2390,6 +2630,66 @@ void ModularWeightManager<Block>::quantize_weights_to_fp4_cache(const BlockWeigh
 
         // MLP down weight: (C, D)
         quantize_fp4_weight(src.mlp_down_weight, mFP4WeightCache.mlp_down_weight, C, D);
+    }
+}
+
+template<typename Block>
+void ModularWeightManager<Block>::quantize_weights_to_fp4_cache_transposed(const BlockWeights& src, cudaStream_t stream) {
+    // Skip if FP4 caching is not enabled or transposed cache buffers are not available
+    if (!mConfig.enable_fp4_forward || !mFP4WeightCacheT.qkv_weight.data.Data) {
+        return;
+    }
+
+    const auto& cfg = mConfig.block_config;
+    const int C = static_cast<int>(cfg.hidden_size);
+    const int Hq = static_cast<int>(cfg.num_query_heads);
+    const int Hkv = static_cast<int>(cfg.num_kv_heads);
+    const int Hs = static_cast<int>(cfg.head_size);
+    const int D = static_cast<int>(cfg.intermediate_size);
+    const int QKV_C = (Hq + 2 * Hkv) * Hs;
+
+    // Helper lambda to quantize a single weight tensor to FP4 with transposed output layout.
+    // Input weight shape is (N, K); output is W^T in packed FP4 (K, N/2).
+    auto quantize_fp4_weight_t = [&](const Tensor& bf16_weight, FP4WeightCacheEntry& fp4_cache_t,
+                                     int N, int K) {
+        if (!bf16_weight.Data || !fp4_cache_t.data.Data) return;
+
+        // Only support BF16 source weights for now
+        if (bf16_weight.DType != ETensorDType::BF16) {
+            return;
+        }
+
+        // Use global amax buffer: 4 floats for qkv, o, mlp_up, mlp_down
+        float* amax_ptr = mFP4WeightAmax.template get<float>();
+        int amax_offset = 0;
+        if (&fp4_cache_t == &mFP4WeightCacheT.qkv_weight) amax_offset = 0;
+        else if (&fp4_cache_t == &mFP4WeightCacheT.o_weight) amax_offset = 1;
+        else if constexpr (has_mlp_weights<BlockWeights>::value) {
+            if (&fp4_cache_t == &mFP4WeightCacheT.mlp_up_weight) amax_offset = 2;
+            else if (&fp4_cache_t == &mFP4WeightCacheT.mlp_down_weight) amax_offset = 3;
+        }
+
+        quantize_nvfp4_weight_cutlass_transpose_auto_scale(
+            fp4_cache_t.data.template get<uint8_t>(),
+            fp4_cache_t.scales.template get<uint8_t>(),
+            amax_ptr + amax_offset,
+            bf16_weight.template get<nv_bfloat16>(),
+            N, K,
+            mDeviceProp, stream);
+    };
+
+    // QKV weight: (QKV_C, C) -> transposed cache stores (C, QKV_C)
+    quantize_fp4_weight_t(src.attention.qkv_weight, mFP4WeightCacheT.qkv_weight, QKV_C, C);
+
+    // O weight: (C, Hq*Hs) -> transposed cache stores (Hq*Hs, C)
+    quantize_fp4_weight_t(src.attention.out_weight, mFP4WeightCacheT.o_weight, C, Hq * Hs);
+
+    if constexpr (has_mlp_weights<BlockWeights>::value) {
+        // MLP up weight: (2*D, C) -> transposed cache stores (C, 2*D)
+        quantize_fp4_weight_t(src.mlp_up_weight, mFP4WeightCacheT.mlp_up_weight, 2 * D, C);
+
+        // MLP down weight: (C, D) -> transposed cache stores (D, C)
+        quantize_fp4_weight_t(src.mlp_down_weight, mFP4WeightCacheT.mlp_down_weight, C, D);
     }
 }
 
