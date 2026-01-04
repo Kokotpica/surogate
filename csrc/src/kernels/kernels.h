@@ -767,6 +767,14 @@ void quantize_nvfp4_weight_cutlass(uint8_t* out_fp4, uint8_t* block_scales,
                                     const nv_bfloat16* in, int N, int K,
                                     const cudaDeviceProp& dp, cudaStream_t stream);
 
+/// @brief NVFP4 weight quantization producing a transposed (K, N) output layout.
+/// Input is BF16 weight in row-major (N, K); output is FP4 packed row-major (K, N/2 bytes)
+/// with CUTLASS-compatible scale layout. Used to avoid an explicit BF16 transpose in backward dgrad.
+void quantize_nvfp4_weight_cutlass_transpose_auto_scale(uint8_t* out_fp4, uint8_t* block_scales,
+                                                         float* global_amax, const nv_bfloat16* in,
+                                                         int N, int K,
+                                                         const cudaDeviceProp& dp, cudaStream_t stream);
+
 /// @brief NVFP4 quantization with stochastic rounding (for gradients).
 void quantize_nvfp4_stochastic_cutlass(uint8_t* out_fp4, uint8_t* block_scales,
                                         const nv_bfloat16* in, int M, int K,

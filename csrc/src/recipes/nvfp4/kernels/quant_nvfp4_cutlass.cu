@@ -775,6 +775,92 @@ __global__ void quantize_nvfp4_weight_cutlass_auto_kernel(
     }
 }
 
+/**
+ * @brief Per-block NVFP4 weight quantization producing a transposed output layout.
+ *
+ * Input weights are provided as row-major BF16 (N, K). The output FP4 matrix is written
+ * as row-major (K, N) (packed as (K, N/2) bytes). This matches the layout needed for
+ * backward dgrad GEMMs without an explicit BF16 transpose.
+ */
+template<int TILE_SIZE = 128>
+__global__ void quantize_nvfp4_weight_cutlass_transpose_auto_kernel(
+    uint8_t* __restrict__ out_fp4,
+    uint8_t* __restrict__ block_scales,
+    const float* __restrict__ global_amax_in,
+    const nv_bfloat16* __restrict__ in,
+    int N, int K,
+    int num_scale_cols_out)
+{
+    // Output matrix shape: (K, N)
+    const int tile_row = blockIdx.x;  // rows over K
+    const int tile_col = blockIdx.y;  // cols over N
+
+    const int row_start = tile_row * TILE_SIZE;
+    const int col_start = tile_col * TILE_SIZE;
+    const int row_end = min(row_start + TILE_SIZE, K);
+    const int col_end = min(col_start + TILE_SIZE, N);
+
+    __shared__ float s_global_encode_scale;
+    __shared__ float s_global_decode_scale;
+    if (threadIdx.x == 0) {
+        const float ga = *global_amax_in;
+        const float enc = compute_global_encode_scale(ga);
+        s_global_encode_scale = enc;
+        s_global_decode_scale = 1.0f / enc;
+    }
+    __syncthreads();
+
+    const float global_encode_scale = s_global_encode_scale;
+    const float global_decode_scale = s_global_decode_scale;
+
+    const int num_rows = row_end - row_start;
+    const int num_blocks_per_row = div_ceil(col_end - col_start, kNVFP4BlockSize);
+    const int total_blocks = num_rows * num_blocks_per_row;
+
+    for (int block_idx = threadIdx.x; block_idx < total_blocks; block_idx += blockDim.x) {
+        const int local_row = block_idx / num_blocks_per_row;
+        const int local_block = block_idx % num_blocks_per_row;
+
+        const int out_row = row_start + local_row;  // 0..K-1
+        const int out_block_col_start = col_start + local_block * kNVFP4BlockSize;  // 0..N-1
+        const int out_block_col_end = min(out_block_col_start + kNVFP4BlockSize, col_end);
+        const int block_width = out_block_col_end - out_block_col_start;
+
+        float block_amax = 0.0f;
+        float values[kNVFP4BlockSize];
+
+        // Read transposed: out(out_row, out_col) = in(out_col, out_row)
+        #pragma unroll
+        for (int i = 0; i < block_width; ++i) {
+            const int in_row = out_block_col_start + i;  // 0..N-1
+            const int in_col = out_row;                  // 0..K-1
+            float val = (float)in[in_row * K + in_col];
+            values[i] = val;
+            block_amax = fmaxf(block_amax, fabsf(val));
+        }
+
+        float decode_scale = compute_decode_scale(block_amax, global_encode_scale);
+        uint8_t ue4m3_scale = float_to_ue4m3(fmaxf(decode_scale, 1e-10f));
+
+        // Store scale for output row/scale_col
+        const int scale_col = (col_start / kNVFP4BlockSize) + local_block;
+        const size_t scale_offset = nvfp4_cutlass_scale_offset(out_row, scale_col, num_scale_cols_out);
+        block_scales[scale_offset] = ue4m3_scale;
+
+        float actual_decode = ue4m3_to_float(ue4m3_scale);
+        float encode_scale = compute_encode_scale(actual_decode, global_decode_scale);
+
+        const int out_byte_col_start = out_block_col_start / kNVFP4ValuesPerByte;
+
+        #pragma unroll
+        for (int i = 0; i < block_width; i += 2) {
+            uint8_t fp4_0 = quantize_fp4_e2m1_rn(values[i] * encode_scale);
+            uint8_t fp4_1 = (i + 1 < block_width) ? quantize_fp4_e2m1_rn(values[i + 1] * encode_scale) : 0;
+            out_fp4[out_row * (N / 2) + out_byte_col_start + i / 2] = pack_fp4(fp4_0, fp4_1);
+        }
+    }
+}
+
 // Global namespace to match kernels.h declarations
 
 // ============================================================================
@@ -1042,6 +1128,36 @@ void quantize_nvfp4_weight_cutlass_from_amax(
 
     quantize_nvfp4_weight_cutlass_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
         out_fp4, block_scales, global_amax, in, N, K, num_scale_cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/**
+ * @brief Host launcher for NVFP4 weight quantization producing a transposed (K, N) output layout.
+ *
+ * This avoids an explicit BF16 transpose when computing dgrad in backward passes.
+ */
+void quantize_nvfp4_weight_cutlass_transpose_auto_scale(
+    uint8_t* out_fp4,
+    uint8_t* block_scales,
+    float* global_amax,
+    const nv_bfloat16* in,
+    int N, int K,
+    const cudaDeviceProp& dp,
+    cudaStream_t stream)
+{
+    // 1) Compute true global amax (same for W and W^T)
+    abs_max(global_amax, in, (long)N * K, dp, stream);
+
+    // 2) Quantize-and-transpose in one pass
+    const int out_cols = N;
+    const int out_rows = K;
+    const int num_scale_cols_out = div_ceil(out_cols, kNVFP4BlockSize);
+
+    dim3 grid(div_ceil(out_rows, kNVFP4TileDim), div_ceil(out_cols, kNVFP4TileDim));
+    const int threads_per_block = 256;
+
+    quantize_nvfp4_weight_cutlass_transpose_auto_kernel<128><<<grid, threads_per_block, 0, stream>>>(
+        out_fp4, block_scales, global_amax, in, N, K, num_scale_cols_out);
     CUDA_CHECK(cudaGetLastError());
 }
 

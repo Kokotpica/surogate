@@ -687,11 +687,6 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
     // dinp = dout @ W
     // =========================================================================
     {
-        // For dinp computation: A = dout (BT, OC), B = W^T (C, OC) -> result (BT, C)
-        // Need to transpose W from (OC, C) to (C, OC) for CUTLASS B operand
-        Tensor weight_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(OC)});
-        transpose(weight_tp, *ctx.weight, OC, C, ctx.stream);
-
         // Quantize dout (A) with stochastic rounding + two-level scaling
         const size_t dout_scale_size = compute_nvfp4_cutlass_scale_size(BT, OC);
         Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(OC / 2)});
@@ -706,18 +701,20 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
             BT, OC, sr_seed,
             rs.DeviceProp, ctx.stream);
 
-        // Quantize W^T (B) for dgrad with two-level scaling
+        // Quantize W^T (B) for dgrad with two-level scaling.
+        // Fused path: quantize-and-transpose directly from the original (OC, C) BF16 weight,
+        // avoiding an explicit BF16 transpose (which is costly on bandwidth-rich GPUs like B200).
         const size_t w_scale_size = compute_nvfp4_cutlass_scale_size(C, OC);
         Tensor w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)});
         Tensor w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)});
         Tensor w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
 
-        quantize_nvfp4_weight_cutlass_auto_scale(
+        quantize_nvfp4_weight_cutlass_transpose_auto_scale(
             w_fp4.get<uint8_t>(),
             w_scales.get<uint8_t>(),
             w_amax.get<float>(),
-            weight_tp.get<nv_bfloat16>(),
-            C, OC,
+            ctx.weight->get<nv_bfloat16>(),
+            /*N=*/OC, /*K=*/C,
             rs.DeviceProp, ctx.stream);
 
         // Compute alpha on device
@@ -752,7 +749,6 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
         rs.temp_free(dout_amax);
         rs.temp_free(dout_scales);
         rs.temp_free(dout_fp4);
-        rs.temp_free(weight_tp);
     }
 
     // =========================================================================
