@@ -122,10 +122,16 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
     //   2) applying alpha correction in FP32
     //   3) casting down to BF16
     //
+    // OPTIMIZATION (B200/datacenter GPUs):
+    // Use fused fp4_alpha_scale_convert() to combine steps 2+3 into a single kernel,
+    // eliminating one kernel launch and intermediate memory traffic.
+    //
     // Global scales are baked into block scales during quantization; alpha scaling is applied separately.
     Tensor out_f32{};
     float* out_f32_ptr = nullptr;
-    if (ctx.out->DType == ETensorDType::BF16) {
+    const bool need_bf16_output = (ctx.out->DType == ETensorDType::BF16);
+
+    if (need_bf16_output) {
         out_f32 = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(BT), static_cast<long>(C_out)});
         out_f32_ptr = out_f32.get<float>();
     } else if (ctx.out->DType == ETensorDType::FP32) {
@@ -147,20 +153,26 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
         FP4_BLOCK_SIZE,
         rs.CudnnHandle, ctx.stream);
 
-    // Step 5: Apply alpha scaling correction (TransformerEngine formula)
+    // Step 5+6: Apply alpha scaling and convert to BF16 (fused for better performance)
     // alpha = (global_amax_a * global_amax_b) / (FP4_MAX^2 * FP8_MAX^2)
-    fp4_alpha_scale(
-        out_f32_ptr,
-        inp_global_amax.get<float>(),                  // global_amax_a (input)
-        weight_global_amax.get<float>(),               // global_amax_b (weight)
-        static_cast<long>(BT) * C_out,
-        rs.DeviceProp, ctx.stream);
-
-    // Step 6: Cast to BF16 if needed
-    if (ctx.out->DType == ETensorDType::BF16) {
-        convert_dtype(ctx.out->get<nv_bfloat16>(), out_f32_ptr,
-                      static_cast<std::size_t>(BT) * static_cast<std::size_t>(C_out), ctx.stream);
+    if (need_bf16_output) {
+        // Fused: alpha scale in FP32 + convert to BF16 in single kernel
+        fp4_alpha_scale_convert(
+            ctx.out->get<nv_bfloat16>(),
+            out_f32_ptr,
+            inp_global_amax.get<float>(),
+            weight_global_amax.get<float>(),
+            static_cast<long>(BT) * C_out,
+            rs.DeviceProp, ctx.stream);
         rs.temp_free(out_f32);
+    } else {
+        // FP32 output: just alpha scale in-place
+        fp4_alpha_scale(
+            out_f32_ptr,
+            inp_global_amax.get<float>(),
+            weight_global_amax.get<float>(),
+            static_cast<long>(BT) * C_out,
+            rs.DeviceProp, ctx.stream);
     }
 
     // Step 7: Add bias if present
@@ -265,10 +277,12 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
             C, OC,
             rs.DeviceProp, ctx.stream);
 
-        // Matmul output in FP32, alpha-correct in FP32, then cast
+        // Matmul output in FP32, alpha-correct + convert in single fused kernel
         Tensor dinp_f32{};
         float* dinp_f32_ptr = nullptr;
-        if (ctx.dinp->DType == ETensorDType::BF16) {
+        const bool need_bf16_dinp = (ctx.dinp->DType == ETensorDType::BF16);
+
+        if (need_bf16_dinp) {
             dinp_f32 = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(BT), static_cast<long>(C)});
             dinp_f32_ptr = dinp_f32.get<float>();
         } else if (ctx.dinp->DType == ETensorDType::FP32) {
@@ -290,17 +304,23 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
             FP4_BLOCK_SIZE,
             rs.CudnnHandle, ctx.stream);
 
-        fp4_alpha_scale(
-            dinp_f32_ptr,
-            dout_amax.get<float>(),
-            w_amax.get<float>(),
-            static_cast<long>(BT) * C,
-            rs.DeviceProp, ctx.stream);
-
-        if (ctx.dinp->DType == ETensorDType::BF16) {
-            convert_dtype(ctx.dinp->get<nv_bfloat16>(), dinp_f32_ptr,
-                          static_cast<std::size_t>(BT) * static_cast<std::size_t>(C), ctx.stream);
+        // Fused alpha scale + BF16 conversion for better datacenter GPU performance
+        if (need_bf16_dinp) {
+            fp4_alpha_scale_convert(
+                ctx.dinp->get<nv_bfloat16>(),
+                dinp_f32_ptr,
+                dout_amax.get<float>(),
+                w_amax.get<float>(),
+                static_cast<long>(BT) * C,
+                rs.DeviceProp, ctx.stream);
             rs.temp_free(dinp_f32);
+        } else {
+            fp4_alpha_scale(
+                dinp_f32_ptr,
+                dout_amax.get<float>(),
+                w_amax.get<float>(),
+                static_cast<long>(BT) * C,
+                rs.DeviceProp, ctx.stream);
         }
 
         rs.temp_free(w_amax);
@@ -384,18 +404,25 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
             FP4_BLOCK_SIZE,
             rs.CudnnHandle, ctx.stream);
 
-        fp4_alpha_scale(
-            dw_f32_ptr,
-            a_amax.get<float>(),
-            b_amax.get<float>(),
-            static_cast<long>(OC) * C,
-            rs.DeviceProp, ctx.stream);
-
+        // Apply alpha scaling and type conversion (fused when possible for datacenter GPUs)
         if (ctx.dweight->DType == ETensorDType::BF16) {
             if (!ctx.accumulate) {
-                convert_dtype(ctx.dweight->get<nv_bfloat16>(), dw_f32_ptr,
-                              static_cast<std::size_t>(OC) * static_cast<std::size_t>(C), ctx.stream);
+                // Fused: alpha scale + convert to BF16 in single kernel
+                fp4_alpha_scale_convert(
+                    ctx.dweight->get<nv_bfloat16>(),
+                    dw_f32_ptr,
+                    a_amax.get<float>(),
+                    b_amax.get<float>(),
+                    static_cast<long>(OC) * C,
+                    rs.DeviceProp, ctx.stream);
             } else {
+                // Accumulate mode: need separate operations
+                fp4_alpha_scale(
+                    dw_f32_ptr,
+                    a_amax.get<float>(),
+                    b_amax.get<float>(),
+                    static_cast<long>(OC) * C,
+                    rs.DeviceProp, ctx.stream);
                 Tensor dw_bf16 = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(C)});
                 convert_dtype(dw_bf16.get<nv_bfloat16>(), dw_f32_ptr,
                               static_cast<std::size_t>(OC) * static_cast<std::size_t>(C), ctx.stream);
@@ -404,6 +431,12 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
                 rs.temp_free(dw_bf16);
             }
         } else if (ctx.dweight->DType == ETensorDType::FP32) {
+            fp4_alpha_scale(
+                dw_f32_ptr,
+                a_amax.get<float>(),
+                b_amax.get<float>(),
+                static_cast<long>(OC) * C,
+                rs.DeviceProp, ctx.stream);
             if (!ctx.accumulate) {
                 CUDA_CHECK(cudaMemcpyAsync(ctx.dweight->get<float>(), dw_f32_ptr,
                                            sizeof(float) * static_cast<std::size_t>(OC) * static_cast<std::size_t>(C),

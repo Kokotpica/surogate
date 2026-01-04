@@ -541,6 +541,23 @@ void fp4_alpha_scale(Tensor& out, const Tensor& global_amax_a, const Tensor& glo
 void compute_fp4_alpha(float* alpha_out, const float* global_amax_a, const float* global_amax_b,
                        cudaStream_t stream);
 
+/// @brief Fused FP4 alpha scaling + FP32→BF16 conversion.
+///
+/// Combines alpha scaling and type conversion into a single kernel, eliminating
+/// intermediate FP32 storage and reducing memory traffic. Optimized for datacenter
+/// GPUs (B200/H100) where kernel launch overhead is significant.
+///
+/// @param out_bf16 Output BF16 tensor
+/// @param in_f32 Input FP32 tensor (from FP4 matmul)
+/// @param global_amax_a Global amax of tensor A (device pointer)
+/// @param global_amax_b Global amax of tensor B (device pointer)
+/// @param N Number of elements
+/// @param dp CUDA device properties
+/// @param stream CUDA stream
+void fp4_alpha_scale_convert(nv_bfloat16* out_bf16, const float* in_f32,
+                             const float* global_amax_a, const float* global_amax_b,
+                             long N, const cudaDeviceProp& dp, cudaStream_t stream);
+
 // ============================================================================
 // Random Hadamard Transform (RHT)
 // ============================================================================

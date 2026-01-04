@@ -1678,6 +1678,107 @@ void fp4_alpha_scale(
     }
 }
 
+// ============================================================================
+// Fused FP4 Alpha Scale + Type Conversion (for B200/datacenter optimization)
+// ============================================================================
+
+/**
+ * @brief Fused kernel: alpha scale FP32 input and convert to BF16 in one pass.
+ *
+ * Combines fp4_alpha_scale() + convert_dtype() into a single kernel to:
+ * - Eliminate intermediate FP32 storage after matmul
+ * - Reduce global memory traffic by 2x (read FP32 once, write BF16 once)
+ * - Save one kernel launch overhead
+ *
+ * This is particularly beneficial on datacenter GPUs (B200/H100) where
+ * kernel launch overhead and memory bandwidth are critical.
+ *
+ * @param[out] out_bf16 Output BF16 tensor
+ * @param[in] in_f32 Input FP32 tensor (from matmul)
+ * @param[in] global_amax_a Global amax of tensor A (device pointer)
+ * @param[in] global_amax_b Global amax of tensor B (device pointer)
+ * @param N Number of elements
+ */
+__global__ void fp4_alpha_scale_convert_kernel(
+    nv_bfloat16* __restrict__ out_bf16,
+    const float* __restrict__ in_f32,
+    const float* __restrict__ global_amax_a,
+    const float* __restrict__ global_amax_b,
+    long N)
+{
+    constexpr float factor = 6.0f * 6.0f * 448.0f * 448.0f;
+
+    __shared__ float s_alpha;
+    if (threadIdx.x == 0) {
+        float amax_a = *global_amax_a;
+        float amax_b = *global_amax_b;
+        s_alpha = (amax_a * amax_b) / factor;
+    }
+    __syncthreads();
+
+    const float alpha = s_alpha;
+
+    // Process 4 elements per thread for better memory coalescing
+    const long tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const long stride = gridDim.x * blockDim.x;
+
+    // Vectorized path: process 4 floats at a time
+    const long N4 = N / 4 * 4;
+    for (long i = tid * 4; i < N4; i += stride * 4) {
+        // Load 4 floats
+        float4 vals = *reinterpret_cast<const float4*>(&in_f32[i]);
+
+        // Scale and convert to BF16
+        nv_bfloat16 out0 = (nv_bfloat16)(vals.x * alpha);
+        nv_bfloat16 out1 = (nv_bfloat16)(vals.y * alpha);
+        nv_bfloat16 out2 = (nv_bfloat16)(vals.z * alpha);
+        nv_bfloat16 out3 = (nv_bfloat16)(vals.w * alpha);
+
+        // Store as 2 bfloat162 (4 BF16 values)
+        *reinterpret_cast<nv_bfloat162*>(&out_bf16[i]) = {out0, out1};
+        *reinterpret_cast<nv_bfloat162*>(&out_bf16[i + 2]) = {out2, out3};
+    }
+
+    // Handle remainder
+    for (long i = N4 + tid; i < N; i += stride) {
+        out_bf16[i] = (nv_bfloat16)(in_f32[i] * alpha);
+    }
+}
+
+/**
+ * @brief Fused alpha scale + BF16 conversion for FP4 matmul output.
+ *
+ * Combines alpha scaling and type conversion into a single kernel,
+ * eliminating intermediate storage and reducing memory traffic.
+ *
+ * @param out_bf16 Output BF16 tensor
+ * @param in_f32 Input FP32 tensor (from FP4 matmul)
+ * @param global_amax_a Global amax of tensor A (device pointer)
+ * @param global_amax_b Global amax of tensor B (device pointer)
+ * @param N Number of elements
+ * @param dp CUDA device properties
+ * @param stream CUDA stream
+ */
+void fp4_alpha_scale_convert(
+    nv_bfloat16* out_bf16,
+    const float* in_f32,
+    const float* global_amax_a,
+    const float* global_amax_b,
+    long N,
+    const cudaDeviceProp& dp,
+    cudaStream_t stream)
+{
+    const int threads_per_block = 256;
+    // Use more blocks on datacenter GPUs for better occupancy
+    const int num_blocks = std::min(
+        (int)((N / 4 + threads_per_block - 1) / threads_per_block),
+        4 * dp.multiProcessorCount);
+
+    fp4_alpha_scale_convert_kernel<<<num_blocks, threads_per_block, 0, stream>>>(
+        out_bf16, in_f32, global_amax_a, global_amax_b, N);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 /**
  * @brief Kernel to compute FP4 alpha from two global amax values.
  *
