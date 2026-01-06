@@ -28,6 +28,22 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     if (!ctx.out || !ctx.inp || !ctx.weight) {
         throw std::runtime_error("FP8HybridRecipe::forward_matmul: required tensors are null");
     }
+
+    // Fall back to BF16 matmul if FP8 is not allowed for this layer (skip_quant_first/last_layers)
+    if (!ctx.allow_fp8) {
+        IRunState& rs = *ctx.run_state;
+        const int M = ctx.B * ctx.T;
+        const int N = ctx.C_out;
+        const int K = ctx.C_in;
+        std::optional<Tensor> bias_opt = ctx.has_bias() ? std::make_optional(*ctx.bias) : std::nullopt;
+        // BF16 forward: out = inp @ weight.T, using same layout as base Recipe class
+        // Weight is (N, K), inp is (M, K), out is (M, N)
+        matmul(*ctx.out, *ctx.weight, *ctx.inp, bias_opt, nullptr, nullptr,
+               rs.CublasLtHandle, rs.CuBlasWorkspace,
+               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        return;
+    }
+
     if (!ctx.inp_quant || !ctx.inp_quant->Data) {
         throw std::runtime_error("FP8HybridRecipe::forward_matmul: FP8 buffer not allocated");
     }
@@ -148,6 +164,36 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     if (!ctx.dinp || !ctx.dout || !ctx.inp || !ctx.weight) {
         throw std::runtime_error("FP8HybridRecipe::backward_matmul: required tensors are null");
     }
+
+    // Fall back to BF16 matmul if FP8 is not allowed for this layer (skip_quant_first/last_layers)
+    if (!ctx.allow_fp8) {
+        IRunState& rs = *ctx.run_state;
+        const int B = ctx.B;
+        const int T = ctx.T;
+        const int C = ctx.C_in;   // Input channels
+        const int OC = ctx.C_out; // Output channels
+
+        // dinp = W^T @ dout (always needed for gradient flow)
+        // Use Tensor-based matmul identical to backward_qmm
+        matmul(*ctx.dinp, *ctx.weight, *ctx.dout, std::nullopt, nullptr, nullptr,
+               rs.CublasLtHandle, rs.CuBlasWorkspace,
+               C, B * T, OC, EMMTranspose::NN, /*accumulate=*/false, ctx.stream);
+
+        // dweight = inp^T @ dout (skip if weights are frozen in LoRA-only mode)
+        if (!ctx.skip_weight_grad && ctx.dweight) {
+            matmul(*ctx.dweight, *ctx.inp, *ctx.dout, std::nullopt, nullptr, nullptr,
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   C, OC, B * T, EMMTranspose::NT, /*accumulate=*/ctx.accumulate, ctx.stream);
+
+            // Bias gradient if needed
+            if (ctx.dbias && ctx.bias_buffer) {
+                backward_bias(*ctx.dbias, *ctx.dout, nullptr, nullptr, *ctx.bias_buffer,
+                              B, T, OC, rs.DeviceProp, ctx.stream);
+            }
+        }
+        return;
+    }
+
     if (!ctx.dout_quant || !ctx.dout_quant->Data) {
         throw std::runtime_error("FP8HybridRecipe::backward_matmul: E5M2 gradient buffer not allocated");
     }
