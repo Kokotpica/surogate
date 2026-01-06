@@ -236,7 +236,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     recompute_qkv: Optional[bool] = True
     recompute_att: Optional[bool] = True
     recompute_block: Optional[bool] = True
-    recompute_lora: Optional[bool] = True
+    recompute_lora: Optional[bool] = False
 
     offload_residual: Optional[bool] = False
     offload_master: Optional[bool] = False
@@ -502,13 +502,14 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         recompute_swiglu = self.recompute_swiglu or recompute_ffn
         recompute_rmsnorm = self.recompute_rmsnorm or recompute_block
         
+        if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
+            self.recompute_lora = True
+            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
+            
         if self.recompute_lora:
             self.recompute_block = True  # Enforce block recompute if LoRA recompute is enabled            
             if self.offload_residual:
                 self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with LoRA recompute
-            
-        if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4:
-            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             
         self.runtime_config = _surogate.RuntimeOptions(
             recompute_swiglu=recompute_swiglu,
