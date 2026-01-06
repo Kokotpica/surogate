@@ -562,6 +562,8 @@ void print_memory_breakdown(
         if (name.find("qlora") != std::string::npos ||
             name.find("fp8_weight") != std::string::npos ||
             name.find("fp4_weight") != std::string::npos ||
+            name.find("_nf4") != std::string::npos ||
+            name.find("_absmax") != std::string::npos ||
             name.find("_scales") != std::string::npos) {
             return "QLoRA Quantized Weights";
         }

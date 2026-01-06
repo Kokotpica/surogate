@@ -517,13 +517,14 @@ NB_MODULE(_surogate, m) {
         .value("NONE", modules::QLoRAQuantStrategy::None, "No quantization (regular LoRA with BF16 base model)")
         .value("FP8", modules::QLoRAQuantStrategy::FP8, "FP8 E4M3 with per-block scales")
         .value("NVFP4", modules::QLoRAQuantStrategy::NVFP4, "FP4 E2M1 with two-level block scales (Blackwell SM100+)")
+        .value("BNB", modules::QLoRAQuantStrategy::BitsAndBytes, "BitsAndBytes NF4 with per-block absmax (any GPU)")
         ;
 
     nb::class_<modules::QLoRAConfig>(m, "QLoRAConfig",
         "QLoRA (Quantized LoRA) configuration for memory-efficient adapter training.\n\n"
         "Configures quantization of base model weights. The base model is stored in a\n"
-        "quantized format (FP8 or FP4) while LoRA adapters remain in full precision.\n\n"
-        "Use QLoRAConfig.fp8() or QLoRAConfig.nvfp4() factory methods to create configs.")
+        "quantized format (FP8, FP4, or NF4) while LoRA adapters remain in full precision.\n\n"
+        "Use QLoRAConfig.fp8(), QLoRAConfig.nvfp4(), or QLoRAConfig.bnb() factory methods.")
         .def("__init__", [](modules::QLoRAConfig *t, bool enabled, const std::string& strategy,
                            int block_size, const std::string& base_dtype, const std::string& adapter_dtype) {
             modules::QLoRAQuantStrategy strat = modules::QLoRAQuantStrategy::None;
@@ -531,8 +532,10 @@ NB_MODULE(_surogate, m) {
                 strat = modules::QLoRAQuantStrategy::FP8;
             } else if (strategy == "nvfp4" || strategy == "NVFP4" || strategy == "fp4") {
                 strat = modules::QLoRAQuantStrategy::NVFP4;
+            } else if (strategy == "bnb" || strategy == "BNB" || strategy == "bitsandbytes" || strategy == "nf4") {
+                strat = modules::QLoRAQuantStrategy::BitsAndBytes;
             } else if (!strategy.empty() && strategy != "none") {
-                throw std::runtime_error("Unknown QLoRA strategy: " + strategy + " (valid: none, fp8, nvfp4)");
+                throw std::runtime_error("Unknown QLoRA strategy: " + strategy + " (valid: none, fp8, nvfp4, bnb)");
             }
 
             new (t) modules::QLoRAConfig{
@@ -551,8 +554,8 @@ NB_MODULE(_surogate, m) {
              "Create a QLoRA configuration.\n\n"
              "Parameters:\n"
              "- enabled: Whether QLoRA is enabled.\n"
-             "- strategy: Quantization strategy ('none', 'fp8', 'nvfp4').\n"
-             "- block_size: Block size for per-block quantization (FP8: 64/128/256, FP4: 16).\n"
+             "- strategy: Quantization strategy ('none', 'fp8', 'nvfp4', 'bnb').\n"
+             "- block_size: Block size for per-block quantization (FP8: 64/128/256, FP4: 16, BnB: 64).\n"
              "- base_dtype: Storage dtype for quantized base weights.\n"
              "- adapter_dtype: Dtype for LoRA adapter weights (not quantized).")
         .def_rw("enabled", &modules::QLoRAConfig::enabled, "Whether QLoRA is enabled.")
@@ -563,6 +566,8 @@ NB_MODULE(_surogate, m) {
                              cfg->strategy = modules::QLoRAQuantStrategy::FP8;
                          } else if (strat == "nvfp4" || strat == "NVFP4" || strat == "fp4") {
                              cfg->strategy = modules::QLoRAQuantStrategy::NVFP4;
+                         } else if (strat == "bnb" || strat == "BNB" || strat == "bitsandbytes" || strat == "nf4") {
+                             cfg->strategy = modules::QLoRAQuantStrategy::BitsAndBytes;
                          } else {
                              cfg->strategy = modules::QLoRAQuantStrategy::None;
                          }
@@ -588,6 +593,8 @@ NB_MODULE(_surogate, m) {
                      "Whether using FP4 quantization.")
         .def_prop_ro("is_fp8", &modules::QLoRAConfig::is_fp8,
                      "Whether using FP8 quantization.")
+        .def_prop_ro("is_bnb", &modules::QLoRAConfig::is_bnb,
+                     "Whether using BitsAndBytes NF4 quantization.")
         .def_static("fp8", [](int block_size) {
             return modules::QLoRAConfig::fp8(block_size);
         }, nb::arg("block_size") = 128,
@@ -606,7 +613,26 @@ NB_MODULE(_surogate, m) {
         },
            "Create disabled QLoRA configuration (regular LoRA).\n\n"
            "Returns: QLoRAConfig with quantization disabled.")
+        .def_static("bnb", [](int block_size, bool double_quant) {
+            return modules::QLoRAConfig::bnb(block_size, double_quant);
+        }, nb::arg("block_size") = 64, nb::arg("double_quant") = true,
+           "Create BitsAndBytes NF4 QLoRA configuration.\n\n"
+           "Works on any CUDA GPU (no SM89+ or SM100+ requirement).\n"
+           "Uses NF4 (Normal Float 4-bit) quantization with per-block absmax scaling.\n\n"
+           "Parameters:\n"
+           "- block_size: Number of consecutive elements per quantization block (64, 128, 256, 512).\n"
+           "- double_quant: Enable double quantization (quantize absmax to INT8) for extra memory savings.\n\n"
+           "Returns: QLoRAConfig with NF4 base weights.")
+        .def_rw("bnb_double_quant", &modules::QLoRAConfig::bnb_double_quant,
+                "Enable double quantization for BnB (quantize absmax values to INT8).")
+        .def_rw("bnb_double_quant_group_size", &modules::QLoRAConfig::bnb_double_quant_group_size,
+                "Group size for double quantization (number of absmax values per group).")
         .def("__repr__", [](const modules::QLoRAConfig& cfg) {
+            if (cfg.is_bnb()) {
+                return fmt::format("QLoRAConfig(enabled={}, strategy='{}', block_size={}, bnb_double_quant={}, adapter_dtype='{}')",
+                                  cfg.enabled, modules::to_string(cfg.strategy), cfg.scale_config.block_size,
+                                  cfg.bnb_double_quant, dtype_to_str(cfg.adapter_dtype));
+            }
             return fmt::format("QLoRAConfig(enabled={}, strategy='{}', block_size={}, base_dtype='{}', adapter_dtype='{}')",
                               cfg.enabled, modules::to_string(cfg.strategy), cfg.scale_config.block_size,
                               dtype_to_str(cfg.base_dtype), dtype_to_str(cfg.adapter_dtype));

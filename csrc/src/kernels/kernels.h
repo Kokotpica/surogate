@@ -999,4 +999,99 @@ void matmul_cutlass_fp4_alpha(
 /// @return Required workspace size in bytes
 std::size_t cutlass_fp4_workspace_size(int M, int N, int K);
 
+// ============================================================================
+// BitsAndBytes NF4 Quantization (QLoRA-style blockwise quantization)
+// ============================================================================
+// 4-bit Normal Float (NF4) quantization with per-block absmax scaling.
+// Compatible with any CUDA GPU (no SM89+ or SM100+ requirement).
+//
+// NF4 uses 16 asymmetric bins derived from a standard normal distribution,
+// which better represents neural network weight distributions compared to
+// uniform quantization.
+//
+// Double quantization is supported to further reduce memory overhead by
+// quantizing the absmax scaling factors themselves.
+
+/// @brief BitsAndBytes-style NF4 blockwise quantization.
+/// Quantizes BF16 weights to packed 4-bit NF4 with per-block absmax scaling.
+/// @param[out] out Output packed 4-bit data (M*K/2 bytes).
+/// @param[out] absmax Output per-block absmax scales (M*K/block_size floats).
+/// @param[in] in Input BF16 data (M*K elements).
+/// @param M Number of rows.
+/// @param K Number of columns.
+/// @param block_size Quantization block size (64, 128, 256, or 512).
+/// @param dp CUDA device properties.
+/// @param stream CUDA stream.
+void quantize_bnb_nf4(unsigned char* out, float* absmax, const nv_bfloat16* in,
+                      int M, int K, int block_size,
+                      const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Tensor-based BnB NF4 quantization.
+void quantize_bnb_nf4(Tensor& out, Tensor& absmax, const Tensor& in,
+                      int block_size,
+                      const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief BitsAndBytes-style NF4 blockwise dequantization.
+/// Dequantizes packed 4-bit NF4 data back to BF16 using per-block absmax scales.
+/// @param[out] out Output BF16 data (M*K elements).
+/// @param[in] in Input packed 4-bit data (M*K/2 bytes).
+/// @param[in] absmax Per-block absmax scales.
+/// @param M Number of rows.
+/// @param K Number of columns.
+/// @param block_size Quantization block size.
+/// @param dp CUDA device properties.
+/// @param stream CUDA stream.
+void dequantize_bnb_nf4(nv_bfloat16* out, const unsigned char* in, const float* absmax,
+                        int M, int K, int block_size,
+                        const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Tensor-based BnB NF4 dequantization.
+void dequantize_bnb_nf4(Tensor& out, const Tensor& in, const Tensor& absmax,
+                        int block_size,
+                        const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Double quantization: quantize absmax values to INT8.
+/// Reduces memory overhead by quantizing the absmax scaling factors themselves.
+/// @param[out] out_quant Output INT8 quantized absmax.
+/// @param[out] out_scale Per-group dequantization scale (FP32).
+/// @param[out] out_offset Per-group offset (FP32).
+/// @param[in] absmax Input FP32 absmax values.
+/// @param num_absmax Number of absmax values.
+/// @param group_size Values per quantization group (default 256).
+/// @param dp CUDA device properties.
+/// @param stream CUDA stream.
+void quantize_absmax_double(unsigned char* out_quant, float* out_scale, float* out_offset,
+                            const float* absmax, int num_absmax, int group_size,
+                            const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Dequantize INT8 absmax values back to FP32.
+void dequantize_absmax_double(float* out_absmax,
+                              const unsigned char* in_quant, const float* in_scale, const float* in_offset,
+                              int num_absmax, int group_size,
+                              const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief NF4 dequantization with inline absmax dequantization (double quant).
+/// Handles both absmax dequantization and NF4 dequantization in one kernel.
+/// @param[out] out Output BF16 data (M*K elements).
+/// @param[in] in Input packed 4-bit NF4 data (M*K/2 bytes).
+/// @param[in] absmax_quant Quantized INT8 absmax values.
+/// @param[in] absmax_scale Per-group FP32 scale for absmax.
+/// @param[in] absmax_offset Per-group FP32 offset for absmax.
+/// @param M Number of rows.
+/// @param K Number of columns.
+/// @param block_size Quantization block size.
+/// @param absmax_group_size Group size for double quantization (typically 256).
+/// @param dp CUDA device properties.
+/// @param stream CUDA stream.
+void dequantize_bnb_nf4_double(nv_bfloat16* out, const unsigned char* in,
+                               const unsigned char* absmax_quant,
+                               const float* absmax_scale, const float* absmax_offset,
+                               int M, int K, int block_size, int absmax_group_size,
+                               const cudaDeviceProp& dp, cudaStream_t stream);
+
+/// @brief Get the NF4 codebook values (host-side).
+/// Returns pointer to the 16-element NF4 lookup table for debugging.
+/// @return Pointer to static array of 16 floats.
+const float* get_nf4_codebook();
+
 #endif //SUROGATE_SRC_KERNELS_KERNELS_H

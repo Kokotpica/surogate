@@ -227,6 +227,7 @@ target_sources(surogate-common PRIVATE
 
     src/modules/qlora/fp8_weights.cpp
     src/modules/qlora/fp4_weights.cpp
+    src/modules/qlora/bnb_weights.cpp
 
     # Recipe system
     src/recipes/recipe.cpp
@@ -244,6 +245,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/qk_norm.cu
     src/kernels/cudnn_att.cpp
     src/kernels/block_quant.cu
+    src/kernels/bnb_quant.cu
     src/kernels/global_norm.cu
     src/kernels/bias.cu
     src/kernels/adamw8bit.cu
@@ -341,6 +343,7 @@ if (BUILD_TESTS)
 	            src/testing/test-qlora.cu
 	            src/testing/test-adamw.cu
 	            src/testing/test-fp4.cu
+	            src/testing/test-bnb-quant.cpp
 	    )
     target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
     target_compile_options(unit-tests PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)

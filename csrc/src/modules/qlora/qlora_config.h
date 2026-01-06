@@ -23,7 +23,7 @@ enum class QLoRAQuantStrategy {
     None,           ///< No quantization (regular LoRA with BF16 base model)
     FP8,            ///< FP8 E4M3 with per-block scales
     NVFP4,          ///< FP4 E2M1 with two-level block scales for SM 100+ (Blackwell)
-    BitsAndBytes    ///< Future: BitsAndBytes-style NF4/INT4 with double quantization
+    BitsAndBytes    ///< BitsAndBytes-style NF4 with per-block absmax and double quantization
 };
 
 /**
@@ -114,6 +114,17 @@ struct QLoRAConfig {
     /// Error metric for 4/6 selection (MSE, L1, or AbsMax)
     recipes::FourOverSixErrorMetric four_over_six_metric = recipes::FourOverSixErrorMetric::MSE;
 
+    // =========================================================================
+    // BitsAndBytes-specific configuration
+    // =========================================================================
+
+    /// Enable double quantization for BnB (quantize absmax values to INT8)
+    /// Reduces memory overhead by ~0.4 bits per parameter
+    bool bnb_double_quant = true;
+
+    /// Group size for double quantization (number of absmax values per group)
+    int bnb_double_quant_group_size = 256;
+
     /**
      * @brief Check if quantization is active
      */
@@ -140,6 +151,13 @@ struct QLoRAConfig {
      */
     [[nodiscard]] bool is_fp8() const {
         return strategy == QLoRAQuantStrategy::FP8;
+    }
+
+    /**
+     * @brief Check if using BitsAndBytes NF4 quantization
+     */
+    [[nodiscard]] bool is_bnb() const {
+        return strategy == QLoRAQuantStrategy::BitsAndBytes;
     }
 
     /**
@@ -171,6 +189,32 @@ struct QLoRAConfig {
         cfg.scale_config.block_size = 16;  // FP4 uses 16-element blocks
         cfg.base_dtype = ETensorDType::FP4_E2M1;
         cfg.adapter_dtype = ETensorDType::BF16;
+        return cfg;
+    }
+
+    /**
+     * @brief Create BitsAndBytes NF4 QLoRA configuration
+     *
+     * NF4 (Normal Float 4-bit) uses 16 asymmetric bins derived from a normal
+     * distribution, which better represents neural network weight distributions.
+     *
+     * Features:
+     * - Per-block absmax scaling (block_size consecutive elements share one scale)
+     * - Double quantization (quantize absmax to INT8 for additional memory savings)
+     * - Works on any CUDA GPU (no SM89+ or SM100+ requirement)
+     *
+     * @param block_size Number of consecutive elements per quantization block
+     *                   Valid values: 64, 128, 256, 512 (default: 64)
+     * @param double_quant Enable double quantization (default: true)
+     */
+    static QLoRAConfig bnb(int block_size = 64, bool double_quant = true) {
+        QLoRAConfig cfg;
+        cfg.enabled = true;
+        cfg.strategy = QLoRAQuantStrategy::BitsAndBytes;
+        cfg.scale_config.block_size = block_size;
+        cfg.base_dtype = ETensorDType::BYTE;  // Packed 4-bit NF4 stored as uint8
+        cfg.adapter_dtype = ETensorDType::BF16;
+        cfg.bnb_double_quant = double_quant;
         return cfg;
     }
 
@@ -215,6 +259,24 @@ public:
         mConfig.base_dtype = ETensorDType::FP4_E2M1;
         mConfig.scale_config.block_size = 16;  // FP4 uses 16-element blocks
         mConfig.enabled = true;
+        return *this;
+    }
+
+    QLoRAConfigBuilder& bnb(int block_size = 64) {
+        mConfig.strategy = QLoRAQuantStrategy::BitsAndBytes;
+        mConfig.base_dtype = ETensorDType::INT8;  // Packed 4-bit NF4
+        mConfig.scale_config.block_size = block_size;
+        mConfig.enabled = true;
+        return *this;
+    }
+
+    QLoRAConfigBuilder& bnb_double_quant(bool enable = true) {
+        mConfig.bnb_double_quant = enable;
+        return *this;
+    }
+
+    QLoRAConfigBuilder& bnb_double_quant_group_size(int size) {
+        mConfig.bnb_double_quant_group_size = size;
         return *this;
     }
 
