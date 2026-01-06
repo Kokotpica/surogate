@@ -99,13 +99,9 @@ FP4 E2M1 provides extreme compression with only 8 representable values per sign:
 | Parameter                     | Default | Description                         |
 | ----------------------------- | ------- | ----------------------------------- |
 | `qlora_fp4`                   | false   | Enable FP4 QLoRA                    |
-| `disable_stochastic_rounding` | false   | Disable stochastic rounding         |
-| `disable_2d_quantization`     | false   | Use 1D instead of 2D weight scaling |
 | `skip_quant_first_layers`     | 0       | Skip FP4 for first N layers         |
 | `skip_quant_last_layers`      | 0       | Skip FP4 for last N layers          |
 | `backend`                     | cutlass | Backend: cudnn or cutlass           |
-| `enable_four_over_six`        | true    | Enable 4/6 adaptive scaling         |
-| `four_over_six_metric`        | MSE     | Error metric: MSE, L1, or AbsMax    |
 
 ### Recommended Recipe Combinations
 

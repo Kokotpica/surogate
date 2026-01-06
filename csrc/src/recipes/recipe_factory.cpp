@@ -33,7 +33,6 @@ std::unique_ptr<Recipe> RecipeFactory::create(const std::string& name, const Rec
 
     if (name == "nvfp4") {
         NVFP4Recipe::Config nvfp4_config{
-            .disable_stochastic_rounding = config.fp4_disable_stochastic_rounding,
             .disable_2d_quantization = config.fp4_disable_2d_quantization,
             .skip_quant_first_layers = config.skip_quant_first_layers,
             .skip_quant_last_layers = config.skip_quant_last_layers,

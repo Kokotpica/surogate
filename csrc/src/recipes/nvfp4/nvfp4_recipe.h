@@ -58,7 +58,6 @@ public:
      * @brief Configuration for NVFP4 recipe.
      */
     struct Config {
-        bool disable_stochastic_rounding = false; ///< Disable stochastic rounding for gradients
         bool disable_2d_quantization = false;    ///< Use 1D instead of 2D block scaling for weights
         int skip_quant_first_layers = 0;         ///< Skip quantization for first N layers (embedding)
         int skip_quant_last_layers = 0;          ///< Skip quantization for last N layers (lm_head)
@@ -101,7 +100,7 @@ public:
     [[nodiscard]] QuantParams quant_bwd_grad() const override {
         return {
             .random_hadamard_transform = true,
-            .stochastic_rounding = !mConfig.disable_stochastic_rounding,
+            .stochastic_rounding = true,  // Always use stochastic rounding for gradients
             .block_2d_quantization = false,
             .power_2_scale = false,
             .amax_epsilon = 0.0f

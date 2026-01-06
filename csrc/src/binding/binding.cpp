@@ -296,14 +296,12 @@ NB_MODULE(_surogate, m) {
             const std::string matmul_type, const std::string gradient_type, const std::string master_dtype,
             const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope,
             int fp8_amax_history, const std::string& fp4_backend,
-            bool no_fp4_stochastic_rounding,
             int skip_quant_first_layers, int skip_quant_last_layers) {
 
             // Build recipe options
             recipes::RecipeConfig recipe_options;
             recipe_options.fp8_amax_history_len = fp8_amax_history;
             recipe_options.fp4_backend = matmul_backend_from_str(fp4_backend);
-            recipe_options.fp4_disable_stochastic_rounding = no_fp4_stochastic_rounding;
             recipe_options.skip_quant_first_layers = skip_quant_first_layers;
             recipe_options.skip_quant_last_layers = skip_quant_last_layers;
 
@@ -380,7 +378,6 @@ NB_MODULE(_surogate, m) {
              nb::arg("use_fused_rope") = false,
              nb::arg("fp8_amax_history") = 1024,
              nb::arg("fp4_backend") = "cutlass",
-             nb::arg("no_fp4_stochastic_rounding") = false,
              nb::arg("skip_quant_first_layers") = 0,
              nb::arg("skip_quant_last_layers") = 0,
              "Create runtime/training options.\n\n"
@@ -397,7 +394,6 @@ NB_MODULE(_surogate, m) {
              "- use_fused_rope: Use fused RoPE kernel with on-the-fly cos/sin computation.\n"
              "- fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).\n"
              "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"
-             "- no_fp4_stochastic_rounding: Disable stochastic rounding for NVFP4 gradients.\n"
              "- skip_quant_first_layers: Skip quantization for first N layers.\n"
              "- skip_quant_last_layers: Skip quantization for last N layers.")
         .def_rw("recompute_swiglu", &RuntimeOptions::RecomputeSwiGLu, "Recompute SwiGLU activations in backward.")

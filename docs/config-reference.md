@@ -97,7 +97,6 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 | Option                       | Type   | Default     | Description                                                                  |
 | ---------------------------- | ------ | ----------- | ---------------------------------------------------------------------------- |
 | `fp4_backend`                | string | `"cutlass"` | FP4 matmul backend: `"cutlass"` (default) or `"cudnn"` (for `nvfp4` recipe). |
-| `no_fp4_stochastic_rounding` | bool   | `false`     | Disable stochastic rounding for NVFP4 gradient quantization.                 |
 
 ### Layer Quantization Skip Options
 
