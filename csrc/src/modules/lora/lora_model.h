@@ -30,6 +30,7 @@
 #include "modules/qlora/qlora_config.h"
 #include "modules/qlora/fp8_weight_provider.h"
 #include "modules/qlora/fp4_weight_provider.h"
+#include "modules/qlora/bnb_weight_provider.h"
 #include "training/model.h"
 #include "training/runtime_options.h"
 #include "utilities/allocator.h"
@@ -635,6 +636,8 @@ public:
             // QLoRA mode: load base weights into quantized storage, then inject weight provider
             if (mQLoRAConfig.is_fp4()) {
                 import_weights_fp4_qlora(file_name, comm);
+            } else if (mQLoRAConfig.is_bnb()) {
+                import_weights_bnb_qlora(file_name, comm);
             } else {
                 import_weights_qlora(file_name, comm);
             }
@@ -672,6 +675,9 @@ public:
             }
             if (mFP4WeightProvider) {
                 mFP4WeightProvider->invalidate_cache();
+            }
+            if (mBnBWeightProvider) {
+                mBnBWeightProvider->invalidate_cache();
             }
         }
 
@@ -1146,15 +1152,17 @@ public:
     ModularLoRAWeightsManager& lora_weights() { return *mLoRAWeights; }
     ModularLoRAGradsManager& lora_grads() { return *mLoRAGrads; }
 
-    // QLoRA memory stats (supports both FP8 and FP4)
+    // QLoRA memory stats (supports FP8, FP4, and BnB NF4)
     [[nodiscard]] std::size_t qlora_quantized_weights_bytes() const {
         if (mFP4WeightProvider) return mFP4WeightProvider->quantized_weights_bytes();
         if (mFP8WeightProvider) return mFP8WeightProvider->quantized_weights_bytes();
+        if (mBnBWeightProvider) return mBnBWeightProvider->quantized_weights_bytes();
         return 0;
     }
     [[nodiscard]] float qlora_memory_savings_ratio() const {
         if (mFP4WeightProvider) return mFP4WeightProvider->memory_savings_ratio();
         if (mFP8WeightProvider) return mFP8WeightProvider->memory_savings_ratio();
+        if (mBnBWeightProvider) return mBnBWeightProvider->memory_savings_ratio();
         return 1.0f;
     }
 
@@ -1369,6 +1377,9 @@ private:
     // QLoRA FP4: quantized base weight provider (FP4 E2M1 with two-level block scales)
     std::unique_ptr<FP4WeightProvider<Block>> mFP4WeightProvider;
 
+    // QLoRA BnB: BitsAndBytes NF4 quantized base weight provider (works on any GPU)
+    std::unique_ptr<BnBWeightProvider<Block>> mBnBWeightProvider;
+
     std::minstd_rand mLoRAOptimizerRNG;
 
     void allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
@@ -1571,6 +1582,81 @@ private:
         weights_manager.set_lm_head_provider(
             [this](cudaStream_t stream) -> Tensor& {
                 return mFP4WeightProvider->get_lm_head(stream);
+            });
+    }
+
+    /**
+     * @brief Load and quantize base model weights for BitsAndBytes NF4 QLoRA mode
+     *
+     * Creates BnBWeightProvider, loads and quantizes base model weights to NF4,
+     * then injects the weight provider into the base model's weight manager.
+     *
+     * This mode works on any CUDA GPU (no SM89+ or SM100+ requirement).
+     *
+     * @param file_name Path to safetensors model file
+     * @param comm NCCL communicator for multi-GPU sync
+     */
+    void import_weights_bnb_qlora(const std::string& file_name, NCCLCommunicator& comm) {
+        const auto& cfg = mBaseModel->config();
+
+        // Get CUDA device properties
+        int device_id = 0;
+        CUDA_CHECK(cudaGetDevice(&device_id));
+        cudaDeviceProp device_props{};
+        CUDA_CHECK(cudaGetDeviceProperties(&device_props, device_id));
+
+        // Create a CUDA stream for quantization
+        cudaStream_t quant_stream = nullptr;
+        CUDA_CHECK(cudaStreamCreate(&quant_stream));
+
+        // Create BnB weight provider config
+        typename BnBWeightProvider<Block>::Config bnb_config{};
+        bnb_config.num_layers = cfg.NumLayers;
+        bnb_config.hidden_size = cfg.HiddenSize;
+        bnb_config.intermediate_size = cfg.IntermediateSize;
+        bnb_config.num_query_heads = cfg.NumQueryHeads;
+        bnb_config.num_kv_heads = cfg.NumKeyValHeads;
+        bnb_config.head_size = cfg.head_size();
+        bnb_config.vocab_size = cfg.VocabSize;
+        bnb_config.qlora_config = mQLoRAConfig;
+        bnb_config.lora_config = mLoRAConfig;
+        bnb_config.model_dtype = cfg.DType;
+        bnb_config.use_qk_norm = cfg.UseQKNorm;
+        bnb_config.tied_embeddings = cfg.TiedWordEmbeddings;
+        bnb_config.shard_idx = comm.rank();
+        bnb_config.num_shards = comm.world_size();
+
+        // Create the BnB weight provider
+        mBnBWeightProvider = std::make_unique<BnBWeightProvider<Block>>(
+            bnb_config, *mAllocator, device_props);
+
+        // Import and quantize weights to NF4
+        mBnBWeightProvider->import_and_quantize(file_name, comm, quant_stream);
+
+        // Synchronize before cleanup
+        CUDA_CHECK(cudaStreamSynchronize(quant_stream));
+        CUDA_CHECK(cudaStreamDestroy(quant_stream));
+
+        // Inject the weight provider into the base model's weight manager
+        // This makes get_block() return dequantized weights from BnB NF4 storage
+        auto& weights_manager = mBaseModel->weights_manager();
+        weights_manager.set_weight_provider(
+            [this](int layer_idx, cudaStream_t stream) -> typename Block::Weights& {
+                return mBnBWeightProvider->get_block(layer_idx, stream);
+            });
+
+        // Also inject providers for non-block weights (embeddings, final_norm, lm_head)
+        weights_manager.set_embeddings_provider(
+            [this](cudaStream_t stream) -> Tensor& {
+                return mBnBWeightProvider->get_embeddings(stream);
+            });
+        weights_manager.set_final_norm_provider(
+            [this](cudaStream_t stream) -> Tensor& {
+                return mBnBWeightProvider->get_final_norm(stream);
+            });
+        weights_manager.set_lm_head_provider(
+            [this](cudaStream_t stream) -> Tensor& {
+                return mBnBWeightProvider->get_lm_head(stream);
             });
     }
 

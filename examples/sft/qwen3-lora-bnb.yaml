@@ -1,0 +1,43 @@
+model: Qwen/Qwen3-0.6B
+output_dir: ./output
+merge_adapter: false
+apply_recommended_values: false
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+
+sample_packing: true
+sequence_len: 1024
+
+max_steps: 100
+save_steps: 1000
+
+learning_rate: 2e-4
+
+recipe: bf16
+
+offload_residual: true
+offload_optimizer: true
+lmhead_chunks: 4
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+qlora_bnb: true
+qlora_bnb_block_size: 64
+qlora_bnb_double_quant: true
+
+dataloader_num_workers: 4
+datasets:
+  - path: "mlabonne/FineTome-100k"
+    samples: 1000
+    type: auto

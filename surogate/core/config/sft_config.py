@@ -190,12 +190,19 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Dropout rate for LoRA adapters.
         lora_target_modules (Optional[str], default to 'all-linear'):
             List of comma-separated module names to apply LoRA adapters to.
-        qlora_fp4: (Optional[bool], defaults to True):
+        qlora_fp4: (Optional[bool], defaults to False):
             Enable NVFP4 QLoRA mode (base weights quantized to FP4 E2M1). Requires Blackwell GPU (SM100+)
         qlora_fp8: (Optional[bool], defaults to False):
             Enable FP8 QLoRA mode (base weights quantized to FP8 with per-block scales)
+        qlora_bnb: (Optional[bool], defaults to False):
+            Enable BitsAndBytes NF4 QLoRA mode (base weights quantized to NF4 with per-block absmax).
+            Works on any CUDA GPU (no SM89+ or SM100+ requirement).
         qlora_block_size: (Optional[int], defaults to 128):
-            Block size for QLoRA quantization. Valid values are 64, 128, 256.
+            Block size for FP8 QLoRA quantization. Valid values are 64, 128, 256.
+        qlora_bnb_block_size: (Optional[int], defaults to 64):
+            Block size for BnB NF4 QLoRA quantization. Valid values are 64, 128, 256, 512.
+        qlora_bnb_double_quant: (Optional[bool], defaults to True):
+            Enable double quantization for BnB (quantize absmax values to INT8 for extra memory savings).
         qlora_four_over_six: (Optional[bool], defaults to True):
             Enable Four Over Six (4/6) adaptive block scaling for NVFP4 QLoRA quantization.
             Evaluates both max=4 and max=6 scaling per block and selects lower error option.
@@ -284,7 +291,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     lora_target_modules: Optional[List[str]] = None
     qlora_fp4: Optional[bool] = False
     qlora_fp8: Optional[bool] = False
+    qlora_bnb: Optional[bool] = False
     qlora_block_size: Optional[int] = 128
+    qlora_bnb_block_size: Optional[int] = 64
+    qlora_bnb_double_quant: Optional[bool] = True
     qlora_four_over_six: Optional[bool] = True
 
     merge_adapter: Optional[bool] = False
@@ -368,7 +378,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.lora_target_modules = cfg.get('lora_target_modules', ['all-linear'])
         self.qlora_fp4 = cfg.get('qlora_fp4', self.qlora_fp4)
         self.qlora_fp8 = cfg.get('qlora_fp8', self.qlora_fp8)
+        self.qlora_bnb = cfg.get('qlora_bnb', self.qlora_bnb)
         self.qlora_block_size = cfg.get('qlora_block_size', self.qlora_block_size)
+        self.qlora_bnb_block_size = cfg.get('qlora_bnb_block_size', self.qlora_bnb_block_size)
+        self.qlora_bnb_double_quant = cfg.get('qlora_bnb_double_quant', self.qlora_bnb_double_quant)
         self.qlora_four_over_six = cfg.get('qlora_four_over_six', self.qlora_four_over_six)
 
         self.merge_adapter = cfg.get('merge_adapter', self.merge_adapter)
@@ -540,6 +553,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             self.qlora_config = _surogate.QLoRAConfig.fp8(block_size=self.qlora_block_size)
             self.qlora_config.enable_four_over_six = self.qlora_four_over_six
+        elif self.qlora_bnb:
+            self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
+            self.qlora_config = _surogate.QLoRAConfig.bnb(
+                block_size=self.qlora_bnb_block_size,
+                double_quant=self.qlora_bnb_double_quant
+            )
 
     def generate_run_name(self):
         return generate_unique_name(category='science')
