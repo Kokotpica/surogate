@@ -4,7 +4,7 @@ FP4 E2M1 training with two-level block scaling.
 
 ## Overview
 
-This recipe implements NVIDIA TransformerEngine's NVFP4BlockScaling strategy for extreme memory efficiency on Blackwell GPUs. FP4 uses only 4 bits per value, enabling 2x memory savings over FP8.
+This recipe implements NVIDIA TransformerEngine's NVFP4BlockScaling strategy for extreme efficiency on Blackwell GPUs.
 
 Key techniques for narrow-format stability:
 1. **Two-level block scaling**: FP8 E4M3 scale per 16 values + FP32 global amax
