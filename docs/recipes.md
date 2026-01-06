@@ -75,7 +75,7 @@ skip_quant_first_layers: 1
 skip_quant_last_layers: 2
 ```
 
-## FP4
+## FP4 (NVFP4)
 
 This recipe uses NVIDIA's NVFP4 format for both forward and backward passes, employing two-level block scaling for improved stability. It uses FP8 E4M3 scales per 16 values and a global FP32 amax, along with 2D block quantization for weights, stochastic rounding for gradients, and optional Random Hadamard Transforms (RHT) to spread outliers before quantization.
 
@@ -100,10 +100,40 @@ Use this recipe when:
 | Parameter                    | Default | Description                                                        |
 | ---------------------------- | ------- | ------------------------------------------------------------------ |
 | `fp4_backend`                | cutlass | Matmul backend: `cutlass` (default) or `cudnn`                     |
-| `no_fp4_hadamard`            | false   | Disable Random Hadamard Transform                                  |
+| `no_fp4_hadamard`            | false   | Disable Random Hadamard Transform (enables scaled SwiGLU instead)  |
 | `no_fp4_stochastic_rounding` | false   | Disable stochastic rounding for gradients                          |
 | `skip_quant_first_layers`    | 0       | Skip quantization for first N layers (keep in BF16 for stability)  |
 | `skip_quant_last_layers`     | 0       | Skip quantization for last N layers (keep in BF16 for stability)   |
+
+### Scaled SwiGLU (Alternative to Hadamard Transform)
+
+When Random Hadamard Transforms are disabled (`no_fp4_hadamard: true`), the recipe automatically enables **Scaled SwiGLU** as an alternative technique for FP4 numerical stability.
+
+The standard SwiGLU activation can produce values with large magnitudes that don't quantize well to FP4's limited range (max 6.0). Scaled SwiGLU addresses this by normalizing the gate values before the activation:
+
+```
+# Standard SwiGLU
+out = silu(up) * gate
+
+# Scaled SwiGLU
+s = max(|gate|)              # per-row max of gate values
+gate_norm = gate / s         # normalize gate to [-1, 1] range
+out = silu(up) * gate_norm   # scaled output stays in FP4-friendly range
+```
+
+The scale `s` is saved and applied after the down projection to restore the correct magnitude:
+```
+final_out = down_proj(out) * s
+```
+
+This keeps intermediate values within FP4's representable range while preserving the mathematical equivalence of the computation. The scale is treated as a constant (detached) in the backward pass for gradient stability.
+
+**When to use Scaled SwiGLU over Hadamard Transform:**
+- When you want to avoid the memory overhead of Hadamard workspace tensors
+- When profiling shows Hadamard transforms are a bottleneck
+- For debugging or comparing quantization strategies
+
+Both approaches aim to spread outliers and keep values in a quantization-friendly range, but they achieve this through different mechanisms: RHT uses random orthogonal transformations across the hidden dimension, while Scaled SwiGLU uses per-row normalization at the activation boundary.
 
 ### Backend Selection
 
