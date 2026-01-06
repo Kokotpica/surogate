@@ -82,4 +82,4 @@ class HuggingFaceHub(HubOperation):
         from huggingface_hub import snapshot_download
         return snapshot_download(
             model_id_or_path, repo_type='model', revision=revision, ignore_patterns=ignore_patterns,
-            tqdm_class=create_hfhub_tqdm('Downloading model from HuggingFace: '), **kwargs)
+            tqdm_class=create_hfhub_tqdm('Downloading model: '), **kwargs)

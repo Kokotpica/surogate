@@ -1,12 +1,12 @@
 import math
 from abc import ABC
 from dataclasses import dataclass
-from typing import Optional, Literal, Union, Any
+from typing import Optional, Union, Any
 
 import torch
 from transformers.utils.quantization_config import QuantizationConfigMixin
 
-from surogate.core.model.loader import get_model_info_and_template
+from surogate.core.model.loader import get_model_info_and_tokenizer
 from surogate.utils.dict import DictDefault
 from surogate.utils.jsonl import json_parse_to_dict
 from surogate.utils.logger import get_logger
@@ -51,7 +51,7 @@ class ModelConfig(ABC):
 
     def _init_model_info(self) -> torch.dtype:
         logger.debug("init model info and template...")
-        self.model_info, self.model_template = get_model_info_and_template(**self.get_model_kwargs())
+        self.model_info, self.model_template, self.model, self.tokenizer = get_model_info_and_tokenizer(**self.get_model_kwargs())
         self.model_dir = self.model_info.model_dir
         self.model_type = self.model_info.model_type
 

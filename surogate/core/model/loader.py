@@ -69,119 +69,13 @@ def safe_snapshot_download(
 
         model_dir = hub.download_model(model_id_or_path, revision, ignore_patterns, token=hub_token, **kwargs)
 
-        logger.info(f'Loading model from local path: {model_dir}')
+        logger.debug(f'Loading model from local path: {model_dir}')
 
     model_dir = os.path.abspath(os.path.expanduser(model_dir))
     if sub_folder:
         model_dir = os.path.join(model_dir, sub_folder)
     assert os.path.isdir(model_dir), f'model_dir: {model_dir}'
     return model_dir
-
-
-def get_model_and_tokenizer(
-        model_id_or_path: str,
-        torch_dtype: Optional[torch.dtype] = None,
-        device_map: Union[str, Dict[str, Any], None] = None,
-        *,
-        load_model: bool = True,
-        # hub
-        hub_token: Optional[str] = None,
-        revision: Optional[str] = None,
-        download_model: Optional[bool] = None,
-        # model kwargs
-        model_type: Optional[str] = None,
-        quantization_config=None,
-        max_memory: Union[str, Dict[str, Any]] = None,
-        attn_impl: Optional[str] = None,
-        new_special_tokens: Optional[List[str]] = None,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        max_model_len: Optional[int] = None,
-        automodel_class=None,
-        model_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs) -> Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]:
-    """
-    model_id_or_path: The path to the model or the model_id from modelscope/huggingface (controlled by `use_hf`).
-    torch_dtype: If you pass `None`, it will retrieve the torch_dtype from the config.json file.
-    model_kwargs: Passed to `automodel_class.from_pretrained`.
-    load_model: Whether to load the model. If set to False, the model will return `None`.
-    use_hf: Indicates whether the model download hub is modelscope or huggingface.
-    model_type: If it is not possible to uniquely determine the model_type from the architecture in config.json,
-        it needs to be provided.
-    attn_impl: If set to 'flash_attn': It will automatically convert names based on the model.
-        If set to None : It will be automatically selected between sdpa and eager.
-    download_model: Whether to download the model weights. If `None`, it will be selected based on load_model.
-    tokenizer_path: The path to the tokenizer. If `None`, it will use the tokenizer from the model.
-    """
-    if model_kwargs is None:
-        model_kwargs = {}
-    if download_model is None:
-        download_model = load_model
-
-    model_info, model_template = get_model_info_and_template(
-        model_id_or_path,
-        torch_dtype,
-        use_hf=True,
-        hub_token=hub_token,
-        revision=revision,
-        download_model=download_model,
-        model_type=model_type,
-        quantization_config=quantization_config)
-
-    model_kwargs['device_map'] = device_map
-    if quantization_config:
-        model_kwargs['quantization_config'] = quantization_config
-    if max_memory:
-        model_kwargs['max_memory'] = max_memory
-    model_dir = model_info.model_dir
-    get_function = model_template.get_function
-    kwargs['automodel_class'] = automodel_class
-    kwargs['attn_impl'] = attn_impl
-    kwargs['rope_scaling'] = rope_scaling
-    kwargs['model_meta'] = model_template
-    kwargs['max_model_len'] = max_model_len
-
-    model, processor = get_function(model_dir, model_info, model_kwargs, load_model, **kwargs)
-
-    if not isinstance(processor, PreTrainedTokenizerBase) and hasattr(processor, 'tokenizer'):
-        tokenizer = processor.tokenizer
-        patch_getattr(processor.__class__, 'tokenizer')
-    else:
-        tokenizer = processor
-    if new_special_tokens:
-        num_new_tokens = tokenizer.add_special_tokens({'additional_special_tokens': new_special_tokens})
-        if num_new_tokens > 0:
-            logger.info(f'Added {num_new_tokens} new special tokens.')
-
-            if model is not None:
-                llm_model = get_lm_head_model(model, model_template)
-                origin_vocab_size = HfConfigFactory.get_config_attr(llm_model.config, 'vocab_size')
-                if origin_vocab_size < len(tokenizer):
-                    vocab_size = math.ceil(len(tokenizer) / 128) * 128
-                    llm_model.resize_token_embeddings(vocab_size)
-                    # fix transformers==4.52.4 qwen2.5-vl
-                    HfConfigFactory.set_config_attr(llm_model.config, 'vocab_size', vocab_size)
-
-    tokenizer.model_info = model_info
-    tokenizer.model_meta = model_template
-
-    if model is not None:
-        model.model_info = model_info
-        model.model_meta = model_template
-        model.model_dir = model_dir
-
-        # generation_config
-        generation_config_path = os.path.join(model_dir, 'generation_config.json')
-        if not hasattr(model, 'generation_config') and os.path.isfile(generation_config_path):
-            model.generation_config = GenerationConfig.from_pretrained(model_dir)
-        # fix llama2 warning
-        if getattr(model, 'generation_config', None):
-            fix_do_sample_warning(model.generation_config)
-
-    if processor is not None:
-        processor.model_info = model_info
-        processor.model_meta = model_template
-
-    return model, processor
 
 
 def get_model_and_tokenizer_from_local(
@@ -266,7 +160,7 @@ def get_model_info_and_template(
         model_id_or_path: str,
         torch_dtype: Optional[torch.dtype] = None,
         *,
-        download_model: bool = False,
+        download_model: bool = True,
         model_type: Optional[str] = None,
         quantization_config=None,
         **kwargs
@@ -283,6 +177,7 @@ def get_model_info_and_template(
     """
     model_dir = safe_snapshot_download(
         model_id_or_path,
+        check_local=True,
         download_model=download_model)
 
     model_info = ModelInfo.create(model_dir, model_type, quantization_config=quantization_config)
@@ -317,7 +212,7 @@ def get_model_info_and_template(
     return model_info, model_template
 
 
-def get_model_tokenizer_from_local(
+def get_model_and_tokenizer_from_local(
         model_dir: str,
         model_info: ModelInfo,
         model_kwargs: Dict[str, Any],
@@ -409,7 +304,7 @@ def get_model_tokenizer_with_flash_attn(
         model_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     AttnImpl.update_attn_impl(model_config, kwargs.get('attn_impl'), kwargs.get('attn_impl_keys'))
     kwargs['model_config'] = model_config
-    return get_model_tokenizer_from_local(model_dir, model_info, model_kwargs, load_model, **kwargs)
+    return get_model_and_tokenizer_from_local(model_dir, model_info, model_kwargs, load_model, **kwargs)
 
 
 def get_model_tokenizer_multimodal(model_dir: str, *args, **kwargs):
@@ -419,24 +314,40 @@ def get_model_tokenizer_multimodal(model_dir: str, *args, **kwargs):
     model, _ = get_model_tokenizer_with_flash_attn(model_dir, *args, **kwargs)
     return model, processor
 
-
-def get_model_tokenizer(
+def get_model_info_and_tokenizer(
         model_id_or_path: str,
         torch_dtype: Optional[torch.dtype] = None,
         device_map: Union[str, Dict[str, Any], None] = None,
         *,
         load_model: bool = True,
+        # hub
+        hub_token: Optional[str] = None,
+        revision: Optional[str] = None,
         download_model: Optional[bool] = None,
+        # model kwargs
         model_type: Optional[str] = None,
         quantization_config=None,
         max_memory: Union[str, Dict[str, Any]] = None,
         attn_impl: Optional[str] = None,
+        new_special_tokens: Optional[List[str]] = None,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_model_len: Optional[int] = None,
         automodel_class=None,
         model_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs
-) -> Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]:
+        **kwargs) -> Tuple[ModelInfo, ModelTemplate, Optional[PreTrainedModel], PreTrainedTokenizerBase]:
+    """
+    model_id_or_path: The path to the model or the model_id from modelscope/huggingface (controlled by `use_hf`).
+    torch_dtype: If you pass `None`, it will retrieve the torch_dtype from the config.json file.
+    model_kwargs: Passed to `automodel_class.from_pretrained`.
+    load_model: Whether to load the model. If set to False, the model will return `None`.
+    use_hf: Indicates whether the model download hub is modelscope or huggingface.
+    model_type: If it is not possible to uniquely determine the model_type from the architecture in config.json,
+        it needs to be provided.
+    attn_impl: If set to 'flash_attn': It will automatically convert names based on the model.
+        If set to None : It will be automatically selected between sdpa and eager.
+    download_model: Whether to download the model weights. If `None`, it will be selected based on load_model.
+    tokenizer_path: The path to the tokenizer. If `None`, it will use the tokenizer from the model.
+    """
     if model_kwargs is None:
         model_kwargs = {}
     if download_model is None:
@@ -445,6 +356,9 @@ def get_model_tokenizer(
     model_info, model_template = get_model_info_and_template(
         model_id_or_path,
         torch_dtype,
+        use_hf=True,
+        hub_token=hub_token,
+        revision=revision,
         download_model=download_model,
         model_type=model_type,
         quantization_config=quantization_config)
@@ -454,10 +368,8 @@ def get_model_tokenizer(
         model_kwargs['quantization_config'] = quantization_config
     if max_memory:
         model_kwargs['max_memory'] = max_memory
-
     model_dir = model_info.model_dir
     get_function = model_template.get_function
-
     kwargs['automodel_class'] = automodel_class
     kwargs['attn_impl'] = attn_impl
     kwargs['rope_scaling'] = rope_scaling
@@ -471,6 +383,20 @@ def get_model_tokenizer(
         patch_getattr(processor.__class__, 'tokenizer')
     else:
         tokenizer = processor
+    
+    if new_special_tokens:
+        num_new_tokens = tokenizer.add_special_tokens({'additional_special_tokens': new_special_tokens})
+        if num_new_tokens > 0:
+            logger.info(f'Added {num_new_tokens} new special tokens.')
+
+            if model is not None:
+                llm_model = get_lm_head_model(model, model_template)
+                origin_vocab_size = HfConfigFactory.get_config_attr(llm_model.config, 'vocab_size')
+                if origin_vocab_size < len(tokenizer):
+                    vocab_size = math.ceil(len(tokenizer) / 128) * 128
+                    llm_model.resize_token_embeddings(vocab_size)
+                    # fix transformers==4.52.4 qwen2.5-vl
+                    HfConfigFactory.set_config_attr(llm_model.config, 'vocab_size', vocab_size)
 
     tokenizer.model_info = model_info
     tokenizer.model_template = model_template
@@ -488,4 +414,8 @@ def get_model_tokenizer(
         if getattr(model, 'generation_config', None):
             fix_do_sample_warning(model.generation_config)
 
-    return model, processor
+    if processor is not None:
+        processor.model_info = model_info
+        processor.model_template = model_template
+
+    return model_info, model_template, model, processor

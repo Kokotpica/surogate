@@ -14,7 +14,6 @@ from surogate.core.datasets.loader import load_dataset_with_config, pre_process,
     shuffle_dataset
 from surogate.core.datasets.preprocessor.encode import EncodePreprocessor
 from surogate.core.model.chat_templates.processor import ChatTemplateProcessor
-from surogate.core.model.loader import get_model_tokenizer
 from surogate.utils.command import SurogateCommand
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
@@ -587,14 +586,13 @@ class TokenizeDatasets(SurogateCommand):
         super().__init__(config=config, args=args)
         config.__post_init__()
 
-        self.model, self.tokenizer = get_model_tokenizer(**self.config.get_model_kwargs())
         self._prepare_chat_template()
 
     def _prepare_chat_template(self) -> None:
-        template_processor = self.config.get_template_processor(self.tokenizer)
+        template_processor = self.config.get_template_processor(self.config.tokenizer)
         template_processor.set_mode('train')
         if template_processor.use_model:
-            template_processor.model = self.model
+            template_processor.model = self.config.model
         pass
         if self.config.model_template.is_multimodal and (
                 self.config.padding_free or self.config.sample_packing) and not template_processor.support_padding_free:
@@ -662,7 +660,7 @@ class TokenizeDatasets(SurogateCommand):
             for i, row in enumerate(train_dataset):
                 if i >= 5:
                     break
-                debug_labels(row, self.tokenizer)
+                debug_labels(row, self.config.tokenizer)
 
             # If tokenization can be skipped (and debug was the only reason to run), return now
             if stored_hash == current_hash and files_exist:
@@ -747,9 +745,9 @@ class TokenizeDatasets(SurogateCommand):
             num_workers: Number of parallel workers for tokenization. If None, uses
                         half of available CPUs (capped at 8).
         """
-        vocab_size = self.tokenizer.vocab_size
+        vocab_size = self.config.tokenizer.vocab_size
         seq_len = self.config.sequence_len or self.config.max_model_len
-        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        pad_token_id = self.config.tokenizer.pad_token_id if self.config.tokenizer.pad_token_id is not None else 0
 
         # Set defaults for multi-file processing
         if max_tokens_per_file is None and packing:
