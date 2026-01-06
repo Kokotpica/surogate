@@ -142,11 +142,6 @@ struct RuntimeOptions {
         return TrainingRecipe && TrainingRecipe->is_fp8_hybrid();
     }
 
-    // Check if scaled SwiGLU is required by the current recipe
-    [[nodiscard]] bool scaled_swiglu_enabled() const {
-        return TrainingRecipe && TrainingRecipe->requires_scaled_swiglu();
-    }
-
     // Get recipe name (or "bf16" if no recipe set)
     [[nodiscard]] std::string_view recipe_name() const {
         if (TrainingRecipe) {

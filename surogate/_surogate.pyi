@@ -743,7 +743,7 @@ class RuntimeOptions:
         """
         Create and return a new object.  See help(type) for accurate signature.
         """
-    def __init__(self, *, recompute_swiglu: bool = False, recompute_rmsnorm: bool = False, recompute_ffn: bool = False, recompute_qkv: bool = False, recompute_att: bool = False, recompute_block: bool = False, offload_residual: bool = False, use_cuda_graphs: bool = True, trigger_timing_events: bool = False, offload_master: bool = False, offload_quants: bool = False, offload_optimizer: bool = False, offload_grads: bool = False, use_zero_copy: bool = False, use_write_combined: bool = False, shard_weights: bool = False, persistent_quants: bool = False, shard_gradients: bool = False, use_all_to_all_reduce: bool = False, init_projections_to_zero: bool = False, lmhead_chunks: int = 1, attn_bwd_chunks: int = 1, matmul_type: str = '', gradient_type: str = '', master_dtype: str = '', recipe: str = 'bf16', matmul_backend: str = '', use_fused_rope: bool = False, fp8_amax_history: int = 1024, fp4_backend: str = 'cutlass', no_fp4_hadamard: bool = False, no_fp4_stochastic_rounding: bool = False, skip_quant_first_layers: int = 0, skip_quant_last_layers: int = 0) -> None:
+    def __init__(self, *, recompute_swiglu: bool = False, recompute_rmsnorm: bool = False, recompute_ffn: bool = False, recompute_qkv: bool = False, recompute_att: bool = False, recompute_block: bool = False, offload_residual: bool = False, use_cuda_graphs: bool = True, trigger_timing_events: bool = False, offload_master: bool = False, offload_quants: bool = False, offload_optimizer: bool = False, offload_grads: bool = False, use_zero_copy: bool = False, use_write_combined: bool = False, shard_weights: bool = False, persistent_quants: bool = False, shard_gradients: bool = False, use_all_to_all_reduce: bool = False, init_projections_to_zero: bool = False, lmhead_chunks: int = 1, attn_bwd_chunks: int = 1, matmul_type: str = '', gradient_type: str = '', master_dtype: str = '', recipe: str = 'bf16', matmul_backend: str = '', use_fused_rope: bool = False, fp8_amax_history: int = 1024, fp4_backend: str = 'cutlass', no_fp4_stochastic_rounding: bool = False, skip_quant_first_layers: int = 0, skip_quant_last_layers: int = 0) -> None:
         """
         Create runtime/training options.
         
@@ -760,7 +760,6 @@ class RuntimeOptions:
         - use_fused_rope: Use fused RoPE kernel with on-the-fly cos/sin computation.
         - fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).
         - fp4_backend: FP4 matmul backend (cudnn, cutlass).
-        - no_fp4_hadamard: Disable Random Hadamard Transform for NVFP4 recipe.
         - no_fp4_stochastic_rounding: Disable stochastic rounding for NVFP4 gradients.
         - skip_quant_first_layers: Skip quantization for first N layers.
         - skip_quant_last_layers: Skip quantization for last N layers.

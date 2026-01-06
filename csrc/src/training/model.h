@@ -252,12 +252,6 @@ public:
     /// @brief Check if FP4 backward is enabled
     [[nodiscard]] virtual bool has_fp4_backward() const { return false; }
 
-    /// @brief Check if FP4 Hadamard transform is enabled
-    [[nodiscard]] virtual bool has_fp4_hadamard() const { return false; }
-
-    /// @brief Check if scaled SwiGLU is enabled
-    [[nodiscard]] virtual bool has_scaled_swiglu() const { return false; }
-
     /// @brief Check if activation quant buffers are allocated
     [[nodiscard]] virtual bool has_activation_quants() const { return false; }
 

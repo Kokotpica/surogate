@@ -121,8 +121,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             FP8 delayed scaling amax history length (default: 1024, for fp8-hybrid recipe)
         fp4_backend (Optional[Literal['cutlass', 'cudnn']], defaults to 'cutlass'):
             FP4 matmul backend: cutlass (default) or cudnn (for nvfp4 recipe)
-        no_fp4_hadamard (Optional[bool], defaults to False):
-            Disable Random Hadamard Transform for NVFP4 recipe.
         no_fp4_stochastic_rounding (Optional[bool], defaults to False):
             Disable stochastic rounding for NVFP4 gradient quantization.
         skip_quant_first_layers (Optional[int], defaults to 0):
@@ -264,7 +262,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     use_fused_rope: Optional[bool] = False
     fp8_amax_history: Optional[int] = 1024
     fp4_backend: Optional[Literal['cutlass', 'cudnn']] = 'cutlass'
-    no_fp4_hadamard: Optional[bool] = False
     no_fp4_stochastic_rounding: Optional[bool] = False
     skip_quant_first_layers: Optional[int] = 0
     skip_quant_last_layers: Optional[int] = 0
@@ -357,7 +354,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.use_fused_rope = cfg.get('use_fused_rope', self.use_fused_rope)
         self.fp8_amax_history = cfg.get('fp8_amax_history', self.fp8_amax_history)
         self.fp4_backend = cfg.get('fp4_backend', self.fp4_backend)
-        self.no_fp4_hadamard = cfg.get('no_fp4_hadamard', self.no_fp4_hadamard)
         self.no_fp4_stochastic_rounding = cfg.get('no_fp4_stochastic_rounding', self.no_fp4_stochastic_rounding)
         self.skip_quant_first_layers = cfg.get('skip_quant_first_layers', self.skip_quant_first_layers)
         self.skip_quant_last_layers = cfg.get('skip_quant_last_layers', self.skip_quant_last_layers)
@@ -554,7 +550,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             use_fused_rope=self.use_fused_rope,
             fp8_amax_history=self.fp8_amax_history,
             fp4_backend=self.fp4_backend,
-            no_fp4_hadamard=self.no_fp4_hadamard,
             no_fp4_stochastic_rounding=self.no_fp4_stochastic_rounding,
             skip_quant_first_layers=self.skip_quant_first_layers,
             skip_quant_last_layers=self.skip_quant_last_layers,

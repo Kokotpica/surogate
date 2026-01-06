@@ -86,16 +86,6 @@ public:
         // Backward uses stochastic rounding for gradient quantization.
         bool enable_fp4_backward = false;
 
-        // Random Hadamard Transform (RHT) before FP4 quantization
-        // RHT spreads outliers across channels, improving quantization accuracy.
-        // Enabled by default when FP4 is used; can be disabled for debugging.
-        bool enable_fp4_hadamard = true;
-
-        // Scaled SwiGLU: use per-row scaling for FP4 numerical stability
-        // When enabled, SwiGLU output is normalized and scale is applied after down_proj.
-        // Required by nvfp4-simple recipe for training stability.
-        bool enable_scaled_swiglu = false;
-
         // Memory optimization
         bool offload_residuals = false;  ///< Offload residuals to CPU between layers
         int num_residual_buffers = 2;    ///< Number of double-buffered residual slots
@@ -463,8 +453,6 @@ public:
         return mConfig.enable_fp4_forward || mConfig.enable_fp4_backward;
     }
     [[nodiscard]] bool has_fp4_backward() const override { return mConfig.enable_fp4_backward; }
-    [[nodiscard]] bool has_fp4_hadamard() const override { return mConfig.enable_fp4_hadamard; }
-    [[nodiscard]] bool has_scaled_swiglu() const override { return mConfig.enable_scaled_swiglu; }
     FP4ForwardQuantActivations& fp4_forward_quants() { return mFP4ForwardQuants; }
 
     /// @brief Provide FP4 forward buffers to recipes (data, scales, global amax).
@@ -490,7 +478,7 @@ public:
     }
 
     [[nodiscard]] Tensor* get_hadamard_workspace() override {
-        if (!has_fp4_hadamard()) return nullptr;
+        if (!has_fp4_forward()) return nullptr;
         if (!mFP4ForwardQuants.hadamard_workspace.Data) return nullptr;
         return &mFP4ForwardQuants.hadamard_workspace;
     }
@@ -1181,12 +1169,6 @@ void ModularRunState<Block>::allocate_simplified_activations() {
                 dtype, "swiglu", kind, {B, T, D});
         }
 
-        // Allocate swiglu_scale for scaled SwiGLU (nvfp4-simple recipe)
-        if (mConfig.enable_scaled_swiglu) {
-            acts.swiglu_scale = mAllocator->allocate(
-                ETensorDType::FP32, "swiglu_scale", kind, {B * T});
-        }
-
         // mlp_down is NOT needed for LoRA backward - we can share across layers
         if (lora_only) {
             if (!mSharedMlpDown.Data) {
@@ -1387,12 +1369,10 @@ void ModularRunState<Block>::allocate_simplified_quant_buffers() {
         }
 
         // Hadamard transform workspace: largest dimension among C, AttC, D
-        // Only allocated when RHT is enabled
-        if (mConfig.enable_fp4_hadamard) {
-            const long max_dim = std::max({C, AttC, D});
-            mFP4ForwardQuants.hadamard_workspace = mAllocator->allocate(
-                mConfig.activation_dtype, "fp4_hadamard_ws", EAllocationType::ON_DEVICE, {M, max_dim});
-        }
+        // RHT is always enabled for FP4 training
+        const long max_dim = std::max({C, AttC, D});
+        mFP4ForwardQuants.hadamard_workspace = mAllocator->allocate(
+            mConfig.activation_dtype, "fp4_hadamard_ws", EAllocationType::ON_DEVICE, {M, max_dim});
     }
 
     // Leave tensors empty (Data == nullptr) when no quants are needed.

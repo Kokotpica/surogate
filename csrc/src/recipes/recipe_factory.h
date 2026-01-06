@@ -26,7 +26,6 @@ struct RecipeConfig {
     int fp8_margin = 0;
 
     // FP4 options (for nvfp4)
-    bool fp4_disable_rht = false;
     bool fp4_disable_stochastic_rounding = false;
     bool fp4_disable_2d_quantization = false;
     int skip_quant_first_layers = 0;  ///< Skip quantization for first N layers (embedding layers)

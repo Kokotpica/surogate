@@ -124,9 +124,6 @@ public:
     /// @brief Whether this recipe requires Hadamard workspace
     [[nodiscard]] virtual bool requires_hadamard_workspace() const { return false; }
 
-    /// @brief Whether this recipe requires scaled SwiGLU activation
-    [[nodiscard]] virtual bool requires_scaled_swiglu() const { return false; }
-
     /// @brief Whether this recipe skips quantization for embedding and lm_head layers
     [[nodiscard]] virtual bool skip_embedding_lmhead_quant() const { return false; }
 

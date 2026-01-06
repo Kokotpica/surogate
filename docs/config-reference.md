@@ -97,7 +97,6 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 | Option                       | Type   | Default     | Description                                                                  |
 | ---------------------------- | ------ | ----------- | ---------------------------------------------------------------------------- |
 | `fp4_backend`                | string | `"cutlass"` | FP4 matmul backend: `"cutlass"` (default) or `"cudnn"` (for `nvfp4` recipe). |
-| `no_fp4_hadamard`            | bool   | `false`     | Disable Random Hadamard Transform for NVFP4 recipe.                          |
 | `no_fp4_stochastic_rounding` | bool   | `false`     | Disable stochastic rounding for NVFP4 gradient quantization.                 |
 
 ### Layer Quantization Skip Options
@@ -127,8 +126,7 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 
 | Option                        | Type | Default | Description                                                                                                                                              |
 | ----------------------------- | ---- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `per_device_train_batch_size` | int  | `2`     | Batch size per device during training.                                                                                                                   |
-| `per_device_eval_batch_size`  | int  | `2`     | Batch size per device during evaluation.                                                                                                                 |
+| `per_device_train_batch_size` | int  | `2`     | Batch size per device during training/evaluation.                                                                                                                   |
 | `gradient_accumulation_steps` | int  | `4`     | Number of update steps to accumulate gradients before performing backward/update pass. Effective batch size = batch_size × grad_accumulation × num_gpus. |
 | `max_steps`                   | int  | `-1`    | Total number of training steps. `-1` derives from epochs and dataset size.                                                                               |
 | `eval_steps`                  | int  | `100`   | Run evaluation every N optimizer steps.                                                                                                                  |

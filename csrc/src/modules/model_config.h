@@ -265,16 +265,6 @@ struct ModelOptions {
     int skip_quant_first_layers = 0;
     int skip_quant_last_layers = 0;
 
-    // Random Hadamard Transform (RHT) before FP4 quantization
-    // RHT spreads outliers across channels, improving quantization accuracy.
-    // Enabled by default when FP4 is used; can be disabled for debugging.
-    bool enable_fp4_hadamard = true;
-
-    // Scaled SwiGLU: use per-row scaling for FP4 numerical stability
-    // When enabled, SwiGLU output is normalized and scale is applied after down_proj.
-    // Required by nvfp4-simple recipe for training stability.
-    bool enable_scaled_swiglu = false;
-
     // Fused RoPE: compute cos/sin on-the-fly with shared memory caching (TransformerEngine-style).
     // Eliminates precomputed freq_cis tensor, reduces memory bandwidth.
     bool use_fused_rope = false;
@@ -389,8 +379,6 @@ struct ModelOptions {
         options.enable_fp8_forward = opts.fp8_forward_enabled();
         options.enable_fp4_forward = opts.fp4_forward_enabled();
         options.enable_fp4_backward = opts.fp4_backward_enabled();
-        // For hadamard, check the recipe config if it's an NVFP4 recipe
-        options.enable_fp4_hadamard = opts.fp4_enabled();  // Will be refined by recipe
         // Skip layers are now managed via CLI options
         options.skip_quant_first_layers = opts.RecipeOptions.skip_quant_first_layers;
         options.skip_quant_last_layers = opts.RecipeOptions.skip_quant_last_layers;
@@ -399,7 +387,6 @@ struct ModelOptions {
             options.skip_quant_first_layers = std::max(options.skip_quant_first_layers, 1);
             options.skip_quant_last_layers = std::max(options.skip_quant_last_layers, 1);
         }
-        options.enable_scaled_swiglu = opts.scaled_swiglu_enabled();
         options.use_fused_rope = opts.UseFusedRope;
         options.matmul_backend = opts.MatmulBackend;
         options.model_dtype = opts.ModelType;

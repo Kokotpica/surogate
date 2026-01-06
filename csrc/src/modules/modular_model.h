@@ -27,7 +27,6 @@
 #include "recipes/recipe.h"
 #include "recipes/bf16/bf16_recipe.h"
 #include "recipes/nvfp4/nvfp4_recipe.h"
-#include "recipes/nvfp4/kernels/scaled_swiglu.h"
 
 #include "primitives/attention.h"
 #include "primitives/embedding.h"
@@ -1010,21 +1009,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     } else if (rs.has_activation_quants()) {
                         swiglu_abs_max_ptr = q.swiglu.abs_max();
                     }
-                    if (mRecipe && mRecipe->requires_scaled_swiglu()) {
-                        // Recipe-driven scaled SwiGLU forward
-                        modules::SwiGLUContext ctx;
-                        ctx.out = &acts.swiglu;
-                        ctx.scale_out = &acts.swiglu_scale;
-                        ctx.inp = &acts.mlp_up;
-                        ctx.abs_max_out = swiglu_abs_max_ptr;
-                        ctx.B = (int)B;
-                        ctx.T = (int)T;
-                        ctx.D = (int)D;
-                        ctx.stream = main_stream;
-                        mRecipe->swiglu_forward(ctx);
-                    } else {
-                        swiglu_forward(acts.swiglu, acts.mlp_up, swiglu_abs_max_ptr, B, T, D, main_stream);
-                    }
+                    swiglu_forward(acts.swiglu, acts.mlp_up, swiglu_abs_max_ptr, B, T, D, main_stream);
 
                     // 9) MLP down projection (recompute path) - recipe handles all format decisions
                     {
@@ -1090,21 +1075,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     } else if (rs.has_activation_quants()) {
                         swiglu_abs_max_ptr2 = q.swiglu.abs_max();
                     }
-                    if (mRecipe && mRecipe->requires_scaled_swiglu()) {
-                        // Recipe-driven scaled SwiGLU forward
-                        modules::SwiGLUContext ctx;
-                        ctx.out = &acts.swiglu;
-                        ctx.scale_out = &acts.swiglu_scale;
-                        ctx.inp = &acts.mlp_up;
-                        ctx.abs_max_out = swiglu_abs_max_ptr2;
-                        ctx.B = (int)B;
-                        ctx.T = (int)T;
-                        ctx.D = (int)D;
-                        ctx.stream = main_stream;
-                        mRecipe->swiglu_forward(ctx);
-                    } else {
-                        swiglu_forward(acts.swiglu, acts.mlp_up, swiglu_abs_max_ptr2, B, T, D, main_stream);
-                    }
+                    swiglu_forward(acts.swiglu, acts.mlp_up, swiglu_abs_max_ptr2, B, T, D, main_stream);
 
                     // 9) MLP down projection (non-recompute path) - recipe handles all format decisions
                     {
@@ -1130,14 +1101,6 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                             inp_quant, cached_weight, qidx, main_stream,
                             fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
                     }
-                }
-
-                // Apply saved scale from scaled SwiGLU to down_proj output (nvfp4-simple)
-                if (rs.has_scaled_swiglu()) {
-                    recipes::nvfp4::scale_rows(
-                        acts.mlp_down.template get<nv_bfloat16>(),
-                        acts.swiglu_scale.template get<float>(),
-                        B, T, C, main_stream);
                 }
 
                 if (hook) {
@@ -2027,21 +1990,7 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
             } else if (rs.has_activation_quants()) {
                 swiglu_abs_max_ptr = q.swiglu.abs_max();
             }
-            if (mRecipe && mRecipe->requires_scaled_swiglu()) {
-                // Recipe-driven scaled SwiGLU recompute
-                modules::SwiGLUContext ctx;
-                ctx.out = &a.swiglu;
-                ctx.scale_out = &a.swiglu_scale;
-                ctx.inp = &a.mlp_up;
-                ctx.abs_max_out = swiglu_abs_max_ptr;
-                ctx.B = B;
-                ctx.T = T;
-                ctx.D = D;
-                ctx.stream = stream;
-                mRecipe->swiglu_forward(ctx);
-            } else {
-                swiglu_forward(a.swiglu, a.mlp_up, swiglu_abs_max_ptr, B, T, D, stream);
-            }
+            swiglu_forward(a.swiglu, a.mlp_up, swiglu_abs_max_ptr, B, T, D, stream);
         }
     }
 }
@@ -2174,24 +2123,9 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 
         // SwiGLU backward: d_mlp_up from d_swiglu and saved pre-activation (mlp_up)
         with_ctx("swiglu", [&]() {
-            if (mRecipe && mRecipe->requires_scaled_swiglu()) {
-                // Recipe-driven scaled SwiGLU backward
-                modules::SwiGLUContext ctx;
-                ctx.dinp = &da.d_mlp_up;
-                ctx.dout = &da.d_swiglu;
-                ctx.inp = &a.mlp_up;
-                ctx.scale = &a.swiglu_scale;
-                ctx.abs_max_out = rs.has_grad_quants() ? qg.d_mlp_up.abs_max() : nullptr;
-                ctx.B = B;
-                ctx.T = T;
-                ctx.D = D;
-                ctx.stream = stream;
-                mRecipe->swiglu_backward(ctx);
-            } else {
-                swiglu_backward(da.d_mlp_up, da.d_swiglu, a.mlp_up,
-                                rs.has_grad_quants() ? qg.d_mlp_up.abs_max() : nullptr,
-                                B, T, D, stream);
-            }
+            swiglu_backward(da.d_mlp_up, da.d_swiglu, a.mlp_up,
+                            rs.has_grad_quants() ? qg.d_mlp_up.abs_max() : nullptr,
+                            B, T, D, stream);
         });
 
         if (stack_large_bwd_temps) {
@@ -2838,8 +2772,6 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     rs_config.forward_matmul_dtype = options.get_forward_matmul_dtype();
     rs_config.enable_fp4_forward = options.enable_fp4_forward;
     rs_config.enable_fp4_backward = options.enable_fp4_backward;
-    rs_config.enable_fp4_hadamard = options.enable_fp4_hadamard;
-    rs_config.enable_scaled_swiglu = options.enable_scaled_swiglu;
     rs_config.offload_residuals = options.offload_residuals;
     rs_config.recompute_rmsnorm = options.recompute_rmsnorm;
     rs_config.recompute_qkv = options.recompute_qkv;

@@ -13,7 +13,6 @@
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 #include "training/model.h"
-#include "recipes/nvfp4/kernels/scaled_swiglu.h"
 
 namespace recipes {
 
@@ -66,7 +65,6 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
 
     // NOTE: TransformerEngine's NVFP4 recipe currently applies RHT only for "column-wise usage"
     // (primarily to support wgrad GEMM). For forward fprop GEMMs, keep inputs/weights untransformed.
-    // So we ignore mConfig.disable_rht for now.
     const Tensor* quant_input = ctx.inp;
     const Tensor* quant_weight = ctx.weight;
 
@@ -387,23 +385,16 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
         transpose(dout_tp, *ctx.dout, BT, OC, ctx.stream);
         transpose(inp_tp, *ctx.inp, BT, C, ctx.stream);
 
-        Tensor dout_tp_r{};
-        Tensor inp_tp_r{};
-        const Tensor* q_dout_tp = &dout_tp;
-        const Tensor* q_inp_tp = &inp_tp;
-
-        // Apply RHT if enabled (for wgrad GEMM, matching TransformerEngine's NVFP4 recipe)
-        if (rs.has_fp4_hadamard()) {
-            if ((BT % 16) != 0) {
-                throw std::runtime_error("NVFP4Recipe::backward_matmul: BT must be multiple of 16 when --fp4-hadamard is enabled");
-            }
-            dout_tp_r = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)});
-            inp_tp_r = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)});
-            hadamard_transform_forward(dout_tp_r.get<nv_bfloat16>(), dout_tp.get<nv_bfloat16>(), nullptr, OC, BT, rht_seed, ctx.stream);
-            hadamard_transform_forward(inp_tp_r.get<nv_bfloat16>(), inp_tp.get<nv_bfloat16>(), nullptr, C, BT, rht_seed, ctx.stream);
-            q_dout_tp = &dout_tp_r;
-            q_inp_tp = &inp_tp_r;
+        // Apply RHT for wgrad GEMM (matching TransformerEngine's NVFP4 recipe)
+        if ((BT % 16) != 0) {
+            throw std::runtime_error("NVFP4Recipe::backward_matmul: BT must be multiple of 16 for RHT");
         }
+        Tensor dout_tp_r = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)});
+        Tensor inp_tp_r = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)});
+        hadamard_transform_forward(dout_tp_r.get<nv_bfloat16>(), dout_tp.get<nv_bfloat16>(), nullptr, OC, BT, rht_seed, ctx.stream);
+        hadamard_transform_forward(inp_tp_r.get<nv_bfloat16>(), inp_tp.get<nv_bfloat16>(), nullptr, C, BT, rht_seed, ctx.stream);
+        const Tensor* q_dout_tp = &dout_tp_r;
+        const Tensor* q_inp_tp = &inp_tp_r;
 
         // Quantize A (gradient) with stochastic rounding
         Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(OC), static_cast<long>(BT / 2)});
@@ -507,61 +498,11 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
         rs.temp_free(a_amax);
         rs.temp_free(a_scales);
         rs.temp_free(a_fp4);
-        if (inp_tp_r.Data) rs.temp_free(inp_tp_r);
-        if (dout_tp_r.Data) rs.temp_free(dout_tp_r);
+        rs.temp_free(inp_tp_r);
+        rs.temp_free(dout_tp_r);
         rs.temp_free(inp_tp);
         rs.temp_free(dout_tp);
     }
-}
-
-void NVFP4Recipe::swiglu_forward(modules::SwiGLUContext& ctx) const {
-    // Only use scaled SwiGLU when RHT is disabled
-    if (!mConfig.disable_rht) {
-        // Fall back to base class (standard SwiGLU)
-        Recipe::swiglu_forward(ctx);
-        return;
-    }
-
-    // Validate inputs
-    if (!ctx.out || !ctx.inp) {
-        throw std::runtime_error("NVFP4Recipe::swiglu_forward: out and inp are required");
-    }
-    if (!ctx.scale_out) {
-        throw std::runtime_error("NVFP4Recipe::swiglu_forward: scale_out is required for scaled SwiGLU");
-    }
-
-    // Use scaled SwiGLU for FP4 numerical stability
-    nvfp4::scaled_swiglu_forward(
-        ctx.out->get<nv_bfloat16>(),
-        ctx.scale_out->get<float>(),
-        ctx.inp->get<nv_bfloat16>(),
-        ctx.B, ctx.T, ctx.D,
-        ctx.stream);
-}
-
-void NVFP4Recipe::swiglu_backward(modules::SwiGLUContext& ctx) const {
-    // Only use scaled SwiGLU when RHT is disabled
-    if (!mConfig.disable_rht) {
-        // Fall back to base class (standard SwiGLU)
-        Recipe::swiglu_backward(ctx);
-        return;
-    }
-
-    // Validate inputs
-    if (!ctx.dinp || !ctx.dout || !ctx.inp) {
-        throw std::runtime_error("NVFP4Recipe::swiglu_backward: dinp, dout, and inp are required");
-    }
-    if (!ctx.scale) {
-        throw std::runtime_error("NVFP4Recipe::swiglu_backward: scale is required for scaled SwiGLU backward");
-    }
-
-    nvfp4::scaled_swiglu_backward(
-        ctx.dinp->get<nv_bfloat16>(),
-        ctx.dout->get<nv_bfloat16>(),
-        ctx.inp->get<nv_bfloat16>(),
-        ctx.scale->get<float>(),
-        ctx.B, ctx.T, ctx.D,
-        ctx.stream);
 }
 
 // ============================================================================

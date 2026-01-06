@@ -99,7 +99,6 @@ FP4 E2M1 provides extreme compression with only 8 representable values per sign:
 | Parameter                     | Default | Description                         |
 | ----------------------------- | ------- | ----------------------------------- |
 | `qlora_fp4`                   | false   | Enable FP4 QLoRA                    |
-| `disable_rht`                 | false   | Disable Random Hadamard Transform   |
 | `disable_stochastic_rounding` | false   | Disable stochastic rounding         |
 | `disable_2d_quantization`     | false   | Use 1D instead of 2D weight scaling |
 | `skip_quant_first_layers`     | 0       | Skip FP4 for first N layers         |

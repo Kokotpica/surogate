@@ -534,8 +534,6 @@ void TrainingRunner::load_training_config(int argc, const char** argv) {
     app.add_option("--fp4-backend", fp4_backend_str,
         "FP4 matmul backend: cudnn (default) or cutlass (for nvfp4 recipe)")
         ->check(CLI::IsMember({"cudnn", "cutlass"}, CLI::ignore_case));
-    app.add_flag("--no-fp4-hadamard", Options.RecipeOptions.fp4_disable_rht,
-        "Disable Random Hadamard Transform for NVFP4 recipe");
     app.add_flag("--no-fp4-stochastic-rounding", Options.RecipeOptions.fp4_disable_stochastic_rounding,
         "Disable stochastic rounding for NVFP4 gradient quantization");
     app.add_option("--skip-quant-first-layers", Options.RecipeOptions.skip_quant_first_layers,
@@ -620,9 +618,7 @@ void TrainingRunner::load_training_config(int argc, const char** argv) {
 
             // Use unified recipe interface for configuration
             bool is_cutlass = recipe.matmul_backend() == EMatmulBackend::CUTLASS;
-            bool rht_enabled = recipe.requires_hadamard_workspace();
             bool sr_enabled = recipe.quant_bwd_grad().stochastic_rounding;
-            bool scaled_swiglu = recipe.requires_scaled_swiglu();
 
             std::cerr
                 << "FP4 training enabled: using FP4 E2M1 with two-level block scaling.\n"
@@ -630,10 +626,7 @@ void TrainingRunner::load_training_config(int argc, const char** argv) {
                 << "  - Backend: " << (is_cutlass ? "CUTLASS" : "cuDNN") << "\n"
                 << "  - Forward: FP4 quantization\n"
                 << "  - Backward: FP4 with " << (sr_enabled ? "stochastic rounding" : "no stochastic rounding") << "\n"
-                << "  - RHT: " << (rht_enabled ? "enabled" : "disabled") << "\n";
-            if (scaled_swiglu) {
-                std::cerr << "  - Scaled SwiGLU: enabled\n";
-            }
+                << "  - RHT: enabled\n";
         }
     }
 

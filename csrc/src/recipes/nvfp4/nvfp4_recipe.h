@@ -58,7 +58,6 @@ public:
      * @brief Configuration for NVFP4 recipe.
      */
     struct Config {
-        bool disable_rht = false;                ///< Disable Random Hadamard Transform
         bool disable_stochastic_rounding = false; ///< Disable stochastic rounding for gradients
         bool disable_2d_quantization = false;    ///< Use 1D instead of 2D block scaling for weights
         int skip_quant_first_layers = 0;         ///< Skip quantization for first N layers (embedding)
@@ -81,7 +80,7 @@ public:
 
     [[nodiscard]] QuantParams quant_fwd_input() const override {
         return {
-            .random_hadamard_transform = !mConfig.disable_rht,
+            .random_hadamard_transform = true,
             .stochastic_rounding = false,
             .block_2d_quantization = false,
             .power_2_scale = false,
@@ -101,7 +100,7 @@ public:
 
     [[nodiscard]] QuantParams quant_bwd_grad() const override {
         return {
-            .random_hadamard_transform = !mConfig.disable_rht,
+            .random_hadamard_transform = true,
             .stochastic_rounding = !mConfig.disable_stochastic_rounding,
             .block_2d_quantization = false,
             .power_2_scale = false,
@@ -120,10 +119,7 @@ public:
     }
 
     [[nodiscard]] bool requires_block_scales() const override { return true; }
-    [[nodiscard]] bool requires_hadamard_workspace() const override { return !mConfig.disable_rht; }
-
-    /// @brief Use scaled SwiGLU when RHT is disabled for FP4 numerical stability
-    [[nodiscard]] bool requires_scaled_swiglu() const override { return mConfig.disable_rht; }
+    [[nodiscard]] bool requires_hadamard_workspace() const override { return true; }
 
     [[nodiscard]] EMatmulBackend matmul_backend() const override { return mConfig.backend; }
 
@@ -163,23 +159,6 @@ public:
      * - dweight = inp^T @ dout (FP4 quantized with RHT for wgrad)
      */
     void backward_matmul(modules::MatmulContext& ctx) const override;
-
-    // =========================================================================
-    // SwiGLU overrides for scaled variant (when RHT is disabled)
-    // =========================================================================
-
-    /**
-     * @brief Scaled SwiGLU forward for FP4 numerical stability (when RHT disabled)
-     *
-     * Normalizes gate values to [-1, 1] range and saves scale for later use.
-     * Only active when disable_rht is true.
-     */
-    void swiglu_forward(modules::SwiGLUContext& ctx) const override;
-
-    /**
-     * @brief Scaled SwiGLU backward (when RHT disabled)
-     */
-    void swiglu_backward(modules::SwiGLUContext& ctx) const override;
 
 private:
     Config mConfig;

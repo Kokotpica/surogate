@@ -273,7 +273,6 @@ target_sources(surogate-common PRIVATE
     src/recipes/nvfp4/kernels/matmul_cutlass_fp4_sm100.cu
     src/recipes/nvfp4/kernels/matmul_cutlass_fp4_sm103.cu
     src/recipes/nvfp4/kernels/matmul_cutlass_fp4_sm120.cu
-    src/recipes/nvfp4/kernels/scaled_swiglu.cu
 )
 
 target_link_libraries(surogate-common PRIVATE ${CUFILE_LIBS} cudnn_frontend ${CUDNN_LIBRARY} nvidia::nccl fmt::fmt-header-only)
