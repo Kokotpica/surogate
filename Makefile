@@ -31,10 +31,12 @@ unit-tests: configure
 wheel:
 	uv build --wheel
 
-wheel-dev: configure
+wheel-dev: build
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target _surogate
 	cp -f $(BUILD_DIR)/_surogate*.so surogate/
+	cp -f $(BUILD_DIR)/_surogate*.so .venv/lib/python3.12/site-packages/surogate/
 	cp -f $(BUILD_DIR)/libsurogate-common.so surogate/
+	cp -f $(BUILD_DIR)/libsurogate-common.so .venv/lib/python3.12/site-packages/surogate/
 
 # Run tests via CTest
 test: unit-tests

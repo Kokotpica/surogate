@@ -39,18 +39,18 @@ static std::optional<ETensorDType> opt_dtype_from_str(const std::string& dtype_s
 static EMatmulBackend matmul_backend_from_str(const std::string& backend_str) {
     if (backend_str.empty() || backend_str == "auto") {
         return EMatmulBackend::AUTO;
-    } else if (backend_str == "cublaslt" || backend_str == "cublas") {
+    } else if (backend_str == "cudnn") {
         return EMatmulBackend::CUBLASLT;
     } else if (backend_str == "cutlass") {
         return EMatmulBackend::CUTLASS;
     }
-    throw std::runtime_error("Unknown matmul backend: " + backend_str + " (valid: auto, cublaslt, cutlass)");
+    throw std::runtime_error("Unknown matmul backend: " + backend_str + " (valid: auto, cudnn, cutlass)");
 }
 
 static std::string matmul_backend_to_str(EMatmulBackend backend) {
     switch (backend) {
         case EMatmulBackend::AUTO: return "auto";
-        case EMatmulBackend::CUBLASLT: return "cublaslt";
+        case EMatmulBackend::CUBLASLT: return "cudnn";
         case EMatmulBackend::CUTLASS: return "cutlass";
     }
     return "auto";
