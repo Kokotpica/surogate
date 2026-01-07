@@ -105,6 +105,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Use memcpy for send/receive operations (threads backend only).
         init_projections_to_zero (Optional[bool], defaults to False):
             Initialize projection weights (FFN down and attention out) to zero. Only used when training from scratch.
+        from_scratch (Optional[bool], defaults to False):
+            Whether to train the model from scratch (random initialization) rather than fine-tuning a pre-trained model.
         lmhead_chunks (Optional[int], defaults to 1):
             Split LM-head computation into N chunks, so that the required size of the logit tensor is reduced by a factor of N.
         attn_bwd_chunks (Optional[int], defaults to 1):
@@ -263,6 +265,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     memcpy_all_gather: Optional[bool] = False
     memcpy_send_recv: Optional[bool] = False
     init_projections_to_zero: Optional[bool] = False
+    from_scratch: Optional[bool] = False
     lmhead_chunks: Optional[int] = 1
     attn_bwd_chunks: Optional[int] = 1
     gradient_dtype: Optional[str] = None
@@ -361,6 +364,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.memcpy_all_gather = cfg.get('memcpy_all_gather', self.memcpy_all_gather)
         self.memcpy_send_recv = cfg.get('memcpy_send_recv', self.memcpy_send_recv)
         self.init_projections_to_zero = cfg.get('init_projections_to_zero', self.init_projections_to_zero)
+        self.from_scratch = cfg.get('from_scratch', self.from_scratch)
         self.lmhead_chunks = cfg.get('lmhead_chunks', self.lmhead_chunks)
         self.attn_bwd_chunks = cfg.get('attn_bwd_chunks', self.attn_bwd_chunks)
         self.gradient_dtype = cfg.get('gradient_dtype', self.gradient_dtype)
