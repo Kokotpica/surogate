@@ -133,7 +133,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
         learning_rate (Optional[float], defaults to 1e-4):
             The initial learning rate for [`AdamW`] optimizer.
-        lr_scheduler_type (Optional[Literal['linear', 'cosine']]*, defaults to `"linear"`):
+        lr_scheduler_type (Optional[Literal['linear', 'cosine', 'wsd']]*, defaults to `"linear"`):
            Learning rate schedule function: Cosine or Linear
         cooldown_steps (Optional[int], defaults to 0):
             Number of steps used for a linear cooldown from `learning_rate` to `final_lr_fraction * learning_rate`.
