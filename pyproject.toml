@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "transformers>=4.57.3",
     "huggingface-hub>=0.34.0,<1.0",
+    "hf-transfer==0.1.9",
     "datasets==4.3.0",
     "addict",
     "peft",

@@ -128,11 +128,11 @@ source .venv/bin/activate
 ```
 
 Configurations used:
-- Surogate BF16: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" bf16
-- Surogate FP8: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" fp8
-- Surogate QFP8: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" qfp8
-- Surogate FP4: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" fp4
-- Surogate QFP4: ./benchmarks/benchmark.sh "Qwen/Qwen3-0.6B" qfp4
+- Surogate BF16: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" bf16
+- Surogate FP8: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" fp8
+- Surogate QFP8: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" qfp8
+- Surogate FP4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" fp4
+- Surogate QFP4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" qfp4
 
 
 # Unsloth install
