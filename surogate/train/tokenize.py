@@ -246,6 +246,51 @@ def _to_input_mask(assistant_token_mask: np.ndarray) -> np.ndarray:
     out[-1] = 0
     return out
 
+
+def _pack_buffer_to_sequence(
+    token_list: list[np.ndarray],
+    mask_list: list[np.ndarray],
+    buffer_len: int,
+    seq_len: int,
+    pad_token_id: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Pack buffered tokens and masks into a fixed-size sequence with position IDs.
+
+    Args:
+        token_list: List of token arrays to concatenate
+        mask_list: List of mask arrays to concatenate
+        buffer_len: Total length of buffered tokens
+        seq_len: Target sequence length
+        pad_token_id: Token ID to use for padding
+
+    Returns:
+        Tuple of (tokens, position_ids, mask) arrays, each of length seq_len
+    """
+    if buffer_len == 0:
+        raise ValueError("Cannot pack empty buffer")
+
+    tokens = np.concatenate(token_list).astype(np.int32)
+    mask = np.concatenate(mask_list).astype(np.int32)
+
+    # IMPORTANT: For packed sequences, position_ids must be monotonic within the packed chunk
+    # (0..len-1, then 0 for padding). Resetting position IDs per original example (as in the
+    # unpadded docs) changes RoPE phases and hurts training.
+    if tokens.size > seq_len:
+        tokens = tokens[:seq_len]
+        mask = mask[:seq_len]
+        pos_ids = np.arange(seq_len, dtype=np.int32)
+    else:
+        pos_ids = np.arange(tokens.size, dtype=np.int32)
+        if tokens.size < seq_len:
+            pad_len = seq_len - tokens.size
+            tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_token_id)
+            mask = np.pad(mask, (0, pad_len), mode="constant", constant_values=0)
+            pos_ids = np.pad(pos_ids, (0, pad_len), mode="constant", constant_values=0)
+
+    return tokens, pos_ids, mask
+
+
 def pack_and_write(
     writer: TokenizedDataFileWriter,
     docs: Iterable[dict],
@@ -263,32 +308,19 @@ def pack_and_write(
         nonlocal cur_tokens, cur_masks, cur_len
         if cur_len == 0:
             return
-        tokens = np.concatenate(cur_tokens).astype(np.int32)
-        mask = np.concatenate(cur_masks).astype(np.int32)
 
-        # IMPORTANT: For packed sequences, position_ids must be monotonic within the packed chunk
-        # (0..len-1, then 0 for padding). Resetting position IDs per original example (as in the
-        # unpadded docs) changes RoPE phases and hurts training.
-        if tokens.size > seq_len:
-            tokens = tokens[:seq_len]
-            mask = mask[:seq_len]
-            pos_ids = np.arange(seq_len, dtype=np.int32)
-        else:
-            pos_ids = np.arange(tokens.size, dtype=np.int32)
-            if tokens.size < seq_len:
-                pad_len = seq_len - tokens.size
-                tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_token_id)
-                mask = np.pad(mask, (0, pad_len), mode="constant", constant_values=0)
-                pos_ids = np.pad(pos_ids, (0, pad_len), mode="constant", constant_values=0)
-
+        tokens, pos_ids, mask = _pack_buffer_to_sequence(
+            cur_tokens, cur_masks, cur_len, seq_len, pad_token_id
+        )
         writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
         cur_tokens = []
         cur_masks = []
         cur_len = 0
 
     for doc in docs:
-        tokens = np.asarray(doc["tokens"], dtype=np.int32)
-        mask = np.asarray(doc["mask"], dtype=np.int32)
+        # tokens and mask are already numpy arrays from iter_docs()
+        tokens = doc["tokens"]
+        mask = doc["mask"]
 
         if tokens.ndim != 1 or mask.ndim != 1 or tokens.size != mask.size:
             raise ValueError("doc tokens/mask must be 1D and same length")
@@ -321,8 +353,9 @@ def write_padded(
     Used for validation datasets where per-example metrics matter.
     """
     for doc in docs:
-        tokens = np.asarray(doc["tokens"], dtype=np.int32)
-        mask = np.asarray(doc["mask"], dtype=np.int32)
+        # tokens and mask are already numpy arrays from iter_docs()
+        tokens = doc["tokens"]
+        mask = doc["mask"]
 
         if tokens.ndim != 1 or mask.ndim != 1 or tokens.size != mask.size:
             raise ValueError("doc tokens/mask must be 1D and same length")
@@ -503,10 +536,11 @@ class TokenizeDatasets(SurogateCommand):
             train_dataset = concat_datasets(train_datasets)
             train_dataset = shuffle_dataset(
                 train_dataset, seed=get_seed(train_seed), buffer_size=1000)
-
-            val_dataset = concat_datasets(val_datasets)
-            val_dataset = shuffle_dataset(
-                val_dataset, seed=get_seed(eval_seed), buffer_size=1000)
+            
+            if len(val_datasets) > 0:
+                val_dataset = concat_datasets(val_datasets)
+                val_dataset = shuffle_dataset(
+                    val_dataset, seed=get_seed(eval_seed), buffer_size=1000)
 
             train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset)
 
@@ -520,29 +554,19 @@ class TokenizeDatasets(SurogateCommand):
 
         logger.debug(f"Tokenization cache check: current_hash={current_hash}, stored_hash={stored_hash}, files_exist={files_exist}")
 
-        # If debug flag is set, always load and process datasets
         if self.args.get('debug', False):
-            train_dataset, val_dataset = self._load_and_encode_datasets()
+            self.config.validation_datasets = []
+            for ds_config in self.config.datasets:
+                ds_config.samples = 10
+
+            # If debug flag is set, always load and process datasets            
+            train_dataset, _ = self._load_and_encode_datasets()
             logger.info("Debug: printing labels for first 5 train dataset rows")
             for i, row in enumerate(train_dataset):
                 if i >= 5:
                     break
                 debug_labels(row, self.config.tokenizer)
-
-            # If tokenization can be skipped (and debug was the only reason to run), return now
-            if stored_hash == current_hash and files_exist:
-                logger.info(f"Tokenization hash unchanged ({current_hash}), skipping tokenization write.")
-                return
-
-            # Otherwise, continue to write the tokenized files
-            logger.info(f"Writing tokenized files (hash={current_hash})...")
-            self._write_bin_tok(train_dataset, os.path.join(self.config.output_dir, 'train.bin'), packing=True)
-            if val_dataset is not None:
-                self._write_bin_tok(val_dataset, os.path.join(self.config.output_dir, 'eval.bin'), packing=False)
-
-            # Write the hash after successful tokenization
-            write_tokenize_hash(self.config.output_dir, current_hash)
-            logger.info(f"Tokenization complete. Hash saved: {current_hash}")
+            
             return
 
         # No debug flag: check if we can skip entirely
@@ -577,7 +601,7 @@ class TokenizeDatasets(SurogateCommand):
 
         datasets = [train_dataset, val_dataset]
         origin_template_model = template_processor.model
-        template_processor.model = None  # Avoid serializing the model.
+        template_processor.model = None  # Avoid serializing the model with IPC when mapping the dataset.
         
         for i, dataset in enumerate(datasets):
             if dataset is None:
@@ -612,7 +636,7 @@ class TokenizeDatasets(SurogateCommand):
             max_tokens_per_file: Maximum tokens per output file. If None or the total
                                 tokens fit in one file, writes a single file.
                                 Default is 100M tokens per file for training data.
-            num_workers: Number of parallel workers for tokenization. If None, uses
+            num_workers: Number of parallel workers for data preparation. If None, uses
                         half of available CPUs (capped at 8).
         """
         vocab_size = self.config.tokenizer.vocab_size
@@ -627,16 +651,20 @@ class TokenizeDatasets(SurogateCommand):
             num_workers = max(1, min(mp.cpu_count() // 2, 8))
 
         def iter_docs():
-            for row in dataset:
-                input_ids = np.asarray(row['input_ids'], dtype=np.int32)
-                labels = np.asarray(row['labels'], dtype=np.int32)
-                # Create mask: 1 where we want to compute loss (labels != -100), 0 otherwise
-                # Shift by 1 position for input-aligned mask (as in _to_input_mask)
-                assistant_mask = (labels != -100).astype(np.int32)
-                mask = _to_input_mask(assistant_mask)
-                yield {'tokens': input_ids, 'mask': mask}
+            for batch in dataset.iter(batch_size=1000):
+                # Process batch items
+                batch_input_ids = batch['input_ids']
+                batch_labels = batch['labels']
 
-        # Determine output path structure
+                for i in range(len(batch_input_ids)):
+                    input_ids = np.asarray(batch_input_ids[i], dtype=np.int32)
+                    labels = np.asarray(batch_labels[i], dtype=np.int32)
+                    # Create mask: 1 where we want to compute loss (labels != -100), 0 otherwise
+                    # Shift by 1 position for input-aligned mask (as in _to_input_mask)
+                    assistant_mask = (labels != -100).astype(np.int32)
+                    mask = _to_input_mask(assistant_mask)
+                    yield {'tokens': input_ids, 'mask': mask}
+
         out_dir = os.path.dirname(out_path)
         base_name = os.path.basename(out_path)
         name_without_ext = base_name.rsplit('.', 1)[0] if '.' in base_name else base_name
@@ -644,7 +672,6 @@ class TokenizeDatasets(SurogateCommand):
         # non_overlapping=True for validation (padded, non-packed) so dataloader uses correct chunk count
         non_overlapping = not packing
 
-        # Use multi-file writer for training data with packing
         if packing and max_tokens_per_file:
             self._write_multi_file(
                 iter_docs(),
@@ -707,21 +734,9 @@ class TokenizeDatasets(SurogateCommand):
             if current_len == 0:
                 return
 
-            tokens = np.concatenate(current_tokens).astype(np.int32)
-            mask = np.concatenate(current_masks).astype(np.int32)
-
-            if tokens.size > seq_len:
-                tokens = tokens[:seq_len]
-                mask = mask[:seq_len]
-                pos_ids = np.arange(seq_len, dtype=np.int32)
-            else:
-                pos_ids = np.arange(tokens.size, dtype=np.int32)
-                if tokens.size < seq_len:
-                    pad_len = seq_len - tokens.size
-                    tokens = np.pad(tokens, (0, pad_len), mode="constant", constant_values=pad_token_id)
-                    mask = np.pad(mask, (0, pad_len), mode="constant", constant_values=0)
-                    pos_ids = np.pad(pos_ids, (0, pad_len), mode="constant", constant_values=0)
-
+            tokens, pos_ids, mask = _pack_buffer_to_sequence(
+                current_tokens, current_masks, current_len, seq_len, pad_token_id
+            )
             current_writer.add_document(tokens=tokens, position_ids=pos_ids, mask=mask)
             current_tokens = []
             current_masks = []
