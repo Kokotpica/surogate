@@ -1,13 +1,13 @@
 # Surogate vs Unsloth
 
 
-## GPU: 1x NVIDIA RTX 5090 32GB (tok/sec)
-| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
-|----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
-| **Qwen3 0.6B** | 19k         | 22,9k        | 32,3k         | 38,9k        | 35,3k         | 41,9k        | 36,4k         |
-| **Qwen3 1.7B** | 11,7k       | 12,1k        | 15,2k         | 20,7k        | 19,0k         | 24,6k        | 19,5k         |
-| **Qwen3 4B**   | 5,6k        | 5,8k         | 7,2k          | 9,5k         | 8,8k          | 12,0k        | 9,1k          |
-| **Qwen3 8B**   | 3,6k        | 3,4k         | 4,2k          | 5,9k         | 5,3k          | 8,2k         | 5,5k          | 
+## GPU: 1x NVIDIA RTX 5090 32GB (tok/sec) (CUDA 13.1)
+| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 | Surogate NF4 |
+|----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|--------------|
+| **Qwen3 0.6B** | 19,1k       | 21,7k        | 32,5k         | 40.2k        | 35,3k         | 42,2k        | 36,4k         | 30,1k        |
+| **Qwen3 1.7B** | 12k         | 12,6k        | 16k           | 22,4k        | 20,0k         | 25,1k        | 20,3k         | 15,2k        |
+| **Qwen3 4B**   | 6k          | 6.1k         | 7,1k          | 10,3k        | 9,1k          | 12,5k        | 9,4k          | 6.8k         |
+| **Qwen3 8B**   | 3,4k        | 3,5k         | 4,2k          | 6,4k         | 5,7k          | 8,5k         | 5,9k          | 4k           |
  
 * Across all model sizes, Surogate beats Unsloth by a large margin for every listed precision format.
 * Surogate FP4 is the best throughput option, delivering about +107% to +128% vs Unsloth NF4 across all model sizes
@@ -17,15 +17,16 @@
   * Surogate QFP8: +61%
   * Surogate FP4: +116%
   * Surogate QFP4: +68%
+  * Surogate NF4: +68%
 
 ## GPU: 1x NVIDIA H100 SXM (tok/sec)
-| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 |
-|----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|
-| **Qwen3 0.6B** | 21k         | 24,5k        | 62k           | 58k          | 45,6k         | -            | -             |
-| **Qwen3 1.7B** | 20k         | 23k          | 37,5k         | 37,5k        | 30.6k         | -            | -             |
-| **Qwen3 4B**   | 12,6k       | 13,1k        | 17,5k         | 18.7k        | 15,5k         | -            | -             |
-| **Qwen3 8B**   | 8,6k        | 9,1k         | 11,6k         | 12,9k        | 10,2k         | -            | -             |
-| **Qwen3 14B**  | 5,2k        | 5,6k         | 6,8k          | 8k           | 6,2k          | -            | -             |
+| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 | Surogate NF4 |
+|----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|--------------|
+| **Qwen3 0.6B** | 21k         | 24,5k        | 62k           | 58k          | 45,6k         | -            | -             |              |
+| **Qwen3 1.7B** | 20k         | 23k          | 37,5k         | 37,5k        | 30.6k         | -            | -             |              |
+| **Qwen3 4B**   | 12,6k       | 13,1k        | 17,5k         | 18.7k        | 15,5k         | -            | -             |              |
+| **Qwen3 8B**   | 8,6k        | 9,1k         | 11,6k         | 12,9k        | 10,2k         | -            | -             |              |
+| **Qwen3 14B**  | 5,2k        | 5,6k         | 6,8k          | 8k           | 6,2k          | -            | -             |              |
 
 * Surogate BF16 achieves up to 3x throughput on small models (0.6B) due to better memory bandwidth utilization on datacenter GPUs.
 * FP8 matches BF16 throughput while enabling larger batch sizes through reduced memory footprint.
@@ -133,6 +134,7 @@ Configurations used:
 - Surogate QFP8: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" qfp8
 - Surogate FP4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" fp4
 - Surogate QFP4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" qfp4
+- Surogate NF4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" bnb
 
 
 # Unsloth install
