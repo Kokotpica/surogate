@@ -17,14 +17,14 @@ This section provides a comprehensive reference for all configuration options av
 
 ## Model Settings
 
-| Option         | Type   | Default     | Description                                                                                                                                                                                                                                                                                 |
-| -------------- | ------ | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`        | string | required    | Path or HuggingFace model identifier (e.g., `"Qwen/Qwen3-0.6B"`).                                                                                                                                                                                                                           |
-| `model_type`   | string | auto-detect | Type of the model group. Automatically detected from model config if not specified.                                                                                                                                                                                                         |
-| `sequence_len` | int    | model's max | Maximum sequence length for training. Defaults to model's `max_model_len`.                                                                                                                                                                                                                  |
-| `max_model_len`| int    | auto-detect | Maximum model length for rope scaling. Automatically detected from model config if not specified.                                                                                                                                                                                           |
-| `rope_scaling` | string | `null`      | Type of RoPE scaling. Pass a string like `"linear"`, `"dynamic"`, or `"yarn"` along with `max_model_len` to automatically configure rope_scaling. Alternatively, pass a JSON string like `'{"factor": 2.0, "type": "yarn"}'` to directly override the rope_scaling in the model's config. |
-| `torch_dtype`  | string | auto-detect | PyTorch data type for model weights. Options: `"bfloat16"`, `"float16"`, `"float32"`. Automatically detected from model config if not specified.                                                                                                                                            |
+| Option          | Type   | Default     | Description                                                                                                                                                                                                                                                                               |
+| --------------- | ------ | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`         | string | required    | Path or HuggingFace model identifier (e.g., `"Qwen/Qwen3-0.6B"`).                                                                                                                                                                                                                         |
+| `model_type`    | string | auto-detect | Type of the model group. Automatically detected from model config if not specified.                                                                                                                                                                                                       |
+| `sequence_len`  | int    | model's max | Maximum sequence length for training. Defaults to model's `max_model_len`.                                                                                                                                                                                                                |
+| `max_model_len` | int    | auto-detect | Maximum model length for rope scaling. Automatically detected from model config if not specified.                                                                                                                                                                                         |
+| `rope_scaling`  | string | `null`      | Type of RoPE scaling. Pass a string like `"linear"`, `"dynamic"`, or `"yarn"` along with `max_model_len` to automatically configure rope_scaling. Alternatively, pass a JSON string like `'{"factor": 2.0, "type": "yarn"}'` to directly override the rope_scaling in the model's config. |
+| `torch_dtype`   | string | auto-detect | PyTorch data type for model weights. Options: `"bfloat16"`, `"float16"`, `"float32"`. Automatically detected from model config if not specified.                                                                                                                                          |
 
 ## Recomputation Options
 
@@ -98,9 +98,9 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 
 ### FP4/NVFP4 Recipe Options
 
-| Option                       | Type   | Default     | Description                                                                  |
-| ---------------------------- | ------ | ----------- | ---------------------------------------------------------------------------- |
-| `fp4_backend`                | string | `"cutlass"` | FP4 matmul backend: `"cutlass"` (default) or `"cudnn"` (for `nvfp4` recipe). |
+| Option        | Type   | Default     | Description                                                                  |
+| ------------- | ------ | ----------- | ---------------------------------------------------------------------------- |
+| `fp4_backend` | string | `"cutlass"` | FP4 matmul backend: `"cutlass"` (default) or `"cudnn"` (for `nvfp4` recipe). |
 
 ### Layer Quantization Skip Options
 
@@ -111,40 +111,149 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 
 ## Optimizer Settings
 
-| Option              | Type   | Default    | Description                                                                                      |
-| ------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------------ |
-| `learning_rate`     | float  | `2e-4`     | The initial learning rate for AdamW optimizer.                                                   |
-| `lr_scheduler_type` | string | `"linear"` | Learning rate schedule function: `"linear"`, `"cosine"`, or `"wsd"`.                             |
-| `warmup_ratio`      | float  | `0.0`      | Ratio of total training steps used for linear warmup from 0 to `learning_rate`.                  |
-| `warmup_steps`      | int    | `0`        | Number of steps for linear warmup. Overrides `warmup_ratio` if set.                              |
-| `cooldown_steps`    | int    | `0`        | Number of steps for linear cooldown from `learning_rate` to `final_lr_fraction * learning_rate`. |
-| `final_lr_fraction` | float  | `0.0`      | Final learning rate as a fraction of the initial learning rate.                                  |
-| `weight_decay`      | float  | `0.1`      | Weight decay applied to all layers except bias and LayerNorm weights in AdamW optimizer.         |
-| `max_grad_norm`     | float  | `0.0`      | Maximum gradient norm for gradient clipping. `0.0` disables clipping.                            |
-| `adamw_beta1`       | float  | `0.9`      | The beta1 parameter for AdamW optimizer.                                                         |
-| `adamw_beta2`       | float  | `0.999`    | The beta2 parameter for AdamW optimizer.                                                         |
-| `adamw_epsilon`     | float  | `1e-8`     | The epsilon parameter for AdamW optimizer.                                                       |
+| Option              | Type   | Default        | Description                                                                                                                      |
+| ------------------- | ------ | -------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `optimizer`         | string | `"adamw_8bit"` | Optimizer type. Options: `"adamw_8bit"` (8-bit AdamW), `"normuon"` (NorMuon hybrid), `"adafactor"` (AdaFactor memory-efficient). |
+| `learning_rate`     | float  | `2e-4`         | The initial learning rate for the optimizer.                                                                                     |
+| `lr_scheduler_type` | string | `"linear"`     | Learning rate schedule function: `"linear"`, `"cosine"`, or `"wsd"`.                                                             |
+| `warmup_ratio`      | float  | `0.0`          | Ratio of total training steps used for linear warmup from 0 to `learning_rate`.                                                  |
+| `warmup_steps`      | int    | `0`            | Number of steps for linear warmup. Overrides `warmup_ratio` if set.                                                              |
+| `cooldown_steps`    | int    | `0`            | Number of steps for linear cooldown from `learning_rate` to `final_lr_fraction * learning_rate`.                                 |
+| `final_lr_fraction` | float  | `0.0`          | Final learning rate as a fraction of the initial learning rate.                                                                  |
+| `weight_decay`      | float  | `0.1`          | Weight decay applied to all layers except bias and LayerNorm weights.                                                            |
+| `max_grad_norm`     | float  | `1.0`          | Maximum gradient norm for gradient clipping. `0.0` disables clipping.                                                            |
+
+### AdamW 8-bit Optimizer Parameters
+
+Used when `optimizer: "adamw_8bit"` (default).
+
+| Option          | Type  | Default | Description                                |
+| --------------- | ----- | ------- | ------------------------------------------ |
+| `adamw_beta1`   | float | `0.9`   | The beta1 parameter for AdamW optimizer.   |
+| `adamw_beta2`   | float | `0.999` | The beta2 parameter for AdamW optimizer.   |
+| `adamw_epsilon` | float | `1e-8`  | The epsilon parameter for AdamW optimizer. |
+
+### NorMuon Optimizer Parameters
+
+Used when `optimizer: "normuon"`. NorMuon uses a hybrid approach: AdamW for embeddings/norms/lm_head, and orthogonalized momentum for 2D weight matrices.
+
+| Option                | Type  | Default | Description                                                                            |
+| --------------------- | ----- | ------- | -------------------------------------------------------------------------------------- |
+| `normuon_momentum`    | float | `0.95`  | Momentum coefficient for orthogonalized momentum updates in 2D weight matrices.        |
+| `normuon_beta2`       | float | `0.95`  | Second moment coefficient for variance tracking in NorMuon optimizer.                  |
+| `normuon_cautious_wd` | bool  | `true`  | Enable cautious weight decay that only applies decay when gradient and momentum align. |
+
+### AdaFactor Optimizer Parameters
+
+Used when `optimizer: "adafactor"`. AdaFactor uses factored second moment estimates for memory efficiency, particularly useful for small batch fine-tuning.
+
+| Option                             | Type  | Default | Description                                                                                                      |
+| ---------------------------------- | ----- | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `adafactor_decay_rate`             | float | `0.8`   | Decay rate for exponential moving average of second moments. Controls how quickly past gradients are forgotten.  |
+| `adafactor_epsilon1`               | float | `1e-30` | Small constant for numerical stability in factorized moment computation.                                         |
+| `adafactor_epsilon2`               | float | `1e-3`  | Small constant added to denominator in update rule for numerical stability.                                      |
+| `adafactor_clipping_threshold`     | float | `1.0`   | Threshold for adaptive gradient clipping. Controls maximum update magnitude.                                     |
+| `adafactor_min_dim_size_to_factor` | int   | `128`   | Minimum dimension size to use factored second moments. Smaller dimensions use unfactored (full matrix) approach. |
 
 ## Training Loop Settings
 
 | Option                        | Type | Default | Description                                                                                                                                              |
 | ----------------------------- | ---- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `per_device_train_batch_size` | int  | `2`     | Batch size per device during training/evaluation.                                                                                                                   |
+| `per_device_train_batch_size` | int  | `2`     | Batch size per device during training/evaluation.                                                                                                        |
 | `gradient_accumulation_steps` | int  | `4`     | Number of update steps to accumulate gradients before performing backward/update pass. Effective batch size = batch_size × grad_accumulation × num_gpus. |
 | `max_steps`                   | int  | `-1`    | Total number of training steps. `-1` derives from epochs and dataset size.                                                                               |
 | `eval_steps`                  | int  | `100`   | Run evaluation every N optimizer steps.                                                                                                                  |
 
 ## Dataset Settings
 
-| Option                     | Type  | Default | Description                                                                                                                                                                                                                            |
-| -------------------------- | ----- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `datasets`                 | list  | `null`  | List of datasets for training. Each dataset should specify `path`, `type`, and other dataset-specific options.                                                                                                                         |
-| `validation_datasets`      | list  | `null`  | List of datasets for validation during training. If not provided, uses `validation_split_ratio` to create validation split from training data.                                                                                        |
-| `validation_split_ratio`   | float | `0.1`   | Ratio of training data to use for validation if no `validation_datasets` are provided. Value between 0.0 and 1.0.                                                                                                                      |
-| `train_seed`               | int   | `1234`  | Random seed for the training dataloader. Controls shuffling and sampling order.                                                                                                                                                        |
-| `eval_seed`                | int   | `1234`  | Random seed for the evaluation dataloader. Controls shuffling and sampling order.                                                                                                                                                      |
-| `dataloader_num_workers`   | int   | auto    | Number of subprocesses to use for data loading. `0` means data will be loaded in the main process. Defaults to optimal value based on CPU count.                                                                                      |
-| `sample_packing`           | bool  | `true`  | Whether to enable sample packing to fit multiple data samples into a single sequence. Packing reduces the number of samples in the dataset; adjust gradient accumulation steps and learning rate accordingly for packed datasets.      |
+| Option                   | Type  | Default | Description                                                                                                                                                                                                                       |
+| ------------------------ | ----- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `datasets`               | list  | `null`  | List of datasets for training. Each dataset should specify `path`, `type`, and other dataset-specific options. See [Dataset Configuration Options](#dataset-configuration-options) below.                                         |
+| `validation_datasets`    | list  | `null`  | List of datasets for validation during training. If not provided, uses `validation_split_ratio` to create validation split from training data. Uses same format as `datasets`.                                                    |
+| `validation_split_ratio` | float | `0.1`   | Ratio of training data to use for validation if no `validation_datasets` are provided. Value between 0.0 and 1.0.                                                                                                                 |
+| `train_seed`             | int   | `1234`  | Random seed for the training dataloader. Controls shuffling and sampling order.                                                                                                                                                   |
+| `eval_seed`              | int   | `1234`  | Random seed for the evaluation dataloader. Controls shuffling and sampling order.                                                                                                                                                 |
+| `dataloader_num_workers` | int   | auto    | Number of subprocesses to use for data loading. `0` means data will be loaded in the main process. Defaults to optimal value based on CPU count.                                                                                  |
+| `sample_packing`         | bool  | `true`  | Whether to enable sample packing to fit multiple data samples into a single sequence. Packing reduces the number of samples in the dataset; adjust gradient accumulation steps and learning rate accordingly for packed datasets. |
+
+### Dataset Configuration Options
+
+Each dataset in the `datasets` or `validation_datasets` list is configured with the following options. Dataset type determines which additional fields are required.
+
+#### Base Dataset Options (All Types)
+
+| Option    | Type   | Default   | Description                                                                                                          |
+| --------- | ------ | --------- | -------------------------------------------------------------------------------------------------------------------- |
+| `path`    | string | required  | HuggingFace dataset repo, s3:// URL, gs:// URL, or path to local file or directory.                                  |
+| `type`    | string | required  | Dataset type. Options: `"text"`, `"instruction"`, `"conversation"`, `"auto"` (auto-detect format).                   |
+| `subset`  | string | `null`    | HuggingFace dataset subset/configuration name to load (e.g., `"default"` for datasets with multiple configurations). |
+| `split`   | string | `"train"` | Dataset split to load. Common values: `"train"`, `"test"`, `"validation"`.                                           |
+| `samples` | int    | `null`    | Limit the number of samples to use from this dataset. If not specified, uses all available samples.                  |
+
+#### Text Dataset Options (`type: "text"`)
+
+For pre-training or continued pre-training on raw text data.
+
+| Option       | Type   | Default  | Description                                                           |
+| ------------ | ------ | -------- | --------------------------------------------------------------------- |
+| `text_field` | string | `"text"` | Name of the column in the dataset that contains the raw text content. |
+
+**Example:**
+```yaml
+datasets:
+  - path: "HuggingFaceFW/fineweb-edu"
+    type: text
+    text_field: text
+    split: train
+    samples: 100000
+```
+
+#### Instruction Dataset Options (`type: "instruction"`)
+
+For instruction-following datasets with system/instruction/input/output format.
+
+| Option                   | Type   | Default  | Description                                                                                                       |
+| ------------------------ | ------ | -------- | ----------------------------------------------------------------------------------------------------------------- |
+| `instruction_field`      | string | required | Name of the column containing the instruction/question.                                                           |
+| `output_field`           | string | required | Name of the column containing the expected output/answer.                                                         |
+| `input_field`            | string | `null`   | Name of the column containing additional input context (optional).                                                |
+| `system_prompt_type`     | string | `null`   | How to provide system prompt. Options: `"field"` (from dataset column), `"fixed"` (same for all samples), `null`. |
+| `system_prompt_field`    | string | `null`   | Name of the column containing system prompts (required when `system_prompt_type: "field"`).                       |
+| `system_prompt`          | string | `null`   | Fixed system prompt text to use for all samples (required when `system_prompt_type: "fixed"`).                    |
+| `prompt_format`          | string | `null`   | Custom prompt format template. Use `{system}`, `{instruction}`, `{input}`, `{output}` as placeholders.            |
+| `prompt_format_no_input` | string | `null`   | Custom prompt format when no input field. Use `{system}`, `{instruction}`, `{output}` as placeholders.            |
+
+**Example:**
+```yaml
+datasets:
+  - path: "yahma/alpaca-cleaned"
+    type: instruction
+    instruction_field: instruction
+    input_field: input
+    output_field: output
+    system_prompt_type: fixed
+    system_prompt: "You are a helpful AI assistant."
+```
+
+#### Conversation Dataset Options (`type: "conversation"`)
+
+For multi-turn conversational datasets in chat format.
+
+| Option                      | Type   | Default                                       | Description                                                                      |
+| --------------------------- | ------ | --------------------------------------------- | -------------------------------------------------------------------------------- |
+| `messages_field`            | string | `"messages"`                                  | Name of the column containing the list of conversation messages.                 |
+| `system_field`              | string | `null`                                        | Name of the column containing the system prompt for the conversation (optional). |
+| `tools_field`               | string | `null`                                        | Name of the column containing tool/function definitions for function calling.    |
+| `message_property_mappings` | dict   | `{"role": "role", "content": "content", ...}` | Mapping of message property names if dataset uses non-standard field names.      |
+
+**Example:**
+```yaml
+datasets:
+  - path: "HuggingFaceH4/ultrachat_200k"
+    type: conversation
+    messages_field: messages
+    split: train_sft
+```
 
 ## Memory Optimization Settings
 
@@ -182,21 +291,21 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 
 Chat template settings control how conversations are formatted for training and inference.
 
-| Option                     | Type   | Default    | Description                                                                                                                                              |
-| -------------------------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `use_chat_template`        | bool   | `true`     | Whether to use chat template for training.                                                                                                               |
-| `template`                 | string | auto       | The chat template to use. Automatically detected from model if not specified. Available templates defined in CHAT_TEMPLATE_MAPPING.                      |
-| `system`                   | string | `null`     | Override the default system prompt in the template. Use `\n` for newlines.                                                                               |
-| `max_length`               | int    | `null`     | Maximum length for tokenized conversations. Defaults to `sequence_len` if not specified.                                                                 |
-| `truncation_strategy`      | string | `"delete"` | How to handle conversations exceeding max_length. Options: `"delete"` (skip sample), `"left"` (truncate from start), `"right"` (truncate from end), `"split"` (split into multiple samples). |
-| `padding_side`             | string | `"right"`  | Which side to pad sequences on. Options: `"left"`, `"right"`.                                                                                            |
-| `padding_free`             | bool   | `false`    | Enable padding-free training for more efficient packing.                                                                                                 |
-| `loss_scale`               | string | `"default"`| Loss scaling strategy. Options: `"default"`, or custom scaling configuration.                                                                             |
-| `sequence_parallel_size`   | int    | `1`        | Sequence parallelism size for distributed training across sequence dimension.                                                                            |
-| `response_prefix`          | string | `null`     | Prefix to add before model responses during inference. Use `\n` for newlines.                                                                            |
-| `max_pixels`               | int    | `null`     | Maximum number of pixels for vision models (multimodal only).                                                                                            |
-| `norm_bbox`                | string | `null`     | Bounding box normalization strategy for vision models. Options: `"norm1000"`, `"none"`, `null`.                                                          |
-| `agent_template`           | string | `null`     | Template for agent-style conversations (advanced usage).                                                                                                 |
+| Option                   | Type   | Default     | Description                                                                                                                                                                                  |
+| ------------------------ | ------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `use_chat_template`      | bool   | `true`      | Whether to use chat template for training.                                                                                                                                                   |
+| `template`               | string | auto        | The chat template to use. Automatically detected from model if not specified. Available templates defined in CHAT_TEMPLATE_MAPPING.                                                          |
+| `system`                 | string | `null`      | Override the default system prompt in the template. Use `\n` for newlines.                                                                                                                   |
+| `max_length`             | int    | `null`      | Maximum length for tokenized conversations. Defaults to `sequence_len` if not specified.                                                                                                     |
+| `truncation_strategy`    | string | `"delete"`  | How to handle conversations exceeding max_length. Options: `"delete"` (skip sample), `"left"` (truncate from start), `"right"` (truncate from end), `"split"` (split into multiple samples). |
+| `padding_side`           | string | `"right"`   | Which side to pad sequences on. Options: `"left"`, `"right"`.                                                                                                                                |
+| `padding_free`           | bool   | `false`     | Enable padding-free training for more efficient packing.                                                                                                                                     |
+| `loss_scale`             | string | `"default"` | Loss scaling strategy. Options: `"default"`, or custom scaling configuration.                                                                                                                |
+| `sequence_parallel_size` | int    | `1`         | Sequence parallelism size for distributed training across sequence dimension.                                                                                                                |
+| `response_prefix`        | string | `null`      | Prefix to add before model responses during inference. Use `\n` for newlines.                                                                                                                |
+| `max_pixels`             | int    | `null`      | Maximum number of pixels for vision models (multimodal only).                                                                                                                                |
+| `norm_bbox`              | string | `null`      | Bounding box normalization strategy for vision models. Options: `"norm1000"`, `"none"`, `null`.                                                                                              |
+| `agent_template`         | string | `null`      | Template for agent-style conversations (advanced usage).                                                                                                                                     |
 
 ## Logging & Reporting
 
@@ -205,6 +314,21 @@ Chat template settings control how conversations are formatted for training and 
 | `report_to`    | list   | `null`         | Report results and logs to specified platforms. Options: `"wandb"`, `"aim"`.                |
 | `log_file`     | string | auto-generated | Where to save the training log. Defaults to `{output_dir}/log-{run_name}-{timestamp}.json`. |
 | `log_gpu_util` | int    | `100`          | Interval for logging GPU utilization.                                                       |
+
+### WandB (Weights & Biases) Settings
+
+| Option          | Type   | Default      | Description                                                      |
+| --------------- | ------ | ------------ | ---------------------------------------------------------------- |
+| `wandb_project` | string | `"Surogate"` | WandB project name for logging.                                  |
+| `wandb_name`    | string | `run_name`   | WandB run name for logging. Defaults to the value of `run_name`. |
+
+### Aim Settings
+
+| Option           | Type   | Default      | Description                                                     |
+| ---------------- | ------ | ------------ | --------------------------------------------------------------- |
+| `aim_experiment` | string | `"Surogate"` | Aim experiment name for logging.                                |
+| `aim_repo`       | string | `null`       | Aim repository path for logging. Uses default if not specified. |
+| `aim_name`       | string | `run_name`   | Aim run name for logging. Defaults to the value of `run_name`.  |
 
 ## Debugging Options
 
@@ -246,8 +370,17 @@ warmup_ratio: 0.03
 
 # Dataset
 datasets:
+  # Conversation dataset (most common for fine-tuning)
   - path: "mlabonne/FineTome-100k"
-    type: auto
+    type: conversation
+    messages_field: conversations
+    split: train
+  # Or use instruction dataset format
+  # - path: "yahma/alpaca-cleaned"
+  #   type: instruction
+  #   instruction_field: instruction
+  #   input_field: input
+  #   output_field: output
 validation_split_ratio: 0.1
 train_seed: 1234
 eval_seed: 1234
