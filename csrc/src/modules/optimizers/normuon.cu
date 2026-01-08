@@ -579,7 +579,7 @@ void normuon_update_2d(
     );
 
     // Step 4: Cautious weight decay + parameter update
-    // Apply learning rate multiplier
+    // Apply learning rate multiplier based on weight shape
     float lr_mult = normuon_lr_multiplier(M, N);
     float effective_lr = lr * lr_mult;
 

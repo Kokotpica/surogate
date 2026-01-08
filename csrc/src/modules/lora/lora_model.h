@@ -27,6 +27,7 @@
 #include "lora_weights.h"
 #include "modules/forward_hooks.h"
 #include "modules/modular_model.h"
+#include "modules/optimizers/normuon.h"
 #include "modules/qlora/qlora_config.h"
 #include "modules/qlora/fp8_weight_provider.h"
 #include "modules/qlora/fp4_weight_provider.h"
@@ -899,15 +900,31 @@ public:
 
     void update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) override {
         if (!lora_enabled()) {
-            // Delegate to base model which supports NorMuon for full fine-tuning
+            // Delegate to base model which supports all optimizers for full fine-tuning
             mBaseModel->update_with_config(comm, config, step);
             return;
         }
-        if (!mLoRAAdamW8BitState) {
-            throw std::logic_error("ModularLoRAModel::update_with_config: 8-bit optimizer state not allocated");
+
+        switch (config.type) {
+            case optimizers::OptimizerType::ADAMW_8BIT:
+                if (!mLoRAAdamW8BitState) {
+                    throw std::logic_error("ModularLoRAModel::update_with_config(ADAMW_8BIT): "
+                                           "optimizer state not allocated");
+                }
+                update_adamw_8bit(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
+                                 step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
+                break;
+
+            case optimizers::OptimizerType::NORMUON:
+                if (step == 1) {
+                    fmt::print("LoRA NorMuon optimizer selected (step {})\n", step);
+                }
+                update_normuon(comm, config, step);
+                break;
+
+            default:
+                throw std::logic_error("ModularLoRAModel::update_with_config(): unsupported optimizer type");
         }
-        update_adamw_8bit(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
-                         step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
     }
 
     void update_adamw_8bit(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
@@ -969,6 +986,253 @@ public:
             throw std::runtime_error(fmt::format(
                 "ModularLoRAModel: unsupported lora_dtype {} for 8-bit AdamW optimizer",
                 dtype_to_str(lora_dtype)));
+        }
+
+        CUDA_CHECK(cudaEventRecord(rs.OptimizerDone, main_stream));
+    }
+
+    /**
+     * @brief NorMuon optimizer update for LoRA weights
+     *
+     * Implements the NorMuon algorithm with orthogonalized momentum and variance reduction.
+     * For LoRA's 2D matrices, this applies Polar Express orthogonalization and
+     * Adafactor-style variance reduction.
+     */
+    void update_normuon(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) {
+        NVTX_RANGE_FN();
+        auto& rs = mBaseModel->get_run_state();
+        cudaStream_t main_stream = rs.MainStream;
+
+        // Initialize NorMuon state if needed
+        if (!mLoRANorMuonState) {
+            mLoRANorMuonState = std::make_unique<LoRANorMuonState>();
+        }
+        auto& state = *mLoRANorMuonState;
+
+        // Calculate gradient norm - grad_scale is kept on device for CUDA graph compatibility
+        calculate_lora_gradient_norm(comm, config.grad_clip);
+
+        // Extract NorMuon hyperparameters
+        const float lr = config.normuon_lr > 0 ? config.normuon_lr : config.learning_rate;
+        const float momentum = config.normuon_momentum;
+        const float beta2 = config.normuon_beta2;
+        const float weight_decay = config.weight_decay;
+        const bool cautious_wd = config.normuon_cautious_wd;
+        const int L = (int)mBaseModel->config().NumLayers;
+
+        constexpr size_t BLOCK_SIZE = optimizers::NORMUON_BLOCK_SIZE;
+
+        // Lazy initialization of state tensors
+        if (!state.initialized) {
+            fmt::print("LoRA NorMuon: Initializing optimizer state...\n");
+
+            // Phase 1: Count parameters and find max dimensions
+            state.total_params = 0;
+            state.state_elems = 0;
+            state.max_weight_M = 0;
+            state.max_weight_N = 0;
+
+            auto add_param = [&](const Tensor& weight) {
+                if (!weight.Data) return;
+                size_t n = weight.nelem();
+                state.total_params += n;
+                state.state_elems = (state.state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+                state.state_elems += n;
+
+                // Track max dimensions for workspace allocation
+                int M = 1, N = (int)n;
+                if (weight.Rank >= 2) {
+                    M = (int)weight.Sizes[0];
+                    N = (int)(n / M);
+                }
+                state.max_weight_M = std::max(state.max_weight_M, (size_t)M);
+                state.max_weight_N = std::max(state.max_weight_N, (size_t)N);
+
+                // Store shape for variance buffer allocation
+                state.variance_shapes.push_back({M, N});
+            };
+
+            // Count in same order as update phase
+            for (int l = 0; l < L; ++l) {
+                auto& lora_w = mLoRAWeights->get_master_block(l, main_stream);
+
+                if (lora_w.attention.q.has_value()) {
+                    add_param(lora_w.attention.q->A);
+                    add_param(lora_w.attention.q->B);
+                }
+                if (lora_w.attention.k.has_value()) {
+                    add_param(lora_w.attention.k->A);
+                    add_param(lora_w.attention.k->B);
+                }
+                if (lora_w.attention.v.has_value()) {
+                    add_param(lora_w.attention.v->A);
+                    add_param(lora_w.attention.v->B);
+                }
+                if (lora_w.attention.o.has_value()) {
+                    add_param(lora_w.attention.o->A);
+                    add_param(lora_w.attention.o->B);
+                }
+                if (lora_w.mlp.gate.has_value()) {
+                    add_param(lora_w.mlp.gate->A);
+                    add_param(lora_w.mlp.gate->B);
+                }
+                if (lora_w.mlp.up.has_value()) {
+                    add_param(lora_w.mlp.up->A);
+                    add_param(lora_w.mlp.up->B);
+                }
+                if (lora_w.mlp.down.has_value()) {
+                    add_param(lora_w.mlp.down->A);
+                    add_param(lora_w.mlp.down->B);
+                }
+            }
+
+            state.num_blocks = (state.state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            // Allocate momentum quantization map
+            state.momentum_quantiles = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_quantiles", {256});
+            std::vector<float> h_quantiles(256);
+            optimizers::create_normuon_quantiles(h_quantiles.data());
+            CUDA_CHECK(cudaMemcpy(state.momentum_quantiles.Data, h_quantiles.data(),
+                                  256 * sizeof(float), cudaMemcpyHostToDevice));
+
+            // Allocate 8-bit momentum state
+            state.momentum_state = mAllocator->allocate(ETensorDType::BYTE, "lora_normuon_momentum",
+                                                         {static_cast<long>(state.state_elems)});
+            state.momentum_absmax = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_absmax",
+                                                          {static_cast<long>(state.num_blocks)});
+
+            // Initialize momentum state
+            optimizers::init_normuon_momentum_state(
+                reinterpret_cast<unsigned char*>(state.momentum_state.Data),
+                state.momentum_absmax.template get<float>(),
+                state.state_elems,
+                main_stream
+            );
+
+            // Allocate variance buffers (one per tensor)
+            for (const auto& shape : state.variance_shapes) {
+                int M = shape.first;
+                int N = shape.second;
+                size_t var_size = optimizers::normuon_variance_buffer_size(M, N);
+                Tensor var_buf = mAllocator->allocate(ETensorDType::FP32, "lora_normuon_variance",
+                                                       {static_cast<long>(var_size)});
+                // Initialize to 1.0 for stable first update
+                std::vector<float> ones(var_size, 1.0f);
+                CUDA_CHECK(cudaMemcpyAsync(var_buf.Data, ones.data(),
+                                           var_size * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+                state.variance_buffers.push_back(std::move(var_buf));
+            }
+
+            // Allocate Polar Express workspace
+            // Polar Express needs: A (M x M), B (M x M), C (M x N), X_tmp (M x N), plus scale floats
+            // where M = max(rows, cols) after potential transpose. Total ~4 * max(M,N)^2 elements.
+            // Also need space for momentum output before Polar Express (M x N elements)
+            size_t max_dim = std::max(state.max_weight_M, state.max_weight_N);
+            size_t max_weight_elems = state.max_weight_M * state.max_weight_N;
+            size_t polar_workspace_elems = 4 * max_dim * max_dim + 1;  // +1 for scale float (as BF16)
+            size_t polar_size = max_weight_elems + polar_workspace_elems;  // momentum_out + polar workspace
+            state.polar_workspace = mAllocator->allocate(ETensorDType::BF16, "lora_normuon_polar",
+                                                          {static_cast<long>(polar_size)});
+
+            // Allocate momentum temp buffer
+            size_t max_weight_size = state.max_weight_M * state.max_weight_N;
+            state.momentum_temp = mAllocator->allocate(ETensorDType::BF16, "lora_normuon_temp",
+                                                        {static_cast<long>(max_weight_size)});
+
+            // Create cuBLAS handle
+            CUBLAS_CHECK(cublasCreate(&state.cublas_handle));
+            CUBLAS_CHECK(cublasSetStream(state.cublas_handle, main_stream));
+
+            fmt::print("LoRA NorMuon: {} params, {} blocks, max weight {}x{}\n",
+                       state.total_params, state.num_blocks, state.max_weight_M, state.max_weight_N);
+            fmt::print("LoRA NorMuon state: momentum={} bytes, variance={} buffers, polar={} elems\n",
+                       state.state_elems, state.variance_buffers.size(), polar_size);
+
+            state.initialized = true;
+        }
+
+        // Phase 2: Update parameters
+        const ETensorDType lora_dtype = mLoRAConfig.dtype;
+        size_t state_offset = 0;
+        size_t var_idx = 0;
+        bool unused_acc = false;
+
+        auto update_param = [&](Tensor& param, Tensor& grad) {
+            if (!param.Data) return;
+
+            const auto& shape = state.variance_shapes[var_idx];
+            int M = shape.first;
+            int N = shape.second;
+            size_t n = param.nelem();
+
+            // Get state pointers with proper offset
+            size_t aligned_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+            unsigned char* momentum_ptr = reinterpret_cast<unsigned char*>(state.momentum_state.Data) + aligned_offset;
+            float* absmax_ptr = state.momentum_absmax.template get<float>() + (aligned_offset / BLOCK_SIZE);
+            float* variance_ptr = state.variance_buffers[var_idx].template get<float>();
+
+            if (lora_dtype == ETensorDType::BF16) {
+                // Note: normuon_update_2d applies lr_mult internally based on M, N
+                optimizers::normuon_update_2d(
+                    state.cublas_handle,
+                    param.template get<nv_bfloat16>(),
+                    grad.template get<nv_bfloat16>(),
+                    momentum_ptr,
+                    variance_ptr,
+                    state.polar_workspace.template get<nv_bfloat16>(),
+                    M, N,
+                    lr,
+                    momentum,
+                    beta2,
+                    cautious_wd ? weight_decay : 0.0f,  // NorMuon uses cautious WD internally
+                    state.momentum_quantiles.template get<float>(),
+                    absmax_ptr,
+                    main_stream
+                );
+            } else {
+                // FP32 LoRA weights - need to use FP32 overload
+                // For now, fall back to momentum update + simple SGD
+                // (Full NorMuon for FP32 requires additional kernel overloads)
+                throw std::runtime_error("LoRA NorMuon optimizer currently only supports BF16 LoRA weights");
+            }
+
+            state_offset = aligned_offset + n;
+            var_idx++;
+        };
+
+        // Update all LoRA tensors
+        for (int l = 0; l < L; ++l) {
+            auto& lora_w = mLoRAWeights->get_master_block(l, main_stream);
+            auto& lora_g = mLoRAGrads->get_block_full(l, main_stream, comm, unused_acc);
+
+            if (lora_w.attention.q.has_value()) {
+                update_param(lora_w.attention.q->A, lora_g.attention.q->A);
+                update_param(lora_w.attention.q->B, lora_g.attention.q->B);
+            }
+            if (lora_w.attention.k.has_value()) {
+                update_param(lora_w.attention.k->A, lora_g.attention.k->A);
+                update_param(lora_w.attention.k->B, lora_g.attention.k->B);
+            }
+            if (lora_w.attention.v.has_value()) {
+                update_param(lora_w.attention.v->A, lora_g.attention.v->A);
+                update_param(lora_w.attention.v->B, lora_g.attention.v->B);
+            }
+            if (lora_w.attention.o.has_value()) {
+                update_param(lora_w.attention.o->A, lora_g.attention.o->A);
+                update_param(lora_w.attention.o->B, lora_g.attention.o->B);
+            }
+            if (lora_w.mlp.gate.has_value()) {
+                update_param(lora_w.mlp.gate->A, lora_g.mlp.gate->A);
+                update_param(lora_w.mlp.gate->B, lora_g.mlp.gate->B);
+            }
+            if (lora_w.mlp.up.has_value()) {
+                update_param(lora_w.mlp.up->A, lora_g.mlp.up->A);
+                update_param(lora_w.mlp.up->B, lora_g.mlp.up->B);
+            }
+            if (lora_w.mlp.down.has_value()) {
+                update_param(lora_w.mlp.down->A, lora_g.mlp.down->A);
+                update_param(lora_w.mlp.down->B, lora_g.mlp.down->B);
+            }
         }
 
         CUDA_CHECK(cudaEventRecord(rs.OptimizerDone, main_stream));
@@ -1383,6 +1647,43 @@ private:
         Tensor state_offsets;   // int* - element offset for each tensor in state buffers
     };
 
+    // NorMuon optimizer state for LoRA weights
+    // Uses 8-bit quantized momentum + FP32 variance buffers
+    struct LoRANorMuonState {
+        bool initialized = false;
+        size_t total_params = 0;
+        size_t state_elems = 0;
+        size_t num_blocks = 0;
+
+        // 8-bit quantized momentum buffer (combined for all LoRA weights)
+        Tensor momentum_quantiles;  // float[256] - signed quantization map
+        Tensor momentum_state;      // uint8[state_elems]
+        Tensor momentum_absmax;     // float[num_blocks]
+
+        // Variance buffers - stored per LoRA tensor as FP32
+        // For LoRA, each A/B matrix is a 2D weight
+        std::vector<Tensor> variance_buffers;
+        std::vector<std::pair<int, int>> variance_shapes;  // (M, N) for each buffer
+
+        // Polar Express workspace (reused across layers)
+        Tensor polar_workspace;
+        size_t max_weight_M = 0;  // Max weight rows seen
+        size_t max_weight_N = 0;  // Max weight cols seen
+
+        // Temporary buffer for dequantized momentum (reused per weight)
+        Tensor momentum_temp;  // BF16[max_weight_size]
+
+        // cuBLAS handle for Polar Express matrix multiplications
+        cublasHandle_t cublas_handle = nullptr;
+
+        ~LoRANorMuonState() {
+            if (cublas_handle) {
+                cublasDestroy(cublas_handle);
+                cublas_handle = nullptr;
+            }
+        }
+    };
+
     std::unique_ptr<ModularTransformerModel<Block>> mBaseModel;
     ModularLoRAConfig mLoRAConfig;
     QLoRAConfig mQLoRAConfig;
@@ -1392,6 +1693,7 @@ private:
     std::unique_ptr<ModularLoRAWeightsManager> mLoRAWeights;
     std::unique_ptr<ModularLoRAGradsManager> mLoRAGrads;
     std::unique_ptr<LoRAAdamW8BitState> mLoRAAdamW8BitState;
+    std::unique_ptr<LoRANorMuonState> mLoRANorMuonState;
     std::unique_ptr<LoRARunState> mLoRARunState;
 
     // QLoRA: quantized base weight provider (FP8 with per-block scales)

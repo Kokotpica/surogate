@@ -27,7 +27,7 @@ optimizer: normuon
 gpus: 4
 lora: false
 
-dataloader_num_workers: 48
+dataloader_num_workers: 32
 datasets:
   - path: "HuggingFaceFW/fineweb-2"
     subset: ron_Latn

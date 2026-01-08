@@ -9,20 +9,17 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-num_epochs: 2
-eval_steps: 25
+num_epochs: 1
+eval_steps: 250
 save_steps: 0
 
-learning_rate: 2e-5
+learning_rate: 1e-4
 
 recipe: bf16
-optimizer: normuon
-warmup_steps: 20
-lr_scheduler_type: cosine
-max_grad_norm: 1.0
-gpus: 4
+optimizer: adamw_8bit
+warmup_steps: 50
 
-lora: false
+lora: true
 lora_rank: 16
 lora_alpha: 32
 lora_target_modules:
@@ -38,8 +35,3 @@ dataloader_num_workers: 4
 datasets:
   - path: "OpenLLM-Ro/ro_gsm8k"
     type: auto
-
-# report_to: aim
-# aim_experiment: qwen3-0.6b-fft
-# aim_repo: /home/densemax2/work/flavius/surogate/.aim
-# aim_name: fft-bf16-adamw
