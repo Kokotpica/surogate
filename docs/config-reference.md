@@ -143,18 +143,6 @@ Used when `optimizer: "normuon"`. NorMuon uses a hybrid approach: AdamW for embe
 | `normuon_beta2`       | float | `0.95`  | Second moment coefficient for variance tracking in NorMuon optimizer.                  |
 | `normuon_cautious_wd` | bool  | `true`  | Enable cautious weight decay that only applies decay when gradient and momentum align. |
 
-### AdaFactor Optimizer Parameters
-
-Used when `optimizer: "adafactor"`. AdaFactor uses factored second moment estimates for memory efficiency, particularly useful for small batch fine-tuning.
-
-| Option                             | Type  | Default | Description                                                                                                      |
-| ---------------------------------- | ----- | ------- | ---------------------------------------------------------------------------------------------------------------- |
-| `adafactor_decay_rate`             | float | `0.8`   | Decay rate for exponential moving average of second moments. Controls how quickly past gradients are forgotten.  |
-| `adafactor_epsilon1`               | float | `1e-30` | Small constant for numerical stability in factorized moment computation.                                         |
-| `adafactor_epsilon2`               | float | `1e-3`  | Small constant added to denominator in update rule for numerical stability.                                      |
-| `adafactor_clipping_threshold`     | float | `1.0`   | Threshold for adaptive gradient clipping. Controls maximum update magnitude.                                     |
-| `adafactor_min_dim_size_to_factor` | int   | `128`   | Minimum dimension size to use factored second moments. Smaller dimensions use unfactored (full matrix) approach. |
-
 ## Training Loop Settings
 
 | Option                        | Type | Default | Description                                                                                                                                              |
