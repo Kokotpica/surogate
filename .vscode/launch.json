@@ -9,7 +9,7 @@
             "type": "debugpy",
             "request": "launch",
             "module": "surogate.cli.main",
-            "args": ["tokenize", "--config", "${workspaceFolder}/examples/sft/qwen3-0.6b.yaml", "--debug"],
+            "args": ["tokenize", "--config", "${workspaceFolder}/examples/pt/qwen3.yaml"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"}
