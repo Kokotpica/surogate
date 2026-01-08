@@ -204,6 +204,8 @@ class SurogateTrainerWrapper():
                 # Note: eval uses same batch size as training (per_device_train_batch_size) since buffers are shared
                 eval_tokens = batches_processed * self.config.per_device_train_batch_size * self.config.sequence_len * self.config.gpus
                 train_logger.log_eval(step, epoch, eval_tokens, elapsed_ms, val_loss)
+                # Reload training batch after evaluation (eval leaves its last batch in the buffers)
+                self.train_loader.load_batch(in_tokens, out_tokens)
 
             # Periodic checkpointing (before training step)
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
