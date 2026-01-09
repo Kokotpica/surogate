@@ -19,11 +19,12 @@ jobs:
             cuda_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu128"
             archs: "80;86;89;90;100a;120a"
+            torch_index_url: "https://download.pytorch.org/whl/cu128"
           - cuda_version: "12.9"
             cuda_image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu129"
             archs: "80;86;89;90;100a;103a;120a"
-            
+            torch_index_url: "https://download.pytorch.org/whl/cu129"
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_C_COMPILER: gcc-13
@@ -61,13 +62,11 @@ jobs:
         with:
           key: wheel-${{ matrix.wheel_tag }}
 
-      - name: Install the latest version of uv
+      - name: Install the latest version of uv@
         uses: astral-sh/setup-uv@v7
 
-      # we cannot statically declare the cuda dependencies in pyproject.toml
-      # so we have to patch them here
       - name: Add CUDA runtime dependencies
-        run: uv run --no-project --with tomlkit python3 .github/scripts/add_cuda_deps.py "${{ matrix.runtime_deps }}" "${{ matrix.wheel_tag }}"
+        run: uv run --no-project --with tomlkit python3 .github/scripts/add_cuda_deps.py "${{ matrix.wheel_tag }}" "${{ matrix.torch_index_url }}"
 
       - name: Build wheel
         run: uv build --wheel
