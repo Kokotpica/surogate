@@ -5,6 +5,7 @@
 
 #include "comm.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -241,12 +242,39 @@ struct NCCLCommunicator::CommandVisitor {
  * Calls the transaction hooks (on_execute_transaction / on_finish_transaction), executes each buffered command,
  * and performs launch-queue throttling syncs before and after to avoid multi-rank deadlocks.
  *
+ * Launch Queue Throttling Strategy:
+ * - BEFORE transaction: Ensures all ranks are ready to begin enqueuing collective operations together.
+ *   This prevents a fast rank from enqueueing its collectives while slower ranks are still processing
+ *   previous work, which could lead to queue exhaustion before all ranks reach the collective barrier.
+ *
+ * - AFTER transaction: Ensures all ranks have completed enqueuing the collective operations before any
+ *   rank continues with subsequent work. This prevents a fast rank from filling the launch queue with
+ *   post-transaction kernels, which would block slower ranks from enqueuing future collectives.
+ *
+ * Note: In multi-process mode (MPI), _launch_queue_throttle_sync() is a no-op because each process
+ * has its own independent launch queue. This mechanism only applies to multi-threaded mode where
+ * all GPU worker threads share a single per-process CUDA launch queue.
+ *
+ * Optimization: Throttling is only applied when the transaction contains NCCL collective operations
+ * (ScatterReduce or Gather), since only these operations have implicit global barriers that can
+ * cause deadlocks. Point-to-point operations (Send/Recv) don't require throttling.
+ *
  * @param signal CUDA event that will be recorded on the comms stream to signal completion of the transaction.
  *
  * @throws std::runtime_error Propagates errors from command execution or hooks.
  */
 void NCCLCommunicator::execute_transaction(cudaEvent_t signal) {
-    _launch_queue_throttle_sync();
+    // Check if this transaction contains NCCL collective operations that require throttling
+    bool has_collectives = std::any_of(mCmdBuf->Commands.begin(), mCmdBuf->Commands.end(),
+        [](const auto& cmd) {
+            return std::holds_alternative<CommandBuffer::ScatterReduce>(cmd) ||
+                   std::holds_alternative<CommandBuffer::Gather>(cmd);
+        });
+
+    // Synchronize CPU threads before enqueuing collective operations
+    if (has_collectives) {
+        _launch_queue_throttle_sync();
+    }
 
     on_execute_transaction(*mCmdBuf);
 
@@ -257,11 +285,10 @@ void NCCLCommunicator::execute_transaction(cudaEvent_t signal) {
 
     on_finish_transaction(signal);
 
-    // make sure no GPU can enqueue new work until *all* GPUs have enqueued this transaction
-    // this prevents a faster process from filling up the launch queue, which could block
-    // a slower process when it tried to enqueue work that this transaction depends on, causing a
-    // deadlock
-    _launch_queue_throttle_sync();
+    // Synchronize CPU threads after enqueuing collective operations
+    if (has_collectives) {
+        _launch_queue_throttle_sync();
+    }
 
     mCmdBuf->Commands.clear();
 }
@@ -1092,15 +1119,30 @@ void NCCLCommunicatorThreads::barrier() {
 
 /**
  * @brief Throttle launch queue in multithreaded mode by synchronizing CPU threads.
+ *
+ * This prevents deadlocks that occur in multi-threaded (single-process) NCCL configurations
+ * but not in multi-process configurations.
+ *
+ * Root Cause:
+ * CUDA maintains a per-process launch queue for kernel submissions. In multi-threaded mode,
+ * all GPU worker threads share this single queue. NCCL collective operations contain an
+ * implicit global barrier - all ranks must reach the collective before any can proceed.
+ *
+ * Deadlock Scenario:
+ * 1. GPU 0 (fast) enqueues its collective operation
+ * 2. GPU 0 continues and fills the per-process launch queue with subsequent kernels
+ * 3. GPU 1 (slow) tries to enqueue work needed to reach the collective, but queue is full
+ * 4. GPU 0 is blocked on the collective barrier waiting for GPU 1
+ * 5. GPU 1 cannot enqueue because GPU 0 filled the queue → deadlock
+ *
+ * Solution:
+ * CPU-side thread synchronization (not GPU synchronization) ensures all threads reach the
+ * collective submission point together before any thread can continue enqueueing work.
+ * This prevents the launch queue from being exhausted by a single fast GPU.
+ *
+ * Note: Multi-process mode doesn't need this because each process has its own launch queue.
  */
 void NCCLCommunicatorThreads::_launch_queue_throttle_sync() {
-    // This is *speculation* on my part, based on the observation that I was getting deadlocks
-    // in multi-threaded, but not in multi-process configuration, and the deadlock would go away
-    // using either cudaDeviceSynchronize (so no sync between threads, only GPU to CPU)
-    // or barrier (so only syncing CPU threads, no GPU sync). My suspicion is that there is some
-    // form of a *per-process* launch queue, and if one thread runs ahead and fills it up too much,
-    // the other thread cannot schedule the kernels that the first thread is waiting for.
-    // So, for multithreaded mode, let's just ensure that CPU threads do synchronize regularly
     this->barrier();
 }
 
