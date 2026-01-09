@@ -19,23 +19,10 @@ jobs:
             cuda_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu128"
             archs: "80;86;89;90;100a;120a"
-            runtime_deps: |
-              nvidia-cudnn-cu12>=9.10,<10
-              nvidia-nccl-cu12>=2.27,<3
           - cuda_version: "12.9"
             cuda_image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu129"
             archs: "80;86;89;90;100a;103a;120a"
-            runtime_deps: |
-              nvidia-cudnn-cu12>=9.10,<10
-              nvidia-nccl-cu12>=2.27,<3
-          - cuda_version: "13.0"
-            cuda_image: "nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04"
-            wheel_tag: "cu130"
-            archs: "80;86;89;90;100a;103a;120a"
-            runtime_deps: |
-              nvidia-cudnn-cu13>=9.13,<10
-              nvidia-nccl-cu13>=2.27,<3
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_C_COMPILER: gcc-13
@@ -61,7 +48,7 @@ jobs:
 
       - name: Install remaining deps
         run: apt install -y g++-13 wget build-essential cmake ninja-build python3-dev ccache libopenmpi-dev
-
+        
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
