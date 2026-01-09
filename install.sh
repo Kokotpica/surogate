@@ -90,14 +90,14 @@ echo "Detected CUDA version: $CUDA_VERSION"
 
 # Map to supported CUDA version suffix
 if [[ "$CUDA_MAJOR" -ge 13 ]]; then
-    CUDA_SUFFIX="cu130"
+    CUDA_SUFFIX="cu129"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 9 ]]; then
     CUDA_SUFFIX="cu129"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 8 ]]; then
     CUDA_SUFFIX="cu128"
 else
-    echo "Warning: CUDA $CUDA_VERSION may not be fully compatible. Using cu128."
-    CUDA_SUFFIX="cu128"
+    echo "Warning: CUDA $CUDA_VERSION may not be fully compatible. Using cu129."
+    CUDA_SUFFIX="cu129"
 fi
 
 echo "Using CUDA suffix: $CUDA_SUFFIX"
@@ -194,9 +194,7 @@ else
 fi
 
 echo ""
-echo "To activate the virtual environment, run:"
-echo "  source $VENV_DIR/bin/activate"
-echo ""
 echo "To run your first Qwen3-0.6B fine-tune run:"
-echo "  uv run surogate sft examples/sft/qwen3-lora-bf16.yaml"
+echo "  source $VENV_DIR/bin/activate"
+echo "  surogate sft examples/sft/qwen3-lora-bf16.yaml"
 echo ""
