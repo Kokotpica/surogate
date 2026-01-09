@@ -142,7 +142,7 @@ Configurations used:
 - Surogate QFP8: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" qfp8
 - Surogate FP4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" fp4
 - Surogate QFP4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" qfp4
-- Surogate NF4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" bnb
+- Surogate NF4: ./benchmarks/benchmark_sft.sh "Qwen/Qwen3-0.6B" qbnb
 
 
 # Unsloth install
