@@ -7,8 +7,16 @@
 | **Qwen3 0.6B** | 19,1k       | 21,7k        | 32,5k         | 40.2k        | 35,3k         | 42,2k        | 36,4k         | 30,1k        |
 | **Qwen3 1.7B** | 12k         | 12,6k        | 16k           | 22,4k        | 20,0k         | 25,1k        | 20,3k         | 15,2k        |
 | **Qwen3 4B**   | 6k          | 6.1k         | 7,1k          | 10,3k        | 9,1k          | 12,5k        | 9,4k          | 6.8k         |
-| **Qwen3 8B**   | 3,4k        | 3,5k         | 4,2k          | 6,4k         | 5,7k          | 8,5k         | 5,9k          | 4k           |
+| **Qwen3 8B**   | 3,4k        | 3,5k         | 4,2k          | 6,4k         | 5,7k          | 8,5k         | 5,9k          | 4k           | 
  
+ ## GPU: 1x NVIDIA RTX 5090 32GB (tok/sec) (CUDA 12.9)
+| Model          | Unsloth NF4 | Unsloth BF16 | Surogate BF16 | Surogate FP8 | Surogate QFP8 | Surogate FP4 | Surogate QFP4 | Surogate NF4 |
+|----------------|-------------|--------------|---------------|--------------|---------------|--------------|---------------|--------------|
+| **Qwen3 0.6B** | 19,1k       | 22,1k        | 32,0k         | 38,2k        | 33,5k         | 41,5k        | 34,5k         | 29,7k        |
+| **Qwen3 1.7B** | 12k         | 12,6k        | 16k           | 22,4k        | 20,0k         | 25,1k        | 20,3k         | 15,2k        | x
+| **Qwen3 4B**   | 6k          | 6.1k         | 7,1k          | 10,3k        | 9,1k          | 12,5k        | 9,4k          | 6.8k         | x 
+| **Qwen3 8B**   | 3,4k        | 3,5k         | 4,2k          | 6,4k         | 5,7k          | 8,5k         | 5,9k          | 4k           | x 
+
 * Across all model sizes, Surogate beats Unsloth by a large margin for every listed precision format.
 * Surogate FP4 is the best throughput option, delivering about +107% to +128% vs Unsloth NF4 across all model sizes
 * Overall average speed improvement vs Unsloth NF4:

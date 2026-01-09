@@ -160,7 +160,7 @@ With gradient sharding enabled:
 - Persistent shards on host memory are accessed via CUDA's host memory mapping
 - Reduce-scatter communication overlaps backward computation via double-buffering
 - Trade-off: reduced GPU memory vs. PCIe bandwidth for optimizer access
-- On a single GPU, there's no sharding benefit - you'd just be moving the full gradients to CPU and back, which would be slower without any memory savings (since you still need full gradients on GPU during backward)
+- On a single GPU, there's no sharding benefit
 
 ## Quantized Weights: persistent_quants and offload_quants (Multi-GPU only)
 
@@ -211,8 +211,17 @@ When `offload_quants` is enabled (requires `persistent_quants`):
 - `persistent_quants` trades memory for compute (avoids repeated quantization)
 - `offload_quants` moves quantized weights to CPU, reducing GPU memory
 - In PCIe multi-GPU setups, H2D transfer may overlap with all-gather communication
-- Combined with `--memcpy-all-gather`, can lead to speedups when GPU-to-GPU communication passes through host memory anyway
+- Combined with `--memcpy-all-gather`, can lead to speedups
 
 ### QLoRA Mode
 
-**Note:** `persistent_quants` and `offload_quants` have no effect when using QLoRA (FP8 or FP4). In QLoRA mode, base weights are already stored in quantized format by the QLoRA weight provider (`FP8WeightsManager` or `FP4WeightsManager`). The persistent quants mechanism is designed for ZeRO-3 weight gathering scenarios where weights need to be re-quantized after optimizer updates - this doesn't apply to QLoRA since base weights are frozen.
+**Note:** `persistent_quants` and `offload_quants` have no effect when using QLoRA (FP8 or FP4).
+
+---
+
+## See also
+
+- [Memory](memory.md)
+- [Multi-GPU](multi-gpu.md)
+- [Config reference](../reference/config.md)
+- [Back to docs index](../index.md)

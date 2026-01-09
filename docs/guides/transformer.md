@@ -516,3 +516,11 @@ Surogate's transformer implementation is designed for maximum training efficienc
 5. **Multiple precision recipes** (BF16, FP8, FP4) for different hardware
 
 The modular design allows users to tune memory usage and performance for their specific hardware and model size requirements.
+
+---
+
+## See also
+
+- [Performance](../guides/performance.md)
+- [Precision & recipes](../guides/precision-and-recipes.md)
+- [Back to docs index](../index.md)

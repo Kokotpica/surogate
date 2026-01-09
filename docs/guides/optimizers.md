@@ -1,4 +1,4 @@
-# Optimizers in Surogate
+# Optimizers
 
 Surogate supports two optimizers for training: **AdamW 8-bit** and **NorMuon**. Both optimizers use 8-bit quantized state storage to reduce memory consumption while maintaining training stability.
 
@@ -176,3 +176,12 @@ Configure multi-GPU training with:
 gpus: 4  # Number of GPUs to use
 zero_level: 1  # ZeRO optimization level (1, 2, or 3)
 ```
+
+---
+
+## See also
+
+- [Config reference](../reference/config.md)
+- [Memory](memory.md)
+- [Back to docs index](../index.md)
+

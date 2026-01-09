@@ -1,11 +1,16 @@
+# Performance
+
+This page is a work in progress. It will collect practical performance tuning tips and describe major optimizations implemented in Surogate.
+
+---
+
 # High-Level Optimizations
+
 This section describes high-level optimizations implemented in the Surogate framework to improve memory efficiency and training speed.
 
 ## Kernel Fusions
 
-
 ## LoRA Fusions
-
 
 ## Fused RoPE
 
@@ -36,11 +41,16 @@ Fused RoPE is beneficial when:
 - Memory-constrained scenarios where every MB matters
 - The model uses many attention layers (savings compound)
 
-
 ## Multi-threaded multi-GPU
-
 
 ## Chunked Attention
 
-
 ## Chunked LM
+
+---
+
+## See also
+
+- [Multi-GPU](multi-gpu.md)
+- [Precision & recipes](precision-and-recipes.md)
+- [Back to docs index](../index.md)

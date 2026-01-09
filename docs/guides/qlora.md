@@ -13,7 +13,7 @@ QLoRA enables memory-efficient fine-tuning by quantizing the frozen base model w
 
 **QLoRA** determines how the frozen base model weights are stored and used during the forward pass. The base weights remain quantized and are never updated.
 
-**Recipes** (see [recipes.md](recipes.md)) determine the precision format used for LoRA adapter computations, activations, and gradients during training.
+**Recipes** determine the precision format used for LoRA adapter computations, activations, and gradients during training.
 
 You can combine any QLoRA format with any compatible recipe:
 
@@ -45,8 +45,8 @@ Base weights are quantized to FP8 using two formats optimized for their use case
 | `amax_history_len`        | 1024    | Length of amax history window        |
 | `amax_compute_algo`       | MAX     | Algorithm: MAX or MOST_RECENT        |
 | `reduce_amax`             | true    | Reduce amax across distributed group |
-| `skip_quant_first_layers` | 0       | Skip FP4 for first N layers          |
-| `skip_quant_last_layers`  | 0       | Skip FP4 for last N layers           |
+| `skip_quant_first_layers` | 0       | Skip quantization for first N layers |
+| `skip_quant_last_layers`  | 0       | Skip quantization for last N layers  |
 
 ### Recommended Recipe Combinations
 
@@ -91,17 +91,17 @@ FP4 E2M1 provides extreme compression with only 8 representable values per sign:
 
 - **Random Hadamard Transform (RHT)**: Spreads outliers before quantization
 - **Stochastic Rounding**: Prevents quantization bias accumulation in gradients
-- **Four-Over-Six (4/6) Adaptive Scaling**: Selects optimal scale per block ([arXiv:2512.02010](https://arxiv.org/abs/2512.02010))
+- **Four-Over-Six (4/6) Adaptive Scaling**: Selects optimal scale per block
 - **Layer Skipping**: Keep critical layers (embedding, lm_head) in BF16
 
 ### Parameters
 
-| Parameter                     | Default | Description                         |
-| ----------------------------- | ------- | ----------------------------------- |
-| `qlora_fp4`                   | false   | Enable FP4 QLoRA                    |
-| `skip_quant_first_layers`     | 0       | Skip FP4 for first N layers         |
-| `skip_quant_last_layers`      | 0       | Skip FP4 for last N layers          |
-| `backend`                     | cutlass | Backend: cudnn or cutlass           |
+| Parameter                 | Default | Description               |
+| ------------------------ | ------- | ------------------------- |
+| `qlora_fp4`              | false   | Enable FP4 QLoRA          |
+| `skip_quant_first_layers`| 0       | Skip FP4 for first N layers |
+| `skip_quant_last_layers` | 0       | Skip FP4 for last N layers  |
+| `backend`                | cutlass | Backend: cudnn or cutlass |
 
 ### Recommended Recipe Combinations
 
@@ -124,7 +124,7 @@ skip_quant_last_layers: 4
 
 ## NF4 QLoRA (BitsAndBytes)
 
-NF4 QLoRA uses the BitsAndBytes NF4 (NormalFloat4) quantization format, providing ~75% memory reduction with broad GPU compatibility. This is the same quantization format used by the popular BitsAndBytes library.
+NF4 QLoRA uses the BitsAndBytes NF4 (NormalFloat4) quantization format, providing ~75% memory reduction with broad GPU compatibility.
 
 ### How It Works
 
@@ -174,7 +174,7 @@ Unlike FP8 and FP4 QLoRA which require specific GPU architectures, NF4 QLoRA wor
 ### Recommended Recipe Combinations
 
 | Recipe     | Use Case                                         |
-| ---------- | ------------------------------------------------ |
+| ---------- | ----------------------------------------------- |
 | **bf16**   | Best accuracy, broad compatibility (Recommended) |
 | fp8-hybrid | Faster compute on SM89+ GPUs                     |
 
@@ -192,3 +192,12 @@ qlora_bnb_double_quant: true
 
 recipe: bf16
 ```
+
+---
+
+## See also
+
+- [Precision & recipes](precision-and-recipes.md)
+- [Config reference](../reference/config.md)
+- [Back to docs index](../index.md)
+

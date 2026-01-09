@@ -35,17 +35,18 @@ See reproducible comparisons in [`./benchmarks`](./benchmarks/speed.md).
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
-- **🖥️...🖥️ Native multi-GPU** training
+- [**🖥️...🖥️ Native multi-GPU**](./docs/guides/multi-gpu.md) training with multi-threading and MPI backends
 - **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
-- **⚖️ Smart CPU Offloading** for weights, gradients, activations, quants
+- [**🗲 CUDA Kernel Fusions**](./docs/guides/transformer.md#kernel-fusions) for maximum throughput  
+- [**⚖️ Smart CPU Offloading**](./docs/guides/offloading.md) for weights, gradients, activations, quants
 - **📜 Pre-built training recipes**: 
-  - [**💎 BF16**](./csrc/src/recipes/bf16/README.md): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
-  - [**🔥 FP8**](./csrc/src/recipes/fp8_hybrid/README.md): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
-  - [**🔥 NVFP4**](./csrc/src/recipes/nvfp4/README.md): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
-- **⚡ BnB/FP8/NVFP4 QLoRA** to maximize SOL on Hopper/Blackwell GPUs
-- **👌 Optimizers**: AdamW 8bit, !! NorMuon !!
+  - [**💎 BF16**](./docs/guides/precision-and-recipes.md#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
+  - [**🔥 FP8**](./docs/guides/precision-and-recipes.md#fp8-hybrid): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
+  - [**🔥 NVFP4**](./docs/guides/precision-and-recipes.md#fp4-nvfp4): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
+- [**⚡ BnB/FP8/NVFP4 QLoRA**](./docs/guides/qlora.md) to maximize SOL on Hopper/Blackwell GPUs
+- [**👌 Optimizers**](./docs/guides/optimizers.md): AdamW 8bit, !! NorMuon !!
 - **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
-- **🧪 Fast Experimentation**: Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
+- [**🧪 Mixed-precision training**](./docs/guides/precision-and-recipes.md#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
 - **🧠 Supported models**: Qwen2.5, Qwen3 Dense, LLama 3.2, more to come shortly
 

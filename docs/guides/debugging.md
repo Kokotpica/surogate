@@ -103,11 +103,23 @@ Optimization Suggestions:
 ```
 
 ### Training timing breakdown
-You can also enable the `debug_timing_breakdown` flag to get a detailed timing breakdown of different components during training, which can help identify bottlenecks in the training process:
 
-```shell
-
-```
-
+You can also enable the `debug_timing_breakdown` flag to get a detailed timing breakdown of different components during training, which can help identify bottlenecks in the training process.
 
 ### Debug tokenization issues
+
+If you suspect your dataset is being labeled/masked incorrectly (for example, wrong tokens are ignored), run the tokenizer step with `--debug`:
+
+```bash
+surogate tokenize --config <path/to/config.yaml> --debug
+```
+
+This prints tokens alongside their labels so you can confirm that the right spans are being ignored.
+
+---
+
+## See also
+
+- [Memory](memory.md)
+- [Config reference](../reference/config.md)
+- [Back to docs index](../index.md)

@@ -83,7 +83,6 @@ Effective batch size = per_device_batch_size × gradient_accumulation_steps × g
 Controls the ZeRO (Zero Redundancy Optimizer) optimization level, which determines how optimizer states, gradients, and weights are partitioned across GPUs to reduce memory consumption.
 
 - **Default**: `1`
-- **CLI flag**: `--zero-level`
 
 | Level | Description              | What's Sharded                               |
 | ----- | ------------------------ | -------------------------------------------- |
@@ -101,7 +100,7 @@ Higher ZeRO levels reduce per-GPU memory consumption but increase communication 
 
 ### `shard_weights`
 
-Enables sharding of model weights across data-parallel processes. This is automatically enabled when `zero_level: 3` is set, but can also be configured independently.
+Enables sharding of model weights across data-parallel processes.
 
 - **Default**: `false`
 
@@ -119,11 +118,9 @@ Example:
 shard_weights: true
 ```
 
-Note: When training with FP8, it may be beneficial to enable weight sharding before gradient sharding, as weights require only half the bandwidth compared to gradients.
-
 ### `shard_gradients`
 
-Enables sharding of gradients across data-parallel processes. This is automatically enabled when `zero_level >= 2` is set, but can also be configured independently.
+Enables sharding of gradients across data-parallel processes.
 
 - **Default**: `false`
 
@@ -144,6 +141,14 @@ shard_gradients: true
 
 For fine-grained control over multi-GPU communication and memory:
 
-- `memcpy_all_gather`: Use memcpy for all-gather operations (threads backend only). Generally achieves better PCIe bandwidth utilization.
-- `memcpy_send_recv`: Use memcpy for send/receive operations (threads backend only).
-- `use_all_to_all_reduce`: Use all-to-all-based reduce algorithm for potentially better performance.
+- `memcpy_all_gather`: Use memcpy for all-gather operations (threads backend only)
+- `memcpy_send_recv`: Use memcpy for send/receive operations (threads backend only)
+- `use_all_to_all_reduce`: Use all-to-all-based reduce algorithm for potentially better performance
+
+---
+
+## See also
+
+- [Offloading](offloading.md)
+- [Config reference](../reference/config.md)
+- [Back to docs index](../index.md)
