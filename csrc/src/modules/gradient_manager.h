@@ -15,8 +15,7 @@
 #include "utilities/allocator.h"
 #include "utilities/tensor.h"
 #include "utilities/philox.h"
-
-class NCCLCommunicator;
+#include "utilities/comm.h"
 
 namespace modules {
 
