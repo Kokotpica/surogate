@@ -7,6 +7,8 @@
 
 #include <functional>
 #include <string>
+#include <vector>
+#include <cublas_v2.h>
 
 #include "lora_types.h"
 #include "utilities/tensor.h"
@@ -112,6 +114,69 @@ private:
     Tensor mStagingVScales;
 
     void allocate_state();
+};
+
+// 8-bit AdamW optimizer state for LoRA weights
+struct LoRAAdamW8BitState {
+    bool initialized = false;
+    size_t total_params = 0;
+    size_t num_blocks = 0;
+    int num_tensors = 0;
+
+    // Offloading configuration
+    bool offload_state = false;  // If true, state tensors are in pinned host memory
+    bool use_zero_copy = false;  // If true, use zero-copy access instead of transfers
+
+    Tensor quantiles1;   // 256 entries - quantization map for m
+    Tensor quantiles2;   // 256 entries - quantization map for v
+    Tensor state1;       // uint8 quantized m, size = total_params
+    Tensor state2;       // uint8 quantized v, size = total_params
+    Tensor absmax1;      // per-block absmax for m
+    Tensor absmax2;      // per-block absmax for v
+
+    // Multi-tensor optimizer buffers (device memory)
+    // Pre-allocated arrays of pointers/sizes to avoid per-step CPU work
+    Tensor param_ptrs;      // float** or nv_bfloat16** - array of param pointers
+    Tensor grad_ptrs;       // float** or nv_bfloat16** - array of grad pointers
+    Tensor tensor_sizes;    // int* - array of tensor sizes
+    Tensor state_offsets;   // int* - element offset for each tensor in state buffers
+};
+
+// NorMuon optimizer state for LoRA weights
+// Uses 8-bit quantized momentum + FP32 variance buffers
+struct LoRANorMuonState {
+    bool initialized = false;
+    size_t total_params = 0;
+    size_t state_elems = 0;
+    size_t num_blocks = 0;
+
+    // 8-bit quantized momentum buffer (combined for all LoRA weights)
+    Tensor momentum_quantiles;  // float[256] - signed quantization map
+    Tensor momentum_state;      // uint8[state_elems]
+    Tensor momentum_absmax;     // float[num_blocks]
+
+    // Variance buffers - stored per LoRA tensor as FP32
+    // For LoRA, each A/B matrix is a 2D weight
+    std::vector<Tensor> variance_buffers;
+    std::vector<std::pair<int, int>> variance_shapes;  // (M, N) for each buffer
+
+    // Polar Express workspace (reused across layers)
+    Tensor polar_workspace;
+    size_t max_weight_M = 0;  // Max weight rows seen
+    size_t max_weight_N = 0;  // Max weight cols seen
+
+    // Temporary buffer for dequantized momentum (reused per weight)
+    Tensor momentum_temp;  // BF16[max_weight_size]
+
+    // cuBLAS handle for Polar Express matrix multiplications
+    cublasHandle_t cublas_handle = nullptr;
+
+    ~LoRANorMuonState() {
+        if (cublas_handle) {
+            cublasDestroy(cublas_handle);
+            cublas_handle = nullptr;
+        }
+    }
 };
 
 } // namespace modules
