@@ -16,7 +16,7 @@
 
 ## What is Surogate?
 
-Surogate is a **production-grade LLM training framework** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and predictable multi-GPU scaling at scale.
+Surogate is a **production-grade LLM training framework** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and predictable multi-GPU/multi-Node scaling at scale.
 
 By combining a native **C++/CUDA execution engine**, a low-overhead Python frontend, and a highly optimized **multi-threaded scheduler**, Surogate achieves industry-leading Speed-Of-Light (SOL) utilization on NVIDIA GPUs — **outperforming existing training toolkits by a wide margin**. 
 
@@ -25,7 +25,8 @@ By combining a native **C++/CUDA execution engine**, a low-overhead Python front
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
-- [**🖥️...🖥️ Native multi-GPU**](./guides/multi-gpu.md) training with multi-threading and MPI backends
+- [**🖥️...🖥️ Native multi-GPU**](./guides/multi-gpu.md) training with the multi-threaded backend
+- [**🖥️...🖥️ Native multi-Node**](./docs/guides/multi-node.md) DDP training with Ray
 - **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
 - [**🗲 CUDA Kernel Fusions**](./guides/transformer.md#kernel-fusions) for maximum throughput  
 - [**⚖️ Smart CPU Offloading**](./guides/offloading.md) for weights, gradients, activations, quants
