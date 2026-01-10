@@ -213,6 +213,7 @@ target_sources(surogate-common PRIVATE
     src/models/registry.cpp
     src/models/qwen25.cpp
     src/models/qwen3.cpp
+    src/models/qwen3_moe.cpp
     src/models/llama.cpp
 
     src/modules/qlora/fp8_weights.cpp
@@ -335,6 +336,7 @@ if (BUILD_TESTS)
 	            src/testing/test-fp4.cu
 	            src/testing/test-bnb-quant.cpp
 	            src/testing/test-moe.cu
+	            src/testing/test-heterogeneous.cu
 	    )
     target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
     target_compile_options(unit-tests PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)

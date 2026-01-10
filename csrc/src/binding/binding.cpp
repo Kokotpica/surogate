@@ -624,6 +624,14 @@ NB_MODULE(_surogate, m) {
                 "Enable double quantization for BnB (quantize absmax values to INT8).")
         .def_rw("bnb_double_quant_group_size", &modules::QLoRAConfig::bnb_double_quant_group_size,
                 "Group size for double quantization (number of absmax values per group).")
+        .def_rw("num_experts", &modules::QLoRAConfig::num_experts,
+                "Number of experts for MoE models (0 = dense model, >0 = MoE model).")
+        .def_rw("num_experts_per_tok", &modules::QLoRAConfig::num_experts_per_tok,
+                "Number of experts selected per token (top-k routing).")
+        .def_rw("moe_intermediate_size", &modules::QLoRAConfig::moe_intermediate_size,
+                "Per-expert MLP intermediate size (0 = use regular intermediate_size).")
+        .def_prop_ro("is_moe", &modules::QLoRAConfig::is_moe,
+                     "Whether this is an MoE model (num_experts > 0).")
         .def("__repr__", [](const modules::QLoRAConfig& cfg) {
             if (cfg.is_bnb()) {
                 return fmt::format("QLoRAConfig(enabled={}, strategy='{}', block_size={}, bnb_double_quant={}, adapter_dtype='{}')",

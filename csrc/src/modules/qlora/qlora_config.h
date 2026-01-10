@@ -125,6 +125,24 @@ struct QLoRAConfig {
     /// Group size for double quantization (number of absmax values per group)
     int bnb_double_quant_group_size = 256;
 
+    // =========================================================================
+    // MoE (Mixture of Experts) configuration
+    // =========================================================================
+
+    /// Number of experts (0 = dense model, >0 = MoE model)
+    int num_experts = 0;
+
+    /// Number of experts selected per token (top-k routing)
+    int num_experts_per_tok = 8;
+
+    /// Per-expert MLP intermediate size (0 = use regular intermediate_size)
+    int moe_intermediate_size = 0;
+
+    /**
+     * @brief Check if this is an MoE model
+     */
+    [[nodiscard]] bool is_moe() const { return num_experts > 0; }
+
     /**
      * @brief Check if quantization is active
      */
@@ -299,6 +317,13 @@ public:
                                        recipes::FourOverSixErrorMetric metric = recipes::FourOverSixErrorMetric::MSE) {
         mConfig.enable_four_over_six = enable;
         mConfig.four_over_six_metric = metric;
+        return *this;
+    }
+
+    QLoRAConfigBuilder& moe(int num_experts, int num_experts_per_tok = 8, int moe_intermediate_size = 0) {
+        mConfig.num_experts = num_experts;
+        mConfig.num_experts_per_tok = num_experts_per_tok;
+        mConfig.moe_intermediate_size = moe_intermediate_size;
         return *this;
     }
 

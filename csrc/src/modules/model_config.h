@@ -64,16 +64,57 @@ struct MoEConfig {
     float router_aux_loss_coef = 0.01f;  ///< Load balancing auxiliary loss coefficient
     bool router_jitter = false;     ///< Add noise during routing for training stability
     float capacity_factor = 1.25f;  ///< Expert capacity factor for load balancing
+
+    // Qwen3 MoE-style layer configuration
+    int decoder_sparse_step = 1;    ///< MoE layer frequency: MoE every N layers (1 = all MoE)
+    std::vector<int> mlp_only_layers; ///< Explicit list of layer indices using dense MLP instead of MoE
+    bool norm_topk_prob = false;    ///< Normalize top-k routing weights to sum to 1 (Qwen3 style)
+    int moe_intermediate_size = 0;  ///< Per-expert intermediate size (0 = use IntermediateSize)
+};
+
+/**
+ * @brief Block types for heterogeneous architectures
+ */
+enum class BlockType {
+    Dense,       ///< Standard dense transformer block
+    MoE,         ///< Mixture of Experts block
+    Conv,        ///< Convolutional block (for LFM2)
+    SwitchMoE    ///< Switch Transformer style (top-1 routing)
 };
 
 /**
  * @brief Per-layer configuration override for hybrid architectures
  */
 struct LayerOverride {
-    int layer_idx;                  ///< Which layer this override applies to
-    bool is_moe = false;            ///< Whether this layer uses MoE
-    std::optional<int> num_experts; ///< Override number of experts for this layer
-    std::optional<int> intermediate_size;  ///< Override intermediate size
+    int layer_idx;                          ///< Which layer this override applies to
+    BlockType block_type = BlockType::Dense; ///< Block type for this layer
+    bool is_moe = false;                    ///< Whether this layer uses MoE (deprecated, use block_type)
+    std::optional<int> num_experts;         ///< Override number of experts for this layer
+    std::optional<int> intermediate_size;   ///< Override intermediate size
+    std::optional<int> top_k;               ///< Override top-k for MoE layers
+
+    // Convenience constructors
+    static LayerOverride dense(int idx) {
+        return LayerOverride{idx, BlockType::Dense, false};
+    }
+
+    static LayerOverride moe(int idx, int experts = 8, int k = 2) {
+        LayerOverride override{idx, BlockType::MoE, true};
+        override.num_experts = experts;
+        override.top_k = k;
+        return override;
+    }
+
+    static LayerOverride switch_moe(int idx, int experts = 128) {
+        LayerOverride override{idx, BlockType::SwitchMoE, true};
+        override.num_experts = experts;
+        override.top_k = 1;
+        return override;
+    }
+
+    static LayerOverride conv(int idx) {
+        return LayerOverride{idx, BlockType::Conv, false};
+    }
 };
 
 /**
@@ -129,21 +170,82 @@ struct ModelConfig : public PretrainedConfig {
 
     /**
      * @brief Check if a specific layer uses MoE
+     *
+     * For MoE/Hybrid architectures, this follows the Qwen3 MoE pattern:
+     * 1. If layer is in mlp_only_layers, it's NOT MoE (dense MLP)
+     * 2. Otherwise, if (layer_idx + 1) % decoder_sparse_step == 0, it's MoE
+     * 3. Layer overrides take precedence over the above rules
      */
     [[nodiscard]] bool is_layer_moe(int layer_idx) const {
         if (architecture == ArchitectureType::Dense) {
             return false;
         }
+
+        // Check explicit layer overrides first (highest priority)
+        for (const auto& override : layer_overrides) {
+            if (override.layer_idx == layer_idx) {
+                return override.block_type == BlockType::MoE ||
+                       override.block_type == BlockType::SwitchMoE ||
+                       override.is_moe;  // Backwards compatibility
+            }
+        }
+
+        // For MoE/Hybrid architectures, use Qwen3-style pattern
+        if (architecture == ArchitectureType::MoE || architecture == ArchitectureType::Hybrid) {
+            if (moe_config.has_value()) {
+                const auto& moe = moe_config.value();
+
+                // Check if this layer is explicitly marked as dense (mlp_only_layers)
+                for (int dense_layer : moe.mlp_only_layers) {
+                    if (dense_layer == layer_idx) {
+                        return false;
+                    }
+                }
+
+                // Check decoder_sparse_step pattern: MoE if (layer_idx + 1) % step == 0
+                // With step=1, all layers are MoE (default behavior)
+                // With step=2, layers 1,3,5,... are MoE (every other layer starting from 1)
+                if (moe.num_experts > 0) {
+                    return (layer_idx + 1) % moe.decoder_sparse_step == 0;
+                }
+            }
+        }
+
+        // Default: MoE architecture means all layers are MoE, Hybrid means dense
+        return architecture == ArchitectureType::MoE;
+    }
+
+    /**
+     * @brief Get the block type for a specific layer
+     */
+    [[nodiscard]] BlockType get_block_type(int layer_idx) const {
+        if (architecture == ArchitectureType::Dense) {
+            return BlockType::Dense;
+        }
         if (architecture == ArchitectureType::MoE) {
-            return true;
+            return BlockType::MoE;
         }
         // Hybrid: check overrides
         for (const auto& override : layer_overrides) {
             if (override.layer_idx == layer_idx) {
-                return override.is_moe;
+                return override.block_type;
             }
         }
-        return false;  // Default to dense for hybrid
+        return BlockType::Dense;  // Default to dense for hybrid
+    }
+
+    /**
+     * @brief Get top-k for routing in a specific layer
+     */
+    [[nodiscard]] int get_top_k(int layer_idx) const {
+        // Check for layer override
+        for (const auto& override : layer_overrides) {
+            if (override.layer_idx == layer_idx && override.top_k.has_value()) {
+                return override.top_k.value();
+            }
+        }
+        // Default from MoE config
+        return moe_config.has_value() ? moe_config->top_k : 2;
     }
 
     /**

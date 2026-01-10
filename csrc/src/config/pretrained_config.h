@@ -6,6 +6,7 @@
 #define SUROGATE_SRC_CONFIG_PRETRAINED_CONFIG_H
 
 #include <string_view>
+#include <vector>
 
 #include "config/rope_config.h"
 #include "utilities/dtype.h"
@@ -17,6 +18,7 @@ struct PretrainedConfig {
         LLAMA,
         QWEN2,
         QWEN3,
+        QWEN3_MOE,
     } Architecture;
 
     int BosTokenId;
@@ -41,6 +43,15 @@ struct PretrainedConfig {
     bool TiedWordEmbeddings;
     bool UseQKVBias;
     bool UseQKNorm = false;
+
+    // MoE-specific configuration (for Qwen3 MoE and similar architectures)
+    int NumExperts = 0;             ///< Number of routed experts (0 = not MoE)
+    int NumExpertsPerTok = 0;       ///< Top-K experts selected per token
+    int MoeIntermediateSize = 0;    ///< Per-expert MLP hidden dim (0 = use IntermediateSize)
+    int DecoderSparseStep = 1;      ///< MoE layer frequency: MoE every N layers (1 = all MoE)
+    std::vector<int> MlpOnlyLayers; ///< Explicit list of layer indices using dense MLP instead of MoE
+    bool NormTopkProb = false;      ///< Normalize top-k routing weights to sum to 1
+    float RouterAuxLossCoef = 0.001f; ///< Load balancing auxiliary loss coefficient
 
     ETensorDType DType = ETensorDType::BF16;
 

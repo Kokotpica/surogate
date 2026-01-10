@@ -36,6 +36,36 @@ constexpr const char* hook_point_name(ForwardHookPoint point) {
 
 using ForwardHook = std::function<void(int layer_idx, ForwardHookPoint point, cudaStream_t stream)>;
 
+/**
+ * @brief Hook points during MoE expert forward pass
+ *
+ * These correspond to specific locations within a single expert's forward pass
+ * where per-expert LoRA can be applied.
+ */
+enum class MoEExpertHookPoint {
+    AfterExpertUpProjection,   ///< After expert gate_up matmul, before SwiGLU
+    AfterExpertDownProjection, ///< After expert down matmul
+};
+
+constexpr const char* hook_point_name(MoEExpertHookPoint point) {
+    switch (point) {
+        case MoEExpertHookPoint::AfterExpertUpProjection: return "AfterExpertUpProjection";
+        case MoEExpertHookPoint::AfterExpertDownProjection: return "AfterExpertDownProjection";
+        default: return "Unknown";
+    }
+}
+
+/**
+ * @brief Hook for MoE expert forward pass
+ *
+ * Called during per-expert computation with the expert index.
+ * @param layer_idx The layer index
+ * @param expert_idx The expert index within the layer
+ * @param point The hook point within the expert forward pass
+ * @param stream CUDA stream
+ */
+using MoEExpertHook = std::function<void(int layer_idx, int expert_idx, MoEExpertHookPoint point, cudaStream_t stream)>;
+
 } // namespace modules
 
 #endif // SUROGATE_SRC_MODULES_FORWARD_HOOKS_H

@@ -38,6 +38,8 @@ public:
         int num_kv_heads;           ///< Number of key/value heads (< num_query_heads for GQA)
         RoPEConfig rope;            ///< Flexible RoPE configuration
         bool use_qkv_bias = false;  ///< Whether QKV projection has bias (Qwen uses this)
+        bool use_qk_norm = false;   ///< Whether to apply QK normalization (Qwen3)
+        float qk_norm_eps = 1e-6f;  ///< Epsilon for QK RMSNorm
         int head_size = 0;          ///< Optional explicit head dim (0 => hidden_size / num_query_heads)
 
         // Derived dimensions
@@ -74,6 +76,10 @@ public:
         // QKV projection
         QuantizableTensor qkv_input;        ///< Input to QKV projection (LN output)
         Tensor qkv_output;                  ///< QKV after RoPE (B, T, qkv_channels)
+
+        // QK normalization (for backward pass when use_qk_norm=true)
+        Tensor q_rstd;                      ///< (B, T, Hq) reciprocal std for Q heads
+        Tensor k_rstd;                      ///< (B, T, Hkv) reciprocal std for K heads
 
         // Attention
         Tensor attention_output;            ///< (B, T, attn_out_channels) attention output
@@ -172,9 +178,43 @@ inline Tensor AttentionModule::forward_impl(ModuleContext& ctx, Weights& w, Tens
     // 1) QKV projection
     forward_qkv(ctx, w, input, acts);
 
-    // 2) Apply RoPE to Q and K (if enabled)
+    // 2) Apply QK normalization and/or RoPE
     const int rotary_dim = mConfig.rotary_dim();
-    if (rotary_dim > 0) {
+    if (mConfig.use_qk_norm && rotary_dim > 0) {
+        // Fused QK norm + RoPE kernel (more efficient)
+        if (!w.q_norm_weight.has_value() || !w.k_norm_weight.has_value()) {
+            throw std::runtime_error("QK norm enabled but q_norm_weight/k_norm_weight not provided");
+        }
+        qkv_qk_norm_rope_forward(
+            acts.qkv_output,
+            acts.q_rstd, acts.k_rstd,
+            w.q_norm_weight.value(), w.k_norm_weight.value(),
+            w.rope_freqs, ctx.position_ids,
+            mConfig.qk_norm_eps, B, T, Hq, Hkv, Hs,
+            ctx.stream
+        );
+    } else if (mConfig.use_qk_norm) {
+        // QK norm without RoPE (rare case)
+        if (!w.q_norm_weight.has_value() || !w.k_norm_weight.has_value()) {
+            throw std::runtime_error("QK norm enabled but q_norm_weight/k_norm_weight not provided");
+        }
+        const int qkv_channels = mConfig.qkv_channels();
+        // Apply Q norm
+        qkv_head_rmsnorm_forward(
+            acts.qkv_output, acts.q_rstd, w.q_norm_weight.value(),
+            mConfig.qk_norm_eps, B, T, qkv_channels,
+            Hq, Hs, 0,  // Q starts at channel offset 0
+            ctx.stream
+        );
+        // Apply K norm
+        qkv_head_rmsnorm_forward(
+            acts.qkv_output, acts.k_rstd, w.k_norm_weight.value(),
+            mConfig.qk_norm_eps, B, T, qkv_channels,
+            Hkv, Hs, Hq * Hs,  // K starts after Q
+            ctx.stream
+        );
+    } else if (rotary_dim > 0) {
+        // RoPE only (no QK norm)
         rope_forward(
             acts.qkv_output, acts.qkv_output,
             w.rope_freqs,
@@ -323,9 +363,74 @@ inline Tensor AttentionModule::backward_impl(ModuleContext& ctx, Weights& w, Act
         ctx.stream
     );
 
-    // Backward through RoPE (if enabled)
+    // Backward through QK normalization and/or RoPE
     const int rotary_dim = mConfig.rotary_dim();
-    if (rotary_dim > 0) {
+    const int qkv_channels = mConfig.qkv_channels();
+    if (mConfig.use_qk_norm && rotary_dim > 0) {
+        // Fused QK norm + RoPE backward (handles both in one pass)
+        // Backward through Q norm + RoPE
+        qkv_head_rmsnorm_rope_backward_dx(
+            d_qkv, acts.qkv_output, w.q_norm_weight.value(), acts.q_rstd,
+            w.rope_freqs, ctx.position_ids,
+            B, T, qkv_channels, Hq, Hs, 0,  // Q starts at offset 0
+            ctx.stream
+        );
+        // Backward through K norm + RoPE
+        qkv_head_rmsnorm_rope_backward_dx(
+            d_qkv, acts.qkv_output, w.k_norm_weight.value(), acts.k_rstd,
+            w.rope_freqs, ctx.position_ids,
+            B, T, qkv_channels, Hkv, Hs, Hq * Hs,  // K starts after Q
+            ctx.stream
+        );
+        // Weight gradients for Q norm
+        if (grads.d_q_norm_weight.has_value()) {
+            qkv_head_rmsnorm_rope_backward_dweight(
+                grads.d_q_norm_weight.value(), d_qkv, acts.qkv_output, w.q_norm_weight.value(),
+                w.rope_freqs, ctx.position_ids,
+                B, T, qkv_channels, Hq, Hs, 0,
+                accumulate, ctx.stream
+            );
+        }
+        // Weight gradients for K norm
+        if (grads.d_k_norm_weight.has_value()) {
+            qkv_head_rmsnorm_rope_backward_dweight(
+                grads.d_k_norm_weight.value(), d_qkv, acts.qkv_output, w.k_norm_weight.value(),
+                w.rope_freqs, ctx.position_ids,
+                B, T, qkv_channels, Hkv, Hs, Hq * Hs,
+                accumulate, ctx.stream
+            );
+        }
+    } else if (mConfig.use_qk_norm) {
+        // QK norm backward without RoPE
+        // Backward through Q norm
+        qkv_head_rmsnorm_backward_dx(
+            d_qkv, acts.qkv_output, w.q_norm_weight.value(), acts.q_rstd,
+            B, T, qkv_channels, Hq, Hs, 0,
+            ctx.stream
+        );
+        // Backward through K norm
+        qkv_head_rmsnorm_backward_dx(
+            d_qkv, acts.qkv_output, w.k_norm_weight.value(), acts.k_rstd,
+            B, T, qkv_channels, Hkv, Hs, Hq * Hs,
+            ctx.stream
+        );
+        // Weight gradients
+        if (grads.d_q_norm_weight.has_value()) {
+            qkv_head_rmsnorm_backward_dweight(
+                grads.d_q_norm_weight.value(), d_qkv, acts.qkv_output, w.q_norm_weight.value(),
+                B, T, qkv_channels, Hq, Hs, 0,
+                accumulate, ctx.stream
+            );
+        }
+        if (grads.d_k_norm_weight.has_value()) {
+            qkv_head_rmsnorm_backward_dweight(
+                grads.d_k_norm_weight.value(), d_qkv, acts.qkv_output, w.k_norm_weight.value(),
+                B, T, qkv_channels, Hkv, Hs, Hq * Hs,
+                accumulate, ctx.stream
+            );
+        }
+    } else if (rotary_dim > 0) {
+        // RoPE backward only (no QK norm)
         rope_backward(
             d_qkv, d_qkv,
             w.rope_freqs,
@@ -391,9 +496,35 @@ inline void AttentionModule::recompute_impl(ModuleContext& ctx, Weights& w, Tens
     acts.qkv_input.Value = input;
     forward_qkv(ctx, w, input, acts);
 
-    // Recompute RoPE (if enabled)
+    // Recompute QK normalization and/or RoPE
     const int rotary_dim = mConfig.rotary_dim();
-    if (rotary_dim > 0) {
+    if (mConfig.use_qk_norm && rotary_dim > 0) {
+        // Fused QK norm + RoPE (also recomputes q_rstd/k_rstd)
+        qkv_qk_norm_rope_forward(
+            acts.qkv_output,
+            acts.q_rstd, acts.k_rstd,
+            w.q_norm_weight.value(), w.k_norm_weight.value(),
+            w.rope_freqs, ctx.position_ids,
+            mConfig.qk_norm_eps, B, T, Hq, Hkv, Hs,
+            ctx.stream
+        );
+    } else if (mConfig.use_qk_norm) {
+        // QK norm without RoPE
+        const int qkv_channels = mConfig.qkv_channels();
+        qkv_head_rmsnorm_forward(
+            acts.qkv_output, acts.q_rstd, w.q_norm_weight.value(),
+            mConfig.qk_norm_eps, B, T, qkv_channels,
+            Hq, Hs, 0,
+            ctx.stream
+        );
+        qkv_head_rmsnorm_forward(
+            acts.qkv_output, acts.k_rstd, w.k_norm_weight.value(),
+            mConfig.qk_norm_eps, B, T, qkv_channels,
+            Hkv, Hs, Hq * Hs,
+            ctx.stream
+        );
+    } else if (rotary_dim > 0) {
+        // RoPE only
         rope_forward(
             acts.qkv_output, acts.qkv_output,
             w.rope_freqs,

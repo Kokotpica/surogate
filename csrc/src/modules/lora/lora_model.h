@@ -32,6 +32,7 @@
 #include "modules/qlora/fp8_weight_provider.h"
 #include "modules/qlora/fp4_weight_provider.h"
 #include "modules/qlora/bnb_weight_provider.h"
+#include "modules/weights/weight_manager_types.h"
 #include "training/model.h"
 #include "training/runtime_options.h"
 #include "utilities/allocator.h"
@@ -118,6 +119,74 @@ inline void apply_lora_contribution(
     add_2d_slice(output, packed_delta, BT, total_out_features, out_features, output_offset, stream);
 }
 
+/**
+ * @brief Apply LoRA contributions for a single MoE expert
+ *
+ * This function applies LoRA to an expert's gate_up and down projections.
+ * It's called during the MoE expert forward pass for each expert that has
+ * tokens routed to it.
+ *
+ * @param gate_up Output of the expert's gate+up projection (N, 2*D) - modified in place
+ * @param down_output Output of the expert's down projection (N, C) - modified in place
+ * @param expert_input Input to the expert (N, C) - used for gate/up LoRA
+ * @param activated Activated output (N, D) - used for down LoRA
+ * @param expert_lora The LoRA weights for this expert
+ * @param intermediate Scratch tensor for LoRA computation (N, rank)
+ * @param slice_buffer Scratch tensor for slicing
+ * @param scaling LoRA scaling factor
+ * @param N Number of tokens routed to this expert
+ * @param C Hidden size
+ * @param D Expert intermediate size
+ * @param rank LoRA rank
+ * @param handle cuBLAS handle
+ * @param workspace cuBLAS workspace
+ * @param stream CUDA stream
+ */
+inline void apply_expert_lora(
+    Tensor& gate_up,          // (N, 2*D) - gate+up projection output
+    Tensor& down_output,      // (N, C) - down projection output
+    const Tensor& expert_input,  // (N, C) - input to expert
+    const Tensor& activated,     // (N, D) - activated value (after SwiGLU)
+    const LoRAExpertWeights<Tensor>& expert_lora,
+    Tensor& intermediate,
+    Tensor& slice_buffer,
+    float scaling,
+    int N,            // Number of tokens for this expert
+    int C,            // Hidden size
+    int D,            // Expert intermediate size
+    int rank,
+    cublasLtHandle_t handle,
+    Tensor& workspace,
+    cudaStream_t stream) {
+
+    if (N <= 0) return;
+
+    // Apply LoRA to gate projection (first half of gate_up)
+    if (expert_lora.gate.has_value() && expert_lora.gate->has_value()) {
+        apply_lora_contribution(gate_up, D, expert_input, *expert_lora.gate,
+                                intermediate, slice_buffer,
+                                scaling, N, C, D, rank,
+                                handle, workspace, stream);
+    }
+
+    // Apply LoRA to up projection (second half of gate_up)
+    // Note: In the fused gate_up layout, up is at offset 0 and gate is at offset D
+    if (expert_lora.up.has_value() && expert_lora.up->has_value()) {
+        apply_lora_contribution(gate_up, 0, expert_input, *expert_lora.up,
+                                intermediate, slice_buffer,
+                                scaling, N, C, D, rank,
+                                handle, workspace, stream);
+    }
+
+    // Apply LoRA to down projection
+    if (expert_lora.down.has_value() && expert_lora.down->has_value()) {
+        apply_lora_contribution(down_output, 0, activated, *expert_lora.down,
+                                intermediate, slice_buffer,
+                                scaling, N, D, C, rank,
+                                handle, workspace, stream);
+    }
+}
+
 inline void backward_lora_layer(
     Tensor& dA,
     Tensor& dB,
@@ -193,6 +262,118 @@ inline void backward_lora_layer(
     // dx += (dL_dy @ B) @ A
     matmul(dx, A, intermediate, std::nullopt, nullptr, nullptr,
            handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
+}
+
+/**
+ * @brief Backward pass for a single MoE expert's LoRA contributions
+ *
+ * Computes gradients for expert-specific LoRA weights (gate, up, down).
+ * This function is called during the backward pass for each expert that had
+ * tokens routed to it during forward.
+ *
+ * The backward follows the chain rule through:
+ * - down_lora: dL/dA_down, dL/dB_down from d_res_ffn (gradient of MLP output)
+ * - up_lora: dL/dA_up, dL/dB_up from d_mlp_up (gradient of gate_up output)
+ * - gate_lora: dL/dA_gate, dL/dB_gate from d_mlp_up
+ *
+ * @param expert_lora_grads Per-expert LoRA gradients (output)
+ * @param expert_lora_weights Per-expert LoRA weights (input)
+ * @param expert_input Input to the expert (N, C)
+ * @param d_gate_up Gradient w.r.t. gate_up output (N, 2*D)
+ * @param activated Activated value from forward (N, D) - for down backward
+ * @param d_down_output Gradient w.r.t. down projection output (N, C)
+ * @param d_expert_input Gradient w.r.t. expert input (accumulated) (N, C)
+ * @param d_activated Gradient w.r.t. activated value (accumulated) (N, D)
+ * @param intermediate Scratch buffer (N, rank)
+ * @param slice_buffer Scratch buffer for slicing
+ * @param scaling LoRA scaling factor
+ * @param N Number of tokens for this expert
+ * @param C Hidden size
+ * @param D Expert intermediate size
+ * @param rank LoRA rank
+ * @param accumulate Whether to accumulate into gradient tensors
+ * @param handle cuBLAS handle
+ * @param workspace cuBLAS workspace
+ * @param stream CUDA stream
+ */
+inline void backward_lora_expert(
+    LoRAExpertWeights<Tensor>& expert_lora_grads,
+    const LoRAExpertWeights<Tensor>& expert_lora_weights,
+    const Tensor& expert_input,       // (N, C) - input to expert
+    const Tensor& d_gate_up,          // (N, 2*D) - gradient of gate_up
+    const Tensor& activated,          // (N, D) - activated value from forward
+    const Tensor& d_down_output,      // (N, C) - gradient of down proj output
+    Tensor& d_expert_input,           // (N, C) - gradient w.r.t. expert input (accumulated)
+    Tensor& d_activated,              // (N, D) - gradient w.r.t. activated (accumulated)
+    Tensor& intermediate,
+    Tensor& slice_buffer,
+    float scaling,
+    int N,            // Number of tokens for this expert
+    int C,            // Hidden size
+    int D,            // Expert intermediate size
+    int rank,
+    bool accumulate,
+    cublasLtHandle_t handle,
+    Tensor& workspace,
+    cudaStream_t stream) {
+
+    if (N <= 0) return;
+
+    // Backward through down projection LoRA
+    // y_down += scaling * B_down @ (A_down @ activated^T)^T
+    // dA_down = activated^T @ (dL_dy_down @ B_down^T) * scaling
+    // dB_down = (activated @ A_down^T)^T @ dL_dy_down * scaling
+    // d_activated += (dL_dy_down @ B_down^T) @ A_down * scaling
+    if (expert_lora_weights.down.has_value() && expert_lora_weights.down->has_value() &&
+        expert_lora_grads.down.has_value()) {
+        backward_lora_layer(
+            expert_lora_grads.down->A,
+            expert_lora_grads.down->B,
+            d_activated,
+            d_down_output, 0,  // offset 0 since down output is not packed
+            activated,
+            expert_lora_weights.down->A,
+            expert_lora_weights.down->B,
+            scaling,
+            intermediate, slice_buffer,
+            N, D, C, rank, accumulate,
+            handle, workspace, stream);
+    }
+
+    // Backward through gate projection LoRA (second half of gate_up at offset D)
+    // gate is at offset D in the fused gate_up tensor
+    if (expert_lora_weights.gate.has_value() && expert_lora_weights.gate->has_value() &&
+        expert_lora_grads.gate.has_value()) {
+        backward_lora_layer(
+            expert_lora_grads.gate->A,
+            expert_lora_grads.gate->B,
+            d_expert_input,
+            d_gate_up, D,  // gate is at offset D
+            expert_input,
+            expert_lora_weights.gate->A,
+            expert_lora_weights.gate->B,
+            scaling,
+            intermediate, slice_buffer,
+            N, C, D, rank, accumulate,
+            handle, workspace, stream);
+    }
+
+    // Backward through up projection LoRA (first half of gate_up at offset 0)
+    if (expert_lora_weights.up.has_value() && expert_lora_weights.up->has_value() &&
+        expert_lora_grads.up.has_value()) {
+        backward_lora_layer(
+            expert_lora_grads.up->A,
+            expert_lora_grads.up->B,
+            d_expert_input,
+            d_gate_up, 0,  // up is at offset 0
+            expert_input,
+            expert_lora_weights.up->A,
+            expert_lora_weights.up->B,
+            scaling,
+            intermediate, slice_buffer,
+            N, C, D, rank, accumulate,
+            handle, workspace, stream);
+    }
 }
 
 /**
@@ -552,6 +733,9 @@ public:
 
         const auto& cfg = mBaseModel->config();
 
+        // Check if this is an MoE model - per-expert LoRA is used instead of MLP LoRA
+        mIsMoEModel = (cfg.architecture == ArchitectureType::MoE);
+
         ModularLoRAWeightsManager::Config wm{};
         wm.num_layers = cfg.NumLayers;
         wm.hidden_size = cfg.HiddenSize;
@@ -563,6 +747,13 @@ public:
         wm.work_dtype = cfg.DType;
         wm.shard_idx = comm.rank();
         wm.num_shards = comm.world_size();
+        wm.is_moe = mIsMoEModel;
+        if (mIsMoEModel && cfg.moe_config.has_value()) {
+            wm.num_experts = cfg.moe_config->num_experts;
+            wm.moe_intermediate_size = cfg.moe_config->moe_intermediate_size > 0
+                                        ? cfg.moe_config->moe_intermediate_size
+                                        : cfg.IntermediateSize;
+        }
         mLoRAWeights = std::make_unique<ModularLoRAWeightsManager>(wm, *mAllocator);
 
         ModularLoRAGradsManager::Config gm{};
@@ -576,6 +767,13 @@ public:
         gm.grad_dtype = mLoRAConfig.dtype;
         gm.shard_idx = comm.rank();
         gm.num_shards = comm.world_size();
+        gm.is_moe = mIsMoEModel;
+        if (mIsMoEModel && cfg.moe_config.has_value()) {
+            gm.num_experts = cfg.moe_config->num_experts;
+            gm.moe_intermediate_size = cfg.moe_config->moe_intermediate_size > 0
+                                        ? cfg.moe_config->moe_intermediate_size
+                                        : cfg.IntermediateSize;
+        }
         mLoRAGrads = std::make_unique<ModularLoRAGradsManager>(gm, mAllocator);
     }
 
@@ -1295,6 +1493,22 @@ public:
                 collect_tensor(lora_w.mlp.down->A);
                 collect_tensor(lora_w.mlp.down->B);
             }
+
+            // MoE expert LoRA tensors
+            for (auto& expert : lora_w.moe.experts) {
+                if (expert.gate.has_value()) {
+                    collect_tensor(expert.gate->A);
+                    collect_tensor(expert.gate->B);
+                }
+                if (expert.up.has_value()) {
+                    collect_tensor(expert.up->A);
+                    collect_tensor(expert.up->B);
+                }
+                if (expert.down.has_value()) {
+                    collect_tensor(expert.down->A);
+                    collect_tensor(expert.down->B);
+                }
+            }
         }
 
         state.num_tensors = (int)h_param_ptrs.size();
@@ -1387,6 +1601,13 @@ public:
             collect_grad(lora_g.mlp.gate);
             collect_grad(lora_g.mlp.up);
             collect_grad(lora_g.mlp.down);
+
+            // MoE expert LoRA gradients
+            for (auto& expert : lora_g.moe.experts) {
+                collect_grad(expert.gate);
+                collect_grad(expert.up);
+                collect_grad(expert.down);
+            }
         }
 
         // Copy gradient pointers to device
@@ -1429,6 +1650,7 @@ public:
     // LoRA API (used by train.cpp debug / export)
     [[nodiscard]] bool lora_enabled() const { return mLoRAConfig.enabled(); }
     [[nodiscard]] bool qlora_enabled() const { return mQLoRAConfig.is_quantized(); }
+    [[nodiscard]] bool is_moe_model() const { return mIsMoEModel; }
     [[nodiscard]] std::size_t lora_num_parameters() const { return mLoRAWeights ? mLoRAWeights->num_parameters() : 0; }
 
     ModularTransformerModel<Block>& base_model() { return *mBaseModel; }
@@ -1555,6 +1777,13 @@ public:
             if (g.mlp.up.has_value()) { add(g.mlp.up->A); add(g.mlp.up->B); }
             if (g.mlp.down.has_value()) { add(g.mlp.down->A); add(g.mlp.down->B); }
 
+            // MoE expert LoRA gradients
+            for (const auto& expert : g.moe.experts) {
+                if (expert.gate.has_value()) { add(expert.gate->A); add(expert.gate->B); }
+                if (expert.up.has_value()) { add(expert.up->A); add(expert.up->B); }
+                if (expert.down.has_value()) { add(expert.down->A); add(expert.down->B); }
+            }
+
             deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem(), stream);
             if (comm.world_size() > 1) {
                 comm.reduce_norm(buf.template get<float>(), stream);
@@ -1614,6 +1843,15 @@ public:
         if (g.mlp.up.has_value()) out.emplace_back("up_proj", module_norm(g.mlp.up->A, g.mlp.up->B));
         if (g.mlp.down.has_value()) out.emplace_back("down_proj", module_norm(g.mlp.down->A, g.mlp.down->B));
 
+        // MoE expert LoRA gradients
+        for (int e = 0; e < (int)g.moe.experts.size(); ++e) {
+            const auto& expert = g.moe.experts[e];
+            std::string prefix = "expert" + std::to_string(e) + ".";
+            if (expert.gate.has_value()) out.emplace_back(prefix + "gate_proj", module_norm(expert.gate->A, expert.gate->B));
+            if (expert.up.has_value()) out.emplace_back(prefix + "up_proj", module_norm(expert.up->A, expert.up->B));
+            if (expert.down.has_value()) out.emplace_back(prefix + "down_proj", module_norm(expert.down->A, expert.down->B));
+        }
+
         return out;
     }
 
@@ -1627,6 +1865,18 @@ private:
         Tensor recompute_rstd; // (B, T) - buffer for recomputed rstd (unused but required by kernel)
         int B = 0;
         int T = 0;
+
+        // MoE expert LoRA state: pointers to current expert activations during hook execution.
+        // These are set by the MoE block before calling expert hooks and read by the hook callback.
+        // This avoids the need to pass activation pointers through the hook signature.
+        struct MoEExpertContext {
+            Tensor* expert_input = nullptr;   // (N, C) - input tokens routed to this expert
+            Tensor* gate_up = nullptr;        // (N, 2*D) - gate_up projection output
+            Tensor* activated = nullptr;      // (N, D) - activated value after SwiGLU
+            Tensor* output = nullptr;         // (N, C) - down projection output
+            int num_tokens = 0;               // N - number of tokens for this expert
+        };
+        MoEExpertContext moe_expert_ctx;
     };
 
     // 8-bit AdamW optimizer state for LoRA weights
@@ -1703,6 +1953,9 @@ private:
     std::unique_ptr<LoRAAdamW8BitState> mLoRAAdamW8BitState;
     std::unique_ptr<LoRANorMuonState> mLoRANorMuonState;
     std::unique_ptr<LoRARunState> mLoRARunState;
+
+    // MoE model flag - set in constructor, used to determine LoRA forward/backward paths
+    bool mIsMoEModel = false;
 
     // QLoRA: quantized base weight provider (FP8 with per-block scales)
     std::unique_ptr<FP8WeightProvider<Block>> mFP8WeightProvider;
@@ -2250,6 +2503,13 @@ private:
             if (g.mlp.gate.has_value()) { norm_squared(g.mlp.gate->A); norm_squared(g.mlp.gate->B); }
             if (g.mlp.up.has_value()) { norm_squared(g.mlp.up->A); norm_squared(g.mlp.up->B); }
             if (g.mlp.down.has_value()) { norm_squared(g.mlp.down->A); norm_squared(g.mlp.down->B); }
+
+            // MoE expert LoRA gradients
+            for (const auto& expert : g.moe.experts) {
+                if (expert.gate.has_value()) { norm_squared(expert.gate->A); norm_squared(expert.gate->B); }
+                if (expert.up.has_value()) { norm_squared(expert.up->A); norm_squared(expert.up->B); }
+                if (expert.down.has_value()) { norm_squared(expert.down->A); norm_squared(expert.down->B); }
+            }
         }
 
         deterministic_sum(buf.template get<float>(), buf.template get<float>(), buf.nelem() - 2, stream);

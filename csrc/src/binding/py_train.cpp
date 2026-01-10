@@ -19,6 +19,7 @@
 #include "modules/model_config.h"
 #include "modules/model_factory.h"
 #include "modules/composite/transformer_block.h"
+#include "modules/moe/moe_block.h"
 #include "modules/lora/lora_model.h"
 
 /**
@@ -493,10 +494,6 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         mod_config, mod_options, comm.rank(), comm.world_size(), allocator);
 
     if (mLoRAConfig.has_value()) {
-        if (mod_config.architecture != modules::ArchitectureType::Dense) {
-            throw std::runtime_error("MultiGPUPyTrainer: LoRA requires dense architecture");
-        }
-
         // Convert LoRAAdapterConfig -> modular LoRA config.
         modules::ModularLoRAConfig mod_lora;
         mod_lora.rank = mLoRAConfig->Rank;
@@ -520,22 +517,38 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
             }
         }
 
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
-        auto* dense_ptr = dynamic_cast<DenseModel*>(model_storage.get());
-        if (!dense_ptr) {
-            throw std::runtime_error("MultiGPUPyTrainer: modular factory returned non-dense model under dense config");
-        }
-
         // Build QLoRA config if provided
         modules::QLoRAConfig qlora_config;
         if (mQLoRAConfig.has_value()) {
             qlora_config = mQLoRAConfig.value();
         }
 
-        std::unique_ptr<DenseModel> dense_base(static_cast<DenseModel*>(model_storage.release()));
-        ctx.Model = std::make_unique<modules::ModularLoRAModel<DenseBlock>>(
-            std::move(dense_base), mod_lora, mOptions, comm, allocator, qlora_config);
+        // Create LoRA model based on architecture type
+        if (mod_config.architecture == modules::ArchitectureType::Dense) {
+            using DenseBlock = modules::DenseTransformerBlock<>;
+            using DenseModel = modules::ModularTransformerModel<DenseBlock>;
+            auto* dense_ptr = dynamic_cast<DenseModel*>(model_storage.get());
+            if (!dense_ptr) {
+                throw std::runtime_error("MultiGPUPyTrainer: modular factory returned non-dense model under dense config");
+            }
+
+            std::unique_ptr<DenseModel> dense_base(static_cast<DenseModel*>(model_storage.release()));
+            ctx.Model = std::make_unique<modules::ModularLoRAModel<DenseBlock>>(
+                std::move(dense_base), mod_lora, mOptions, comm, allocator, qlora_config);
+        } else if (mod_config.architecture == modules::ArchitectureType::MoE) {
+            using MoEBlock = modules::StandardMoEBlock;
+            using MoEModel = modules::ModularTransformerModel<MoEBlock>;
+            auto* moe_ptr = dynamic_cast<MoEModel*>(model_storage.get());
+            if (!moe_ptr) {
+                throw std::runtime_error("MultiGPUPyTrainer: modular factory returned non-MoE model under MoE config");
+            }
+
+            std::unique_ptr<MoEModel> moe_base(static_cast<MoEModel*>(model_storage.release()));
+            ctx.Model = std::make_unique<modules::ModularLoRAModel<MoEBlock>>(
+                std::move(moe_base), mod_lora, mOptions, comm, allocator, qlora_config);
+        } else {
+            throw std::runtime_error("MultiGPUPyTrainer: LoRA not yet supported for Hybrid architecture");
+        }
     } else {
         ctx.Model = std::move(model_storage);
     }

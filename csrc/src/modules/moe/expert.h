@@ -8,6 +8,7 @@
 #include "modules/module_base.h"
 #include "modules/primitives/linear.h"
 #include "modules/primitives/swiglu.h"
+#include "modules/forward_hooks.h"
 #include "kernels/kernels.h"
 #include "router.h"  // For RouterModule::RouterOutput
 
@@ -76,6 +77,27 @@ public:
     Tensor forward_impl(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts);
 
     /**
+     * @brief Forward pass with LoRA hook for applying per-expert LoRA
+     *
+     * The hook is called at two points:
+     * - AfterExpertUpProjection: After gate_up matmul, before SwiGLU activation
+     * - AfterExpertDownProjection: After down_proj matmul
+     *
+     * The hook can modify acts.gate_up and acts.output in place to apply LoRA.
+     *
+     * @param ctx Module context
+     * @param w Expert weights
+     * @param input Token representations routed to this expert (N, hidden_size)
+     * @param acts Activation storage
+     * @param expert_hook Hook function called at specific points
+     * @param layer_idx Layer index (passed to hook)
+     * @param expert_idx Expert index (passed to hook)
+     * @return Output (N, hidden_size)
+     */
+    Tensor forward_with_hook(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts,
+                             const MoEExpertHook& expert_hook, int layer_idx, int expert_idx);
+
+    /**
      * @brief Backward pass through expert MLP
      */
     Tensor backward_impl(ModuleContext& ctx, Weights& w, Activations& acts,
@@ -140,6 +162,69 @@ inline Tensor ExpertModule::forward_impl(
         C, N, D, EMMTranspose::TN, false,
         ctx.stream
     );
+
+    return acts.output;
+}
+
+inline Tensor ExpertModule::forward_with_hook(
+    ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts,
+    const MoEExpertHook& expert_hook, int layer_idx, int expert_idx) {
+
+    const int N = input.Sizes[0];
+    const int C = mConfig.hidden_size;
+    const int D = mConfig.intermediate_size;
+
+    acts.input = input;
+
+    if (mConfig.use_gated) {
+        // Gated activation (SwiGLU style)
+        matmul(
+            acts.gate_up, w.gate_proj, input, std::nullopt,
+            nullptr, nullptr,
+            ctx.cublas_handle, *ctx.workspace,
+            2 * D, N, C, EMMTranspose::TN, false,
+            ctx.stream
+        );
+
+        // Hook point: After gate_up projection, before SwiGLU
+        // LoRA can modify acts.gate_up in place here
+        if (expert_hook) {
+            expert_hook(layer_idx, expert_idx, MoEExpertHookPoint::AfterExpertUpProjection, ctx.stream);
+        }
+
+        // SwiGLU activation
+        swiglu_forward(acts.activated, acts.gate_up, nullptr, 1, N, D, ctx.stream);
+
+    } else {
+        matmul(
+            acts.gate_up, w.up_proj, input, std::nullopt,
+            nullptr, nullptr,
+            ctx.cublas_handle, *ctx.workspace,
+            D, N, C, EMMTranspose::TN, false,
+            ctx.stream
+        );
+
+        if (expert_hook) {
+            expert_hook(layer_idx, expert_idx, MoEExpertHookPoint::AfterExpertUpProjection, ctx.stream);
+        }
+
+        acts.activated = acts.gate_up;
+    }
+
+    // Down projection
+    matmul(
+        acts.output, w.down_proj, acts.activated, std::nullopt,
+        nullptr, nullptr,
+        ctx.cublas_handle, *ctx.workspace,
+        C, N, D, EMMTranspose::TN, false,
+        ctx.stream
+    );
+
+    // Hook point: After down projection
+    // LoRA can modify acts.output in place here
+    if (expert_hook) {
+        expert_hook(layer_idx, expert_idx, MoEExpertHookPoint::AfterExpertDownProjection, ctx.stream);
+    }
 
     return acts.output;
 }
@@ -305,11 +390,29 @@ public:
                         const RouterModule::RouterOutput& routing, Activations& acts);
 
     /**
+     * @brief Forward pass with per-expert hook for LoRA application
+     *
+     * @param ctx Module context
+     * @param w Expert weights
+     * @param input Token representations (B*T, hidden_size)
+     * @param routing Router output with dispatch information
+     * @param acts Activation storage
+     * @param expert_hook Called after each expert's forward pass (layer_idx, expert_idx, point, stream)
+     * @param layer_idx The layer index (passed to hook)
+     * @return Combined output (B*T, hidden_size)
+     */
+    Tensor forward_with_hook(ModuleContext& ctx, Weights& w, Tensor& input,
+                             const RouterModule::RouterOutput& routing, Activations& acts,
+                             const MoEExpertHook& expert_hook, int layer_idx);
+
+    /**
      * @brief Backward pass through expert group
      */
     Tensor backward_impl(ModuleContext& ctx, Weights& w, Activations& acts,
                          const RouterModule::RouterOutput& routing,
                          Tensor& grad_output, Gradients& grads, bool accumulate = false);
+
+    [[nodiscard]] const Config& config() const { return mConfig; }
 
 private:
     Config mConfig;
@@ -388,6 +491,78 @@ inline Tensor ExpertGroupModule::forward_impl(
 
     // Step 3: Unpermute and combine expert outputs weighted by routing weights
     // For each original token, gather outputs from its assigned experts and weight-combine
+    if (acts.expert_outputs.DType == ETensorDType::BF16) {
+        moe_unpermute_and_combine(
+            acts.combined_output.get<nv_bfloat16>(),
+            acts.expert_outputs.get<nv_bfloat16>(),
+            routing.routing_weights.get<nv_bfloat16>(),
+            acts.scatter_indices.get<int>(),
+            BT, total_tokens, C, K, ctx.stream
+        );
+    } else {
+        moe_unpermute_and_combine(
+            acts.combined_output.get<float>(),
+            acts.expert_outputs.get<float>(),
+            routing.routing_weights.get<float>(),
+            acts.scatter_indices.get<int>(),
+            BT, total_tokens, C, K, ctx.stream
+        );
+    }
+
+    return acts.combined_output;
+}
+
+inline Tensor ExpertGroupModule::forward_with_hook(
+    ModuleContext& ctx, Weights& w, Tensor& input,
+    const RouterModule::RouterOutput& routing, Activations& acts,
+    const MoEExpertHook& expert_hook, int layer_idx) {
+
+    const int BT = ctx.B * ctx.T;
+    const int C = mConfig.hidden_size;
+    const int E = mConfig.num_experts;
+    const int K = mConfig.top_k;
+    const int total_tokens = BT * K;
+
+    // Step 1: Permute tokens to expert-grouped order
+    if (input.DType == ETensorDType::BF16) {
+        moe_permute_tokens(
+            acts.permuted_input.get<nv_bfloat16>(),
+            input.get<nv_bfloat16>(),
+            acts.gather_indices.get<int>(),
+            total_tokens, BT, C, K, ctx.stream
+        );
+    } else {
+        moe_permute_tokens(
+            acts.permuted_input.get<float>(),
+            input.get<float>(),
+            acts.gather_indices.get<int>(),
+            total_tokens, BT, C, K, ctx.stream
+        );
+    }
+
+    // Step 2: Run experts on permuted tokens with hooks
+    acts.expert_acts.resize(E);
+    int offset = 0;
+
+    for (int e = 0; e < E; ++e) {
+        const int* h_count_ptr = routing.token_counts.get<int>();
+        int expert_tokens = h_count_ptr[e];
+
+        if (expert_tokens == 0) continue;
+
+        // Slice of permuted input for this expert
+        Tensor expert_input = slice(acts.permuted_input, 0, offset, offset + expert_tokens);
+        Tensor expert_output = slice(acts.expert_outputs, 0, offset, offset + expert_tokens);
+
+        // Run expert forward with hooks - this calls the hook at the right points
+        // (after gate_up matmul, after down matmul) within the expert forward pass
+        mExperts[e].forward_with_hook(ctx, w.experts[e], expert_input, acts.expert_acts[e],
+                                       expert_hook, layer_idx, e);
+
+        offset += expert_tokens;
+    }
+
+    // Step 3: Unpermute and combine expert outputs
     if (acts.expert_outputs.DType == ETensorDType::BF16) {
         moe_unpermute_and_combine(
             acts.combined_output.get<nv_bfloat16>(),

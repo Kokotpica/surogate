@@ -12,6 +12,7 @@
 #include "models/llama.h"
 #include "models/qwen25.h"
 #include "models/qwen3.h"
+#include "models/qwen3_moe.h"
 
 namespace models {
 
@@ -20,6 +21,7 @@ static const std::vector<ArchitectureOps>& registry() {
         LlamaArchitecture::ops(),
         Qwen25Architecture::ops(),
         Qwen3Architecture::ops(),
+        Qwen3MoEArchitecture::ops(),
     };
     return kRegistry;
 }

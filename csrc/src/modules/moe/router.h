@@ -40,6 +40,11 @@ public:
         float noise_std = 0.1f;     ///< Standard deviation of routing noise
         float capacity_factor = 1.25f;  ///< Expert capacity factor (tokens per expert)
         bool normalize_routing = true;  ///< Normalize routing weights to sum to 1
+
+        // Qwen3 MoE-style normalization
+        bool norm_topk_prob = false;  ///< Normalize top-k routing weights AFTER selection (Qwen3 style)
+                                      ///< When true: weights are normalized to sum to 1 after top-k selection
+                                      ///< When false: weights are the raw softmax probabilities
     };
 
     /**
@@ -170,20 +175,24 @@ inline RouterModule::RouterOutput RouterModule::forward_impl(
     }
 
     // Top-k selection
+    // norm_topk_prob (Qwen3 style): normalize selected weights to sum to 1 after top-k selection
+    // This differs from normalize_routing which normalizes before selection
+    const bool normalize_after_topk = mConfig.norm_topk_prob;
+
     RouterOutput output;
     if (acts.softmax_probs.DType == ETensorDType::BF16) {
         moe_topk_forward(
             output.expert_indices.get<int>(),
             output.routing_weights.get<nv_bfloat16>(),
             acts.softmax_probs.get<nv_bfloat16>(),
-            BT, E, K, mConfig.normalize_routing, ctx.stream
+            BT, E, K, normalize_after_topk, ctx.stream
         );
     } else {
         moe_topk_forward(
             output.expert_indices.get<int>(),
             output.routing_weights.get<float>(),
             acts.softmax_probs.get<float>(),
-            BT, E, K, mConfig.normalize_routing, ctx.stream
+            BT, E, K, normalize_after_topk, ctx.stream
         );
     }
 
@@ -374,9 +383,27 @@ public:
 
     explicit SwitchRouterModule(Config config) : mConfig(config) {}
 
-    Activations forward_impl(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts);
+    /**
+     * @brief Forward pass for Switch routing (top-1 selection)
+     * @return RouterOutput (same as standard router for MoE block compatibility)
+     */
+    RouterOutput forward_impl(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts) {
+        // TODO: Implement Switch-style top-1 routing
+        // For now, delegate to standard router logic with top_k=1
+        RouterOutput output;
+        output.routing_weights = acts.routing_weight;
+        output.expert_indices = acts.expert_index;
+        output.aux_loss = 0.0f;
+        output.z_loss = 0.0f;
+        return output;
+    }
+
     Tensor backward_impl(ModuleContext& ctx, Weights& w, Activations& acts,
-                         Tensor& grad_output, Gradients& grads, bool accumulate = false);
+                         Tensor& grad_output, Gradients& grads, bool accumulate = false) {
+        // TODO: Implement Switch routing backward
+        // Placeholder: return empty gradient
+        return Tensor{};
+    }
 
 private:
     Config mConfig;

@@ -133,6 +133,20 @@ public:
     Tensor forward_impl(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts);
 
     /**
+     * @brief Forward pass with per-expert hook for LoRA
+     *
+     * @param ctx Module context
+     * @param w Block weights
+     * @param input Input tensor (B, T, hidden_size)
+     * @param acts Activation storage
+     * @param expert_hook Hook called for each expert (for LoRA application)
+     * @param layer_idx The layer index (passed to hook)
+     * @return Output tensor (B, T, hidden_size)
+     */
+    Tensor forward_with_expert_hook(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts,
+                                     const MoEExpertHook& expert_hook, int layer_idx);
+
+    /**
      * @brief Backward pass through MoE block
      */
     Tensor backward_impl(ModuleContext& ctx, Weights& w, Activations& acts,
@@ -258,10 +272,12 @@ Tensor MoETransformerBlock<AttentionType, RouterType, NormType>::forward_impl(
     flat_input.Sizes[1] = C;
     flat_input.Rank = 2;
 
-    acts.routing = mRouter.forward(ctx, w.router, flat_input, acts.router);
+    // Router has non-standard return type (RouterOutput), call forward_impl directly
+    acts.routing = mRouter.forward_impl(ctx, w.router, flat_input, acts.router);
 
     // Expert group: dispatch, compute, combine
-    Tensor expert_out = mExperts.forward(ctx, w.experts, flat_input, acts.routing, acts.experts);
+    // ExpertGroup has non-standard signature (takes routing), call forward_impl directly
+    Tensor expert_out = mExperts.forward_impl(ctx, w.experts, flat_input, acts.routing, acts.experts);
 
     // Add shared expert output if configured
     if (mSharedExpert && w.shared_expert.has_value()) {
@@ -281,6 +297,78 @@ Tensor MoETransformerBlock<AttentionType, RouterType, NormType>::forward_impl(
     // Second residual connection: output = residual_att + moe_output
     // This will be handled by the next block's fused LN1 (or done explicitly for last block)
     // Return the MoE output - caller handles final residual
+    return acts.moe_output;
+}
+
+template<typename AttentionType, typename RouterType, typename NormType>
+Tensor MoETransformerBlock<AttentionType, RouterType, NormType>::forward_with_expert_hook(
+    ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts,
+    const MoEExpertHook& expert_hook, int layer_idx) {
+
+    const int B = ctx.B;
+    const int T = ctx.T;
+    const int C = mConfig.hidden_size;
+    const long N = static_cast<long>(B) * T * C;
+
+    // ========================================================================
+    // Attention block: LN1 -> Attention -> Residual (same as forward_impl)
+    // ========================================================================
+
+    Tensor ln1_out;
+    if constexpr (std::is_same_v<NormType, FusedResidualRMSNormModule>) {
+        RMSNormModule standalone_ln1({mConfig.hidden_size, mConfig.rms_norm_eps});
+        RMSNormModule::Activations standalone_acts;
+        RMSNormModule::Weights standalone_weights{w.ln1.weight};
+        ln1_out = standalone_ln1.forward(ctx, standalone_weights, input, standalone_acts);
+        acts.ln1.output.Value = ln1_out;
+        acts.ln1.rstd = standalone_acts.rstd;
+    } else {
+        ln1_out = mLN1.forward(ctx, w.ln1, input, acts.ln1);
+    }
+
+    Tensor att_out = mAttention.forward(ctx, w.attention, ln1_out, acts.attention);
+
+    // ========================================================================
+    // MoE block with expert hooks for LoRA
+    // ========================================================================
+
+    Tensor ln2_out;
+    if constexpr (std::is_same_v<NormType, FusedResidualRMSNormModule>) {
+        FusedResidualRMSNormModule ln2({mConfig.hidden_size, mConfig.rms_norm_eps});
+        ln2.forward_with_residual(ctx, w.ln2, att_out, input, acts.ln2);
+        acts.residual_att = acts.ln2.residual_out;
+        ln2_out = acts.ln2.output.Value;
+    } else {
+        vector_add_sr(acts.residual_att, input, att_out, 1.0f, N, /*seed=*/0, ctx.stream);
+        ln2_out = mLN2.forward(ctx, w.ln2, acts.residual_att, acts.ln2);
+    }
+
+    // Router
+    Tensor flat_input = ln2_out;
+    flat_input.Sizes[0] = B * T;
+    flat_input.Sizes[1] = C;
+    flat_input.Rank = 2;
+
+    acts.routing = mRouter.forward_impl(ctx, w.router, flat_input, acts.router);
+
+    // Expert group with hooks - this is the key difference from forward_impl
+    Tensor expert_out = mExperts.forward_with_hook(ctx, w.experts, flat_input, acts.routing, acts.experts,
+                                                    expert_hook, layer_idx);
+
+    // Shared expert
+    if (mSharedExpert && w.shared_expert.has_value()) {
+        Tensor shared_out = mSharedExpert->forward_all(ctx, *w.shared_expert, flat_input,
+                                                        *acts.shared_expert);
+        vector_add_sr(expert_out, expert_out, shared_out, 1.0f, B * T * C, /*seed=*/0, ctx.stream);
+    }
+
+    // Reshape back
+    acts.moe_output = expert_out;
+    acts.moe_output.Sizes[0] = B;
+    acts.moe_output.Sizes[1] = T;
+    acts.moe_output.Sizes[2] = C;
+    acts.moe_output.Rank = 3;
+
     return acts.moe_output;
 }
 
@@ -313,9 +401,9 @@ Tensor MoETransformerBlock<AttentionType, RouterType, NormType>::backward_impl(
                                                        d_moe_output, *grads.shared_expert, accumulate);
     }
 
-    // Backward through expert group
-    Tensor d_flat_input = mExperts.backward(ctx, w.experts, acts.experts, acts.routing,
-                                            d_moe_output, grads.experts, accumulate);
+    // Backward through expert group (non-standard signature)
+    Tensor d_flat_input = mExperts.backward_impl(ctx, w.experts, acts.experts, acts.routing,
+                                                  d_moe_output, grads.experts, accumulate);
 
     // Add gradient from shared expert
     if (d_flat_input_shared.Data) {

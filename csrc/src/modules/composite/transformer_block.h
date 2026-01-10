@@ -64,6 +64,8 @@ public:
                 .num_kv_heads = num_kv_heads,
                 .rope = rope,
                 .use_qkv_bias = use_qkv_bias,
+                .use_qk_norm = use_qk_norm,
+                .qk_norm_eps = rms_norm_eps,  // Use same epsilon as layer norm
                 .head_size = head_size
             };
         }

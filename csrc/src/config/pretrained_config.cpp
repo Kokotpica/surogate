@@ -34,6 +34,8 @@ PretrainedConfig load_pretrained_config(const char* file_name, ETensorDType dtyp
             return "Qwen2";
         case PretrainedConfig::QWEN3:
             return "Qwen3";
+        case PretrainedConfig::QWEN3_MOE:
+            return "Qwen3-MoE";
         case PretrainedConfig::LLAMA:
             return "LLaMA";
         default:
