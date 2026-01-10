@@ -85,6 +85,7 @@ PretrainedConfig create_test_config(int num_layers = 2, int vocab_size = 128) {
 RuntimeOptions create_test_options() {
     RuntimeOptions opts;
     opts.UseCudaGraphs = false;
+    opts.RecomputeBlock = false;
     opts.ModelType = ETensorDType::BF16;
     opts.MatmulType = ETensorDType::BF16;
     opts.MasterDType = ETensorDType::BF16;
@@ -697,6 +698,7 @@ TEST_CASE("Modular LoRA: base weights stay fixed, adapter weights update", "[mod
 
         PretrainedConfig cfg = create_test_config(/*num_layers=*/1, /*vocab_size=*/128);
         RuntimeOptions opts = create_test_options();
+        opts.RecomputeBlock = false;
 
         // Build base dense model.
         auto allocator = std::make_shared<TensorAllocator>();

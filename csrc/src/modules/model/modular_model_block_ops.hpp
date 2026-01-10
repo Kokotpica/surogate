@@ -504,10 +504,10 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 	            const Tensor& qkv_for_attn = (a.qkv_rope.Data != nullptr) ? a.qkv_rope : a.qkv;
 	            const int chunks = mOptions.attention_bwd_chunks;
 	            if (chunks < 1) {
-	                throw std::invalid_argument("attention_bwd_chunks must be >= 1");
+	                throw std::runtime_error("attention_bwd_chunks must be >= 1");
 	            }
 	            if (chunks > 1 && B % chunks != 0) {
-	                throw std::invalid_argument(fmt::format(
+	                throw std::runtime_error(fmt::format(
 	                    "attn_bwd_chunks ({}) must evenly divide per_device_train_batch_size ({}). "
 	                    "Either increase batch size to a multiple of {} or reduce attn_bwd_chunks.",
 	                    chunks, B, chunks));

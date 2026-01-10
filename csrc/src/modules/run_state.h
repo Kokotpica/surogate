@@ -1616,10 +1616,10 @@ void ModularRunState<Block>::allocate_scratch_buffers(DeviceMemoryStack& stack) 
     int HS = mConfig.block_config.head_size;
     const int attn_chunks = mConfig.attention_bwd_chunks;
     if (attn_chunks < 1) {
-        throw std::invalid_argument("attention_bwd_chunks must be >= 1");
+        throw std::runtime_error("attention_bwd_chunks must be >= 1");
     }
     if (attn_chunks > 1 && B % attn_chunks != 0) {
-        throw std::invalid_argument(fmt::format(
+        throw std::runtime_error(fmt::format(
             "attn_bwd_chunks ({}) must evenly divide per_device_train_batch_size ({}). "
             "Either increase batch size to a multiple of {} or reduce attn_bwd_chunks.",
             attn_chunks, B, attn_chunks));
