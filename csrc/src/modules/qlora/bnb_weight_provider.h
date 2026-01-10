@@ -403,6 +403,14 @@ template<typename Block>
 typename BnBWeightProvider<Block>::BlockWeights& BnBWeightProvider<Block>::get_block(
     int layer_idx, cudaStream_t stream) {
 
+    // For MoE models, use the MoE-specific path that only handles attention weights
+    // MoE models don't have dense MLP weights - they have per-expert weights instead
+    if (is_moe()) {
+        get_moe_attention_weights(layer_idx, stream);
+        return mDequantBlock;
+    }
+
+    // Dense model path
     const auto& qblock = mBnBWeights->get_bnb_block(layer_idx);
 
     // Check if we already have this layer dequantized in the current step

@@ -373,6 +373,14 @@ template<typename Block>
 typename FP4WeightProvider<Block>::BlockWeights& FP4WeightProvider<Block>::get_block(
     int layer_idx, cudaStream_t stream) {
 
+    // For MoE models, use the MoE-specific path that only handles attention weights
+    // MoE models don't have dense MLP weights - they have per-expert weights instead
+    if (is_moe()) {
+        get_moe_attention_weights(layer_idx, stream);
+        return mDequantBlock;
+    }
+
+    // Dense model path
     const auto& fp4_block = mFP4Weights->get_fp4_block(layer_idx);
 
     // Check if we already have this layer dequantized in the current step

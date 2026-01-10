@@ -174,9 +174,15 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
                 breakdown_ctx.batch_size = B;
                 breakdown_ctx.seq_length = T;
 
-                // Get QLoRA stats if applicable
+                // Get QLoRA stats if applicable (try dense model first, then MoE)
                 using DenseBlock = modules::DenseTransformerBlock<>;
+                using MoEBlock = modules::StandardMoEBlock;
                 if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get())) {
+                    if (lora_model->qlora_enabled()) {
+                        breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
+                        breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
+                    }
+                } else if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<MoEBlock>*>(ctx.Model.get())) {
                     if (lora_model->qlora_enabled()) {
                         breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
                         breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
@@ -226,10 +232,19 @@ void MultiGPUPyTrainer::export_model(std::string path) {
  */
 void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_path) {
     run_work([path, base_model_path](sThreadContext& ctx) {
+        // Try dense model first
         using DenseBlock = modules::DenseTransformerBlock<>;
-        auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get());
-        if (!lora_model) throw std::runtime_error("export_adapter: Model is not a modular LoRA model.");
-        lora_model->export_adapter(path, *ctx.Communicator, base_model_path);
+        if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get())) {
+            lora_model->export_adapter(path, *ctx.Communicator, base_model_path);
+            return;
+        }
+        // Try MoE model
+        using MoEBlock = modules::StandardMoEBlock;
+        if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<MoEBlock>*>(ctx.Model.get())) {
+            lora_model->export_adapter(path, *ctx.Communicator, base_model_path);
+            return;
+        }
+        throw std::runtime_error("export_adapter: Model is not a modular LoRA model (dense or MoE).");
     });
 }
 
@@ -703,13 +718,7 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_gradients(int
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradients(int gpu_id) {
     std::vector<std::pair<std::string, Tensor>> result;
     run_work([&result](sThreadContext& ctx) {
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get());
-        if (!lora_model) throw std::runtime_error("get_lora_gradients: model is not a modular LoRA model");
-
-        const auto& config = lora_model->base_model().config();
-        CUDA_CHECK(cudaDeviceSynchronize());
-
+        // Helper to add LoRA layer gradients
         auto add_layer = [&](const std::string& module_prefix,
                              const std::optional<modules::LoRALayerWeights<Tensor>>& layer) {
             if (!layer.has_value()) return;
@@ -717,22 +726,62 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
             if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
         };
 
-        for (int l = 0; l < config.NumLayers; ++l) {
-            bool unused_accumulate = false;
-            auto& block = lora_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
-            std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
+        // Try dense model first
+        using DenseBlock = modules::DenseTransformerBlock<>;
+        if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<DenseBlock>*>(ctx.Model.get())) {
+            const auto& config = lora_model->base_model().config();
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-            add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-            add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-            add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-            add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+            for (int l = 0; l < config.NumLayers; ++l) {
+                bool unused_accumulate = false;
+                auto& block = lora_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
+                std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
 
-            add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-            add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-            add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
+                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
+                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
+                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+
+                add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            return;
         }
 
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // Try MoE model
+        using MoEBlock = modules::StandardMoEBlock;
+        if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<MoEBlock>*>(ctx.Model.get())) {
+            const auto& config = lora_model->base_model().config();
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            for (int l = 0; l < config.NumLayers; ++l) {
+                bool unused_accumulate = false;
+                auto& block = lora_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
+                std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
+
+                // Attention LoRA (same for dense and MoE)
+                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
+                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
+                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
+                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
+
+                // MoE models use per-expert LoRA, not dense MLP LoRA
+                // Expert gradients are in block.moe.experts[e].{gate, up, down}
+                for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                    auto& expert = block.moe.experts[e];
+                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                    add_layer(expert_prefix + ".gate_proj", expert.gate);
+                    add_layer(expert_prefix + ".up_proj", expert.up);
+                    add_layer(expert_prefix + ".down_proj", expert.down);
+                }
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            return;
+        }
+
+        throw std::runtime_error("get_lora_gradients: model is not a modular LoRA model (dense or MoE)");
     }, gpu_id);
     return result;
 }

@@ -515,6 +515,14 @@ void FP8WeightProvider<Block>::import_and_quantize(
 
 template<typename Block>
 typename FP8WeightProvider<Block>::BlockWeights& FP8WeightProvider<Block>::get_block(int layer_idx, cudaStream_t stream) {
+    // For MoE models, use the MoE-specific path that only handles attention weights
+    // MoE models don't have dense MLP weights - they have per-expert weights instead
+    if (is_moe()) {
+        get_moe_attention_weights(layer_idx, stream);
+        return mDequantBlock;
+    }
+
+    // Dense model path
     const auto& qblock = mFP8Weights->get_quantized_block(layer_idx);
 
     // **OPTIMIZATION: Native FP8 Path (Fused Conversion)**
