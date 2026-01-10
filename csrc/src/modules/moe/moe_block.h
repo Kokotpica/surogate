@@ -49,6 +49,7 @@ public:
         RoPEConfig rope;  // Flexible RoPE configuration
         int max_seq_len = 2048;
         bool use_qkv_bias = false;
+        bool use_qk_norm = false;  ///< Use QK normalization (Qwen3 style)
 
         // MoE configuration
         int num_experts = 8;

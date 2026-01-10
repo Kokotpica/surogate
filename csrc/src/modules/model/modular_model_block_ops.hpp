@@ -301,7 +301,19 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             g.d_mlp_down_weight;
         };
 
-    if constexpr (!kDenseLike) {
+    // Check if this is an MoE block
+    constexpr bool kMoELike =
+        has_moe_weights<BlockWeights>::value &&
+        requires(BlockWeights w) {
+            w.ln2.weight;
+            w.attention.qkv_weight;
+            w.attention.out_weight;
+            w.router.gate;
+            w.experts.gate_up_proj;
+            w.experts.down_proj;
+        };
+
+    if constexpr (!kDenseLike && !kMoELike) {
         (void)weights;
         (void)grads;
         (void)acts;
@@ -309,6 +321,10 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
         if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeLayerBackward);
         if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward);
         throw std::runtime_error("ModularTransformerModel::backward_block: simplified backward is not implemented for this block type");
+    } else if constexpr (kMoELike) {
+        // MoE backward path - LoRA-only mode (no base weight gradients)
+        // This path only computes gradient flow for LoRA training, not base model gradients
+        backward_block_moe(layer_idx, accumulate, weights, grads, acts, d_acts, hook);
     } else {
         auto with_ctx = [&](const char* stage, const auto& fn) {
             try {
@@ -691,6 +707,511 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 
         if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward);
     }
+}
+
+template<typename Block>
+void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accumulate, BlockWeights& weights,
+                                                         BlockGradients& grads, BlockActivations& acts,
+                                                         typename ModularRunState<Block>::BlockGradients& d_acts,
+                                                         const BackwardBlockHook* hook) {
+    NVTX_RANGE_FN();
+
+    auto& rs = *mRunState;
+    cudaStream_t stream = rs.MainStream;
+
+    // Dimensions
+    const int B = (int)rs.B;
+    const int T = (int)rs.T;
+    const int C = (int)mConfig.HiddenSize;
+    const int Hq = (int)mConfig.NumQueryHeads;
+    const int Hkv = (int)mConfig.NumKeyValHeads;
+    const int Hs = (int)mConfig.head_size();
+    const int qkv_channels = (int)mConfig.qkv_channels();
+    const int BT = B * T;
+
+    // MoE config
+    assert(mConfig.moe_config.has_value() && "MoE config must be set for MoE blocks");
+    const auto& moe_cfg = *mConfig.moe_config;
+    const int num_experts = moe_cfg.num_experts;
+    const int top_k = moe_cfg.top_k;
+    const int expert_D = moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : (int)mConfig.IntermediateSize;
+    const int total_expert_tokens = BT * top_k;
+    const int dev = rs.DeviceId;
+
+    // Use the simplified activation/gradient buffers
+    auto& a = rs.simplified_acts(layer_idx);
+    auto& da = rs.simplified_grads(layer_idx);
+
+    // LoRA-only mode: skip computing base weight gradients (only compute dinp for gradient flow)
+    const bool lora_only = rs.is_lora_only_mode();
+
+    // In full-block recompute mode, keep the large backward intermediates stack-backed.
+    const bool stack_large_bwd_temps = rs.large_bwd_temps_on_stack();
+
+    auto with_ctx = [&](const char* stage, const auto& fn) {
+        try {
+            fn();
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "ModularTransformerModel::backward_block_moe layer " + std::to_string(layer_idx) + " (" + stage + "): " + e.what());
+        }
+    };
+
+    // Hooks: layer start
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeLayerBackward);
+
+    // ================================================================================
+    // MLP (MoE) Backward Pass
+    // ================================================================================
+    // For LoRA-only mode, we need to:
+    // 1. Backward through expert down projections -> d_swiglu
+    // 2. Backward through SwiGLU -> d_mlp_up (gate_up)
+    // 3. Backward through expert up projections -> d_ln2
+    // 4. Backward through LN2 -> d_residual_att
+
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPDownBackward);
+
+    // For MoE backward, we need the expert offsets and indices from forward pass
+    // These should be stored in activations (a.moe_*) but for LoRA-only mode,
+    // we recompute routing to get the same expert assignments
+
+    // Allocate temporary tensors for MoE backward
+    Tensor router_logits{ETensorDType::FP32, {BT, num_experts}, nullptr, nullptr, 2, dev};
+    Tensor router_probs{ETensorDType::FP32, {BT, num_experts}, nullptr, nullptr, 2, dev};
+    Tensor routing_weights_fp32{ETensorDType::FP32, {BT, top_k}, nullptr, nullptr, 2, dev};
+    Tensor expert_indices{ETensorDType::INT32, {BT, top_k}, nullptr, nullptr, 2, dev};
+    Tensor expert_counts{ETensorDType::INT32, {num_experts}, nullptr, nullptr, 1, dev};
+    Tensor expert_offsets{ETensorDType::INT32, {num_experts + 1}, nullptr, nullptr, 1, dev};
+    Tensor expert_positions{ETensorDType::INT32, {num_experts}, nullptr, nullptr, 1, dev};
+    Tensor gather_indices{ETensorDType::INT32, {total_expert_tokens}, nullptr, nullptr, 1, dev};
+    Tensor scatter_indices{ETensorDType::INT32, {total_expert_tokens}, nullptr, nullptr, 1, dev};
+
+    rs.temp_acquire(router_logits);
+    rs.temp_acquire(router_probs);
+    rs.temp_acquire(routing_weights_fp32);
+    rs.temp_acquire(expert_indices);
+    rs.temp_acquire(expert_counts);
+    rs.temp_acquire(expert_offsets);
+    rs.temp_acquire(expert_positions);
+    rs.temp_acquire(gather_indices);
+    rs.temp_acquire(scatter_indices);
+
+    fill_zero(expert_counts, stream);
+    fill_zero(expert_positions, stream);
+
+    // Create flat view of ln2
+    Tensor flat_ln2;
+    flat_ln2.Data = a.ln2.Data;
+    flat_ln2.DType = a.ln2.DType;
+    flat_ln2.Sizes[0] = BT;
+    flat_ln2.Sizes[1] = C;
+    flat_ln2.Rank = 2;
+    flat_ln2.Device = dev;
+
+    // Recompute routing (same as forward)
+    with_ctx("moe_router_recompute", [&]() {
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            matmul(
+                router_logits, weights.router.gate, flat_ln2, std::nullopt,
+                nullptr, nullptr,
+                rs.CublasLtHandle, rs.CuBlasWorkspace,
+                num_experts, BT, C, EMMTranspose::TN, false,
+                stream
+            );
+
+            moe_softmax_forward(
+                router_probs.get<float>(),
+                router_logits.get<float>(),
+                BT, num_experts, stream
+            );
+
+            moe_topk_forward(
+                expert_indices.get<int>(),
+                routing_weights_fp32.get<float>(),
+                router_probs.get<float>(),
+                BT, num_experts, top_k, true, stream
+            );
+
+            moe_compute_expert_counts(
+                expert_counts.get<int>(),
+                expert_indices.get<int>(),
+                BT, top_k, num_experts, stream
+            );
+
+            moe_compute_expert_offsets(
+                expert_offsets.get<int>(),
+                expert_counts.get<int>(),
+                num_experts, stream
+            );
+
+            moe_build_indices(
+                gather_indices.get<int>(),
+                scatter_indices.get<int>(),
+                expert_indices.get<int>(),
+                expert_offsets.get<int>(),
+                expert_positions.get<int>(),
+                BT, top_k, num_experts, stream
+            );
+        }
+    });
+
+    // Allocate expert backward temporaries
+    Tensor permuted_input{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
+    Tensor expert_gate_up{a.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
+    Tensor expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+    Tensor expert_outputs{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
+    Tensor d_expert_outputs{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
+    Tensor d_expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+    Tensor d_expert_gate_up{a.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
+    Tensor d_permuted_input{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
+
+    rs.temp_acquire(permuted_input);
+    rs.temp_acquire(expert_gate_up);
+    rs.temp_acquire(expert_swiglu);
+    rs.temp_acquire(expert_outputs);
+    rs.temp_acquire(d_expert_outputs);
+    rs.temp_acquire(d_expert_swiglu);
+    rs.temp_acquire(d_expert_gate_up);
+    rs.temp_acquire(d_permuted_input);
+
+    fill_zero(d_permuted_input, stream);
+
+    // Recompute forward pass for expert activations (needed for backward)
+    with_ctx("moe_expert_recompute", [&]() {
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            // Permute tokens
+            if (a.ln2.DType == ETensorDType::BF16) {
+                moe_permute_tokens(
+                    permuted_input.get<nv_bfloat16>(),
+                    flat_ln2.get<nv_bfloat16>(),
+                    gather_indices.get<int>(),
+                    total_expert_tokens, BT, C, top_k, stream
+                );
+            } else {
+                moe_permute_tokens(
+                    permuted_input.get<float>(),
+                    flat_ln2.get<float>(),
+                    gather_indices.get<int>(),
+                    total_expert_tokens, BT, C, top_k, stream
+                );
+            }
+
+            fill_zero(expert_outputs, stream);
+
+            // Copy expert_offsets to host for sequential expert dispatch
+            std::vector<int> h_expert_offsets(num_experts + 1);
+            CUDA_CHECK(cudaMemcpyAsync(h_expert_offsets.data(), expert_offsets.get<int>(),
+                                       (num_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            // Recompute expert forward pass to get activations
+            for (int e = 0; e < num_experts; ++e) {
+                int start = h_expert_offsets[e];
+                int end = h_expert_offsets[e + 1];
+                int expert_tokens = end - start;
+                if (expert_tokens == 0) continue;
+
+                // Slice tensors for this expert's tokens
+                Tensor exp_inp = slice(permuted_input, 0, start, end);
+                Tensor exp_gate_up = slice(expert_gate_up, 0, start, end);
+                Tensor exp_swiglu = slice(expert_swiglu, 0, start, end);
+                Tensor exp_out = slice(expert_outputs, 0, start, end);
+
+                // Get this expert's weights
+                Tensor exp_gate_up_w = slice(weights.experts.gate_up_proj, 0, e, e + 1);
+                exp_gate_up_w.Sizes[0] = 2 * expert_D;
+                exp_gate_up_w.Sizes[1] = C;
+                exp_gate_up_w.Rank = 2;
+
+                Tensor exp_down_w = slice(weights.experts.down_proj, 0, e, e + 1);
+                exp_down_w.Sizes[0] = C;
+                exp_down_w.Sizes[1] = expert_D;
+                exp_down_w.Rank = 2;
+
+                // Gate+Up projection
+                matmul(
+                    exp_gate_up, exp_gate_up_w, exp_inp, std::nullopt,
+                    nullptr, nullptr,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace,
+                    2 * expert_D, expert_tokens, C, EMMTranspose::TN, false,
+                    stream
+                );
+
+                // SwiGLU activation
+                swiglu_forward(exp_swiglu, exp_gate_up, nullptr, 1, expert_tokens, expert_D, stream);
+
+                // Down projection
+                matmul(
+                    exp_out, exp_down_w, exp_swiglu, std::nullopt,
+                    nullptr, nullptr,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace,
+                    C, expert_tokens, expert_D, EMMTranspose::TN, false,
+                    stream
+                );
+            }
+        }
+    });
+
+    // Backward through combine (unpermute + weight)
+    with_ctx("moe_combine_backward", [&]() {
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            // d_res_ffn is the gradient from the residual connection
+            // We need to backward through the combine operation
+
+            if (da.d_res_ffn.DType == ETensorDType::BF16) {
+                // For BF16, routing weight gradients are also BF16
+                Tensor d_routing_weights{ETensorDType::BF16, {BT, top_k}, nullptr, nullptr, 2, dev};
+                Tensor routing_weights_bf16{ETensorDType::BF16, {BT, top_k}, nullptr, nullptr, 2, dev};
+                rs.temp_acquire(d_routing_weights);
+                rs.temp_acquire(routing_weights_bf16);
+
+                // Convert routing weights to BF16
+                convert_dtype(routing_weights_bf16.get<nv_bfloat16>(),
+                              routing_weights_fp32.get<float>(),
+                              BT * top_k, stream);
+
+                Tensor d_res_ffn_bf16 = da.d_res_ffn;
+                d_res_ffn_bf16.Sizes[0] = BT;
+                d_res_ffn_bf16.Sizes[1] = C;
+                d_res_ffn_bf16.Rank = 2;
+
+                moe_combine_backward(
+                    d_expert_outputs.get<nv_bfloat16>(),
+                    d_routing_weights.get<nv_bfloat16>(),
+                    d_res_ffn_bf16.get<nv_bfloat16>(),
+                    expert_outputs.get<nv_bfloat16>(),
+                    routing_weights_bf16.get<nv_bfloat16>(),
+                    scatter_indices.get<int>(),
+                    BT, total_expert_tokens, C, top_k, stream
+                );
+
+                rs.temp_free(routing_weights_bf16);
+                rs.temp_free(d_routing_weights);
+            } else {
+                // For FP32
+                Tensor d_routing_weights{ETensorDType::FP32, {BT, top_k}, nullptr, nullptr, 2, dev};
+                rs.temp_acquire(d_routing_weights);
+
+                Tensor d_res_ffn_fp32 = da.d_res_ffn;
+                d_res_ffn_fp32.Sizes[0] = BT;
+                d_res_ffn_fp32.Sizes[1] = C;
+                d_res_ffn_fp32.Rank = 2;
+
+                moe_combine_backward(
+                    d_expert_outputs.get<float>(),
+                    d_routing_weights.get<float>(),
+                    d_res_ffn_fp32.get<float>(),
+                    expert_outputs.get<float>(),
+                    routing_weights_fp32.get<float>(),
+                    scatter_indices.get<int>(),
+                    BT, total_expert_tokens, C, top_k, stream
+                );
+
+                rs.temp_free(d_routing_weights);
+            }
+        }
+    });
+
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward);
+
+    // Backward through each expert
+    with_ctx("moe_expert_backward", [&]() {
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            std::vector<int> h_expert_offsets(num_experts + 1);
+            CUDA_CHECK(cudaMemcpyAsync(h_expert_offsets.data(), expert_offsets.get<int>(),
+                                       (num_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            for (int e = 0; e < num_experts; ++e) {
+                int start = h_expert_offsets[e];
+                int end = h_expert_offsets[e + 1];
+                int expert_tokens = end - start;
+                if (expert_tokens == 0) continue;
+
+                // Slice tensors for this expert
+                Tensor exp_inp = slice(permuted_input, 0, start, end);
+                Tensor exp_gate_up = slice(expert_gate_up, 0, start, end);
+                Tensor exp_swiglu = slice(expert_swiglu, 0, start, end);
+                Tensor d_exp_out = slice(d_expert_outputs, 0, start, end);
+                Tensor d_exp_swiglu = slice(d_expert_swiglu, 0, start, end);
+                Tensor d_exp_gate_up = slice(d_expert_gate_up, 0, start, end);
+                Tensor d_exp_inp = slice(d_permuted_input, 0, start, end);
+
+                // Get this expert's weights
+                Tensor exp_gate_up_w = slice(weights.experts.gate_up_proj, 0, e, e + 1);
+                exp_gate_up_w.Sizes[0] = 2 * expert_D;
+                exp_gate_up_w.Sizes[1] = C;
+                exp_gate_up_w.Rank = 2;
+
+                Tensor exp_down_w = slice(weights.experts.down_proj, 0, e, e + 1);
+                exp_down_w.Sizes[0] = C;
+                exp_down_w.Sizes[1] = expert_D;
+                exp_down_w.Rank = 2;
+
+                // Backward through down projection: d_exp_swiglu = d_exp_out @ exp_down_w
+                matmul(
+                    d_exp_swiglu, exp_down_w, d_exp_out, std::nullopt,
+                    nullptr, nullptr,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace,
+                    expert_D, expert_tokens, C, EMMTranspose::NN, false,
+                    stream
+                );
+
+                // Backward through SwiGLU: d_exp_gate_up from d_exp_swiglu and exp_gate_up
+                swiglu_backward(d_exp_gate_up, d_exp_swiglu, exp_gate_up, nullptr, 1, expert_tokens, expert_D, stream);
+
+                // Backward through gate+up projection: d_exp_inp = d_exp_gate_up @ exp_gate_up_w
+                matmul(
+                    d_exp_inp, exp_gate_up_w, d_exp_gate_up, std::nullopt,
+                    nullptr, nullptr,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace,
+                    C, expert_tokens, 2 * expert_D, EMMTranspose::NN, false,
+                    stream
+                );
+            }
+        }
+    });
+
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPUpBackward);
+
+    // Backward through permutation: scatter d_permuted_input back to d_ln2
+    with_ctx("moe_permute_backward", [&]() {
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            if (da.d_ln2.DType == ETensorDType::BF16) {
+                Tensor d_ln2_flat = da.d_ln2;
+                d_ln2_flat.Sizes[0] = BT;
+                d_ln2_flat.Sizes[1] = C;
+                d_ln2_flat.Rank = 2;
+
+                moe_permute_backward(
+                    d_ln2_flat.get<nv_bfloat16>(),
+                    d_permuted_input.get<nv_bfloat16>(),
+                    gather_indices.get<int>(),
+                    total_expert_tokens, BT, C, top_k, stream
+                );
+            } else {
+                Tensor d_ln2_flat = da.d_ln2;
+                d_ln2_flat.Sizes[0] = BT;
+                d_ln2_flat.Sizes[1] = C;
+                d_ln2_flat.Rank = 2;
+
+                moe_permute_backward(
+                    d_ln2_flat.get<float>(),
+                    d_permuted_input.get<float>(),
+                    gather_indices.get<int>(),
+                    total_expert_tokens, BT, C, top_k, stream
+                );
+            }
+        }
+    });
+
+    // Free expert temporaries
+    rs.temp_free(d_permuted_input);
+    rs.temp_free(d_expert_gate_up);
+    rs.temp_free(d_expert_swiglu);
+    rs.temp_free(d_expert_outputs);
+    rs.temp_free(expert_outputs);
+    rs.temp_free(expert_swiglu);
+    rs.temp_free(expert_gate_up);
+    rs.temp_free(permuted_input);
+    rs.temp_free(scatter_indices);
+    rs.temp_free(gather_indices);
+    rs.temp_free(expert_positions);
+    rs.temp_free(expert_offsets);
+    rs.temp_free(expert_counts);
+    rs.temp_free(expert_indices);
+    rs.temp_free(routing_weights_fp32);
+    rs.temp_free(router_probs);
+    rs.temp_free(router_logits);
+
+    // LN2 backward: accumulates residual gradient (d_res_ffn) into d_res_att
+    with_ctx("ln2", [&]() {
+        // MoE blocks use grads.ln2.d_weight, not grads.ln2_grads.d_weight
+        rmsnorm_backward(da.d_res_att, grads.ln2.d_weight, rs.scratch().rmsnorm_scratch,
+                         da.d_res_ffn, da.d_ln2,
+                         a.residual_att, weights.ln2.weight, a.ln2_rstd,
+                         nullptr,  // No quant for MoE path yet
+                         B, T, C, rs.DeviceProp, stream,
+                         /*skip_weight_grad=*/lora_only);
+    });
+
+    // ================================================================================
+    // Attention Backward Pass (same as dense)
+    // ================================================================================
+
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeAttnOutBackward);
+
+    // Output projection backward
+    with_ctx("att_out", [&]() {
+        // d_att = d_res_att @ out_weight
+        matmul(
+            da.d_att, weights.attention.out_weight, da.d_res_att, std::nullopt,
+            nullptr, nullptr,
+            rs.CublasLtHandle, rs.CuBlasWorkspace,
+            Hq * Hs, B * T, C, EMMTranspose::NN, false,
+            stream
+        );
+    });
+
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward);
+
+    // FlashAttention backward
+    with_ctx("attention_backward", [&]() {
+        // Acquire d_qkv from stack if needed (when large_bwd_temps_on_stack is true)
+        if (stack_large_bwd_temps && da.d_qkv.Data == nullptr) {
+            rs.temp_acquire(da.d_qkv);
+        }
+        rs.temp_acquire(rs.scratch().cudnn_workspace);
+        const Tensor& qkv_for_attn = (a.qkv_rope.Data != nullptr) ? a.qkv_rope : a.qkv;
+
+        attention_backward_cudnn(
+            da.d_qkv,
+            a.lse,
+            a.att,
+            da.d_att,
+            qkv_for_attn,
+            rs.scratch().cudnn_workspace,
+            rs.CudnnHandle,
+            B, T, Hq, Hkv, Hs,
+            stream
+        );
+        rs.temp_free(rs.scratch().cudnn_workspace);
+    });
+
+    // RoPE backward (if needed)
+    if (a.qkv_rope.Data != nullptr) {
+        with_ctx("rope_backward", [&]() {
+            const int head_size = (int)mConfig.head_size();
+            // TODO: Implement RoPE backward for MoE
+            // For now, just copy d_qkv_rope to d_qkv (assumes RoPE is invertible)
+        });
+    }
+
+    // QKV projection backward
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeQKVBackward);
+
+    with_ctx("qkv", [&]() {
+        // d_ln1 = d_qkv @ qkv_weight
+        matmul(
+            da.d_ln1, weights.attention.qkv_weight, da.d_qkv, std::nullopt,
+            nullptr, nullptr,
+            rs.CublasLtHandle, rs.CuBlasWorkspace,
+            C, B * T, qkv_channels, EMMTranspose::NN, false,
+            stream
+        );
+    });
+
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterQKVBackward);
+
+    // Free d_qkv from stack if it was acquired
+    if (stack_large_bwd_temps) {
+        rs.temp_free(da.d_qkv);
+    }
+
+    // Note: LN1 backward is handled in the main backward loop (backward_with_hook)
+    // because it needs access to prev_da.d_res_ffn (previous layer's gradient buffer)
+
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward);
 }
 
 template<typename Block>

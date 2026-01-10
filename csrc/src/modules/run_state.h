@@ -1011,6 +1011,7 @@ void ModularRunState<Block>::allocate_simplified_activations() {
         if constexpr (requires { mConfig.block_config.use_qk_norm; }) return mConfig.block_config.use_qk_norm;
         return false;
     }();
+    fprintf(stderr, "[RunState] use_qk_norm=%d (from block_config)\n", use_qk_norm);
 
     auto dtype = mConfig.activation_dtype;
     auto kind = EAllocationType::ON_DEVICE;
@@ -1041,6 +1042,12 @@ void ModularRunState<Block>::allocate_simplified_activations() {
     const bool share_swiglu = lora_can_share_swiglu && (mConfig.recompute_swiglu || mConfig.recompute_ffn || mConfig.recompute_block);
     const bool ffn_temps_on_stack = mConfig.recompute_block;
     const bool share_residual_intermediates = mConfig.recompute_block;
+
+    // Debug: print sharing decisions
+    fprintf(stderr, "[RunState] lora_only=%d, recompute_lora=%d, recompute_block=%d, recompute_att=%d, recompute_ffn=%d\n",
+            lora_only, mConfig.recompute_lora, mConfig.recompute_block, mConfig.recompute_attention, mConfig.recompute_ffn);
+    fprintf(stderr, "[RunState] share_ln1=%d, share_ln2=%d, share_qkv=%d, share_att=%d, share_mlp_up=%d, share_swiglu=%d, ffn_on_stack=%d\n",
+            share_ln1, share_ln2, share_qkv, share_att, share_mlp_up, share_swiglu, ffn_temps_on_stack);
 
     // Allocate shared buffers once if needed.
     if (share_ln1 && !mSharedLn1.Data) {
@@ -1131,6 +1138,8 @@ void ModularRunState<Block>::allocate_simplified_activations() {
         }
 
         // lse is needed for attention backward (cuDNN)
+        // Note: shape metadata is {B, T, Hq} but memory layout is {B, Hq, T} as cuDNN expects
+        // The total size B*T*Hq is the same, and cuDNN uses raw pointers with explicit dimensions
         acts.lse = mAllocator->allocate(
             ETensorDType::FP32, "lse", kind, {B, T, (long)Hq});
 

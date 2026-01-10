@@ -18,7 +18,11 @@ ModularTransformerModel<Block>::ModularTransformerModel(
     // Create transformer blocks
     BlockConfig block_config;
     block_config.hidden_size = config.HiddenSize;
-    block_config.intermediate_size = config.IntermediateSize;
+    // For MoE models, use MoeIntermediateSize for the per-expert intermediate dimension
+    // IntermediateSize is the dense MLP size (used for shared experts or mlp_only_layers)
+    block_config.intermediate_size = (config.NumExperts > 0 && config.MoeIntermediateSize > 0)
+                                     ? config.MoeIntermediateSize
+                                     : config.IntermediateSize;
     block_config.num_query_heads = config.NumQueryHeads;
     block_config.num_kv_heads = config.NumKeyValHeads;
     block_config.head_size = config.head_size();

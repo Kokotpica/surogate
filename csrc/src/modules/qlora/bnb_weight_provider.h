@@ -175,7 +175,7 @@ public:
     [[nodiscard]] int num_experts() const { return mBnBWeights->num_experts(); }
 
     // =========================================================================
-    // MoE-specific methods: Selective Expert Dequantization
+    // MoE-specific methods
     // =========================================================================
 
     /**
@@ -189,38 +189,18 @@ public:
      */
     Tensor& get_router_gate(int layer_idx, cudaStream_t stream);
 
+private:
     /**
-     * @brief Get dequantized weights for active experts (selective dequantization)
+     * @brief Get attention and expert weights for MoE blocks
      *
-     * This is the key MoE optimization: we only dequantize the experts that
-     * the router selected for the current batch (top_k out of num_experts).
-     *
-     * Call this after running the router to get routing decisions.
-     *
-     * @param layer_idx Layer index
-     * @param active_expert_indices Array of expert indices selected by router (top_k indices)
-     * @param num_active Number of active experts (usually top_k from config)
-     * @param stream CUDA stream for dequantization
-     * @return Vector of pointers to dequantized expert weights
-     */
-    std::vector<DequantizedExpertWeights*> get_active_experts(
-        int layer_idx,
-        const int* active_expert_indices,
-        int num_active,
-        cudaStream_t stream);
-
-    /**
-     * @brief Get attention weights for MoE blocks (separate from expert weights)
-     *
-     * MoE blocks share the same attention structure as dense blocks.
-     * This method dequantizes only the attention weights (QKV + output projection).
+     * Dequantizes attention weights (QKV + output) and ALL expert weights
+     * into batched tensors for efficient forward pass.
      *
      * @param layer_idx Layer index
      * @param stream CUDA stream for dequantization
      */
     void get_moe_attention_weights(int layer_idx, cudaStream_t stream);
 
-private:
     Config mConfig;
     TensorAllocator* mAllocator;
     cudaDeviceProp mDeviceProps;  // Store by value to avoid dangling pointer
@@ -251,30 +231,22 @@ private:
     uint64_t mBufferVersion = 0;  ///< Step version when buffers were last filled
 
     // =========================================================================
-    // MoE-specific members for selective expert dequantization
+    // MoE-specific members for batched expert dequantization
     // =========================================================================
 
-    /// Expert dequantization buffers (top_k sets, not num_experts)
-    /// We only need buffers for the active experts at any time
-    std::vector<Tensor> mDequantExpertGateUp;
-    std::vector<Tensor> mDequantExpertDown;
+    /// Batched expert dequantization buffers (all experts, for forward pass)
+    /// Shape: (num_experts, 2 * moe_intermediate, hidden_size)
+    Tensor mBatchedExpertGateUp;
+    /// Shape: (num_experts, hidden_size, moe_intermediate)
+    Tensor mBatchedExpertDown;
 
-    /// Dequantized expert weights structures (pointing to the buffers above)
-    std::vector<DequantizedExpertWeights> mDequantExperts;
-
-    /// Cache tracking: which experts are currently in each buffer slot
-    std::vector<ExpertCacheEntry> mExpertCache;
-
-    /// Number of expert buffer slots (equals top_k)
-    int mNumExpertBuffers = 0;
+    /// Number of experts in MoE model
+    int mNumMoEExperts = 0;
 
     void allocate_dequant_buffers();
     void allocate_moe_expert_buffers();
     void setup_block_weights_structure();
     void dequantize_weight(const BnBBlockQuantizedWeight& src, Tensor& dst, cudaStream_t stream);
-
-    /// Find a buffer slot for an expert (returns slot index, handles cache)
-    int find_or_allocate_expert_slot(int layer_idx, int expert_idx);
 };
 
 // ============================================================================
@@ -362,6 +334,15 @@ void BnBWeightProvider<Block>::setup_block_weights_structure() {
     if constexpr (has_mlp_weights<BlockWeights>::value) {
         mDequantBlock.mlp_up_weight = mDequantGateUp;
         mDequantBlock.mlp_down_weight = mDequantDown;
+    }
+
+    // Set up MoE expert weights (batched layout)
+    if constexpr (has_moe_weights<BlockWeights>::value) {
+        if (mConfig.qlora_config.is_moe()) {
+            mDequantBlock.experts.use_batched = true;
+            mDequantBlock.experts.gate_up_proj = mBatchedExpertGateUp;
+            mDequantBlock.experts.down_proj = mBatchedExpertDown;
+        }
     }
 }
 
@@ -464,36 +445,22 @@ void BnBWeightProvider<Block>::allocate_moe_expert_buffers() {
     const int hidden = mConfig.hidden_size;
     const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
                           mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
-    const int top_k = mConfig.qlora_config.num_experts_per_tok;
+    const int num_experts = mConfig.qlora_config.num_experts;
 
-    mNumExpertBuffers = top_k;
+    mNumMoEExperts = num_experts;
 
-    // Allocate top_k sets of expert buffers (selective dequantization)
-    mDequantExpertGateUp.resize(top_k);
-    mDequantExpertDown.resize(top_k);
-    mDequantExperts.resize(top_k);
-    mExpertCache.resize(top_k);
+    // Allocate batched expert buffers (all experts for forward pass)
+    // gate_up_proj: (num_experts, 2 * moe_intermediate, hidden_size)
+    // down_proj: (num_experts, hidden_size, moe_intermediate)
+    mBatchedExpertGateUp = mAllocator->allocate(ETensorDType::BF16,
+        "batched_expert_gate_up",
+        EAllocationType::ON_DEVICE,
+        {(long)num_experts, (long)(2 * moe_inter), (long)hidden});
 
-    for (int i = 0; i < top_k; ++i) {
-        std::string suffix = std::to_string(i);
-
-        mDequantExpertGateUp[i] = mAllocator->allocate(ETensorDType::BF16,
-            ("expert_gate_up_" + suffix).c_str(),
-            EAllocationType::ON_DEVICE,
-            {(long)(2 * moe_inter), (long)hidden});
-
-        mDequantExpertDown[i] = mAllocator->allocate(ETensorDType::BF16,
-            ("expert_down_" + suffix).c_str(),
-            EAllocationType::ON_DEVICE,
-            {(long)hidden, (long)moe_inter});
-
-        // Point the DequantizedExpertWeights to these buffers
-        mDequantExperts[i].gate_up_proj = mDequantExpertGateUp[i];
-        mDequantExperts[i].down_proj = mDequantExpertDown[i];
-
-        // Initialize cache entries as empty
-        mExpertCache[i].clear();
-    }
+    mBatchedExpertDown = mAllocator->allocate(ETensorDType::BF16,
+        "batched_expert_down",
+        EAllocationType::ON_DEVICE,
+        {(long)num_experts, (long)hidden, (long)moe_inter});
 }
 
 template<typename Block>
@@ -506,13 +473,47 @@ template<typename Block>
 void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStream_t stream) {
     const auto& qblock = mBnBWeights->get_moe_block(layer_idx);
 
-    // Check cache for attention weights
+    // Check cache for this layer's weights
     const bool cache_hit = (mCurrentLayer == layer_idx) && (mBufferVersion == mStepVersion);
 
     if (!cache_hit) {
-        // Dequantize attention weights only
+        // Dequantize attention weights
         dequantize_weight(qblock.qkv_proj, mDequantQKV, stream);
         dequantize_weight(qblock.out_proj, mDequantOut, stream);
+
+        // Dequantize ALL expert weights into batched buffers
+        // Each expert's weights are dequantized into a slice of the batched tensor
+        const int hidden = mConfig.hidden_size;
+        const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                              mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+
+        for (int e = 0; e < mNumMoEExperts; ++e) {
+            const auto& expert_weights = qblock.experts[e];
+
+            // Create slice views into the batched buffers for this expert
+            // gate_up_proj slice: offset by e * (2 * moe_inter * hidden) bytes
+            Tensor gate_up_slice = Tensor::from_pointer(
+                static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
+                    static_cast<size_t>(e) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+                mBatchedExpertGateUp.Device,
+                ETensorDType::BF16,
+                std::array<long, 2>{2 * moe_inter, hidden}
+            );
+
+            // down_proj slice: offset by e * (hidden * moe_inter) bytes
+            Tensor down_slice = Tensor::from_pointer(
+                static_cast<std::byte*>(mBatchedExpertDown.Data) +
+                    static_cast<size_t>(e) * hidden * moe_inter * sizeof(nv_bfloat16),
+                mBatchedExpertDown.Device,
+                ETensorDType::BF16,
+                std::array<long, 2>{hidden, moe_inter}
+            );
+
+            // Dequantize this expert's weights into the slice
+            dequantize_weight(expert_weights.gate_up_proj, gate_up_slice, stream);
+            dequantize_weight(expert_weights.down_proj, down_slice, stream);
+        }
+
 
         mCurrentLayer = layer_idx;
         mBufferVersion = mStepVersion;
@@ -522,6 +523,11 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
     mDequantBlock.ln1.weight = qblock.ln1_weight;
     mDequantBlock.ln2.weight = qblock.ln2_weight;
 
+    // Update router gate pointer
+    if constexpr (has_moe_weights<BlockWeights>::value) {
+        mDequantBlock.router.gate = qblock.router_gate;
+    }
+
     // Copy QK-norm weights if present
     if constexpr (requires { mDequantBlock.attention.q_norm_weight; mDequantBlock.attention.k_norm_weight; }) {
         if (qblock.q_norm_weight.has_value() && qblock.k_norm_weight.has_value()) {
@@ -529,69 +535,6 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
             mDequantBlock.attention.k_norm_weight = qblock.k_norm_weight;
         }
     }
-}
-
-template<typename Block>
-int BnBWeightProvider<Block>::find_or_allocate_expert_slot(int layer_idx, int expert_idx) {
-    // First, check if this expert is already cached in any slot
-    for (int i = 0; i < mNumExpertBuffers; ++i) {
-        if (mExpertCache[i].matches(layer_idx, expert_idx, mStepVersion)) {
-            return i;  // Cache hit
-        }
-    }
-
-    // Cache miss: find a slot to use
-    // Simple round-robin or LRU could be used; here we find first empty or oldest
-    int slot = 0;
-    uint64_t oldest_version = UINT64_MAX;
-
-    for (int i = 0; i < mNumExpertBuffers; ++i) {
-        if (mExpertCache[i].layer_idx == -1) {
-            // Empty slot
-            slot = i;
-            break;
-        }
-        if (mExpertCache[i].step_version < oldest_version) {
-            oldest_version = mExpertCache[i].step_version;
-            slot = i;
-        }
-    }
-
-    return slot;
-}
-
-template<typename Block>
-std::vector<DequantizedExpertWeights*> BnBWeightProvider<Block>::get_active_experts(
-    int layer_idx,
-    const int* active_expert_indices,
-    int num_active,
-    cudaStream_t stream) {
-
-    const auto& qblock = mBnBWeights->get_moe_block(layer_idx);
-
-    std::vector<DequantizedExpertWeights*> result;
-    result.reserve(num_active);
-
-    for (int i = 0; i < num_active; ++i) {
-        const int expert_idx = active_expert_indices[i];
-        const int slot = find_or_allocate_expert_slot(layer_idx, expert_idx);
-
-        // Check if we need to dequantize
-        if (!mExpertCache[slot].matches(layer_idx, expert_idx, mStepVersion)) {
-            // Need to dequantize this expert into this slot
-            const auto& expert_weights = qblock.experts[expert_idx];
-
-            dequantize_weight(expert_weights.gate_up_proj, mDequantExpertGateUp[slot], stream);
-            dequantize_weight(expert_weights.down_proj, mDequantExpertDown[slot], stream);
-
-            // Update cache
-            mExpertCache[slot].update(layer_idx, expert_idx, mStepVersion);
-        }
-
-        result.push_back(&mDequantExperts[slot]);
-    }
-
-    return result;
 }
 
 } // namespace modules

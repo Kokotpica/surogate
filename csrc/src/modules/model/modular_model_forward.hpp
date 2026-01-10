@@ -438,7 +438,8 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                 const auto& moe_cfg = *mConfig.moe_config;
                 const int num_experts = moe_cfg.num_experts;
                 const int top_k = moe_cfg.top_k;
-                const int expert_D = mConfig.IntermediateSize; // Per-expert intermediate size
+                // Use moe_intermediate_size if set, otherwise fall back to IntermediateSize
+                const int expert_D = moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : (int)mConfig.IntermediateSize;
                 const int total_expert_tokens = BT * top_k;
                 const int dev = rs.DeviceId;
 

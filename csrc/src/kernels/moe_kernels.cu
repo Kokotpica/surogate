@@ -251,10 +251,8 @@ __global__ void moe_compute_gather_indices_kernel(
 
     // Atomically claim a slot in the expert's region
     int slot = atomicAdd(&expert_positions[expert_id], 1);
-    int dest_idx = expert_offsets[expert_id] + slot - expert_offsets[expert_id];
+    int dest_idx = expert_offsets[expert_id] + slot;
 
-    // Actually need to compute relative position
-    // Let's simplify: use scan-based approach
     gather_indices[dest_idx] = idx;  // Token assignment idx -> goes to position dest_idx
     scatter_indices[idx] = dest_idx; // Inverse mapping
 }
@@ -671,28 +669,32 @@ void moe_compute_expert_offsets(
     // expert_offsets[i] = sum(expert_counts[0:i])
     // expert_offsets[num_experts] = total_tokens
 
-    // For small num_experts (typical: 8-256), use CUB device scan
-    // Determine temporary storage requirements
+    // Use CUB InclusiveSum to get expert_offsets[1..num_experts] directly
+    // This gives us expert_offsets[i] = sum(expert_counts[0..i-1]) for i=1..num_experts
+    // We need to shift the result and set expert_offsets[0] = 0
+
     void* d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
 
-    cub::DeviceScan::ExclusiveSum(
+    // First call to determine temp storage size
+    cub::DeviceScan::InclusiveSum(
         d_temp_storage, temp_storage_bytes,
-        expert_counts, expert_offsets, num_experts, stream
+        expert_counts, expert_offsets + 1, num_experts, stream
     );
 
     // Allocate temporary storage
     cudaMallocAsync(&d_temp_storage, temp_storage_bytes, stream);
 
-    // Run exclusive prefix sum
-    cub::DeviceScan::ExclusiveSum(
+    // Run inclusive prefix sum into expert_offsets[1..num_experts]
+    // This gives us: expert_offsets[i+1] = sum(expert_counts[0..i])
+    cub::DeviceScan::InclusiveSum(
         d_temp_storage, temp_storage_bytes,
-        expert_counts, expert_offsets, num_experts, stream
+        expert_counts, expert_offsets + 1, num_experts, stream
     );
 
-    // Compute expert_offsets[num_experts] = total (sum of all counts)
-    // This is done by adding the last count to the last offset
-    // For simplicity, use a simple kernel
+    // Set expert_offsets[0] = 0
+    cudaMemsetAsync(expert_offsets, 0, sizeof(int), stream);
+
     cudaFreeAsync(d_temp_storage, stream);
 }
 
@@ -1029,6 +1031,7 @@ void moe_grouped_gemm_down_impl(
     std::vector<const T*> h_A_ptrs(num_experts);
     std::vector<const T*> h_B_ptrs(num_experts);
     std::vector<T*> h_C_ptrs(num_experts);
+    std::vector<int> h_tokens(num_experts);
 
     int batch_count = 0;
     for (int e = 0; e < num_experts; ++e) {
@@ -1038,6 +1041,7 @@ void moe_grouped_gemm_down_impl(
         h_A_ptrs[batch_count] = input + h_offsets[e] * intermediate_size;
         h_B_ptrs[batch_count] = weights + e * hidden_size * intermediate_size;
         h_C_ptrs[batch_count] = output + h_offsets[e] * hidden_size;
+        h_tokens[batch_count] = tokens_e;
         batch_count++;
     }
 
@@ -1048,28 +1052,23 @@ void moe_grouped_gemm_down_impl(
 
     CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
 
-    int offset_idx = 0;
-    for (int e = 0; e < num_experts; ++e) {
-        int tokens_e = h_offsets[e + 1] - h_offsets[e];
-        if (tokens_e == 0) continue;
-
+    for (int b = 0; b < batch_count; ++b) {
         // output(tokens, C) = input(tokens, D) @ weight^T(D, C)
         cublasGemmEx(
             cublas_handle,
             CUBLAS_OP_T,  // op(A) = A^T
             CUBLAS_OP_N,  // op(B) = B
             hidden_size,  // M = C
-            tokens_e,     // N = tokens
+            h_tokens[b],  // N = tokens
             intermediate_size,  // K = D
             &alpha,
-            h_B_ptrs[offset_idx], cublas_dtype<T>(), intermediate_size,
-            h_A_ptrs[offset_idx], cublas_dtype<T>(), intermediate_size,
+            h_B_ptrs[b], cublas_dtype<T>(), intermediate_size,
+            h_A_ptrs[b], cublas_dtype<T>(), intermediate_size,
             &beta,
-            h_C_ptrs[offset_idx], cublas_dtype<T>(), hidden_size,
+            h_C_ptrs[b], cublas_dtype<T>(), hidden_size,
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT
         );
-        offset_idx++;
     }
 }
 
@@ -1244,11 +1243,11 @@ __global__ void moe_combine_backward_kernel(
 
 // Backward through permute: gather gradient back to original token order
 // d_input[token] += d_permuted[permuted_idx] for each assignment
-template<typename T>
-__global__ void moe_permute_backward_kernel(
-    T* __restrict__ d_input,              // (num_tokens, hidden_size)
-    const T* __restrict__ d_permuted,     // (total_tokens, hidden_size)
-    const int* __restrict__ gather_indices, // (total_tokens,)
+// FP32 version - uses native atomicAdd
+__global__ void moe_permute_backward_kernel_fp32(
+    float* __restrict__ d_input,              // (num_tokens, hidden_size)
+    const float* __restrict__ d_permuted,     // (total_tokens, hidden_size)
+    const int* __restrict__ gather_indices,   // (total_tokens,)
     int total_tokens,
     int num_tokens,
     int hidden_size,
@@ -1261,14 +1260,41 @@ __global__ void moe_permute_backward_kernel(
     int token_assignment_idx = gather_indices[out_idx];
     int token_idx = token_assignment_idx / top_k;
 
-    const T* d_perm = d_permuted + out_idx * hidden_size;
-    T* d_in = d_input + token_idx * hidden_size;
+    const float* d_perm = d_permuted + out_idx * hidden_size;
+    float* d_in = d_input + token_idx * hidden_size;
 
     // Atomically add gradient back to original token
     // (multiple assignments may map to the same token)
     for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        float val = static_cast<float>(d_perm[d]);
-        atomicAdd(reinterpret_cast<float*>(d_in + d), val);
+        atomicAdd(d_in + d, d_perm[d]);
+    }
+}
+
+// BF16 version - uses atomicAdd for __nv_bfloat16 (requires SM80+)
+__global__ void moe_permute_backward_kernel_bf16(
+    nv_bfloat16* __restrict__ d_input,              // (num_tokens, hidden_size)
+    const nv_bfloat16* __restrict__ d_permuted,     // (total_tokens, hidden_size)
+    const int* __restrict__ gather_indices,         // (total_tokens,)
+    int total_tokens,
+    int num_tokens,
+    int hidden_size,
+    int top_k
+) {
+    int out_idx = blockIdx.x;
+    if (out_idx >= total_tokens) return;
+
+    // Which token this permuted position corresponds to
+    int token_assignment_idx = gather_indices[out_idx];
+    int token_idx = token_assignment_idx / top_k;
+
+    const nv_bfloat16* d_perm = d_permuted + out_idx * hidden_size;
+    nv_bfloat16* d_in = d_input + token_idx * hidden_size;
+
+    // Atomically add gradient back to original token
+    // (multiple assignments may map to the same token)
+    // Use native BF16 atomicAdd (SM80+)
+    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        atomicAdd(d_in + d, d_perm[d]);
     }
 }
 
@@ -1363,7 +1389,7 @@ void moe_permute_backward(
 
     int block_size = 256;
     int grid_size = total_tokens;
-    moe_permute_backward_kernel<nv_bfloat16><<<grid_size, block_size, 0, stream>>>(
+    moe_permute_backward_kernel_bf16<<<grid_size, block_size, 0, stream>>>(
         d_input, d_permuted, gather_indices, total_tokens, num_tokens, hidden_size, top_k
     );
 }
@@ -1382,7 +1408,7 @@ void moe_permute_backward(
 
     int block_size = 256;
     int grid_size = total_tokens;
-    moe_permute_backward_kernel<float><<<grid_size, block_size, 0, stream>>>(
+    moe_permute_backward_kernel_fp32<<<grid_size, block_size, 0, stream>>>(
         d_input, d_permuted, gather_indices, total_tokens, num_tokens, hidden_size, top_k
     );
 }

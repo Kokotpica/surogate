@@ -162,6 +162,22 @@ struct ModelConfig : public PretrainedConfig {
             config.attention_type = AttentionType::MHA;
         }
 
+        // Infer architecture type from MoE configuration
+        if (config.NumExperts > 0) {
+            config.architecture = ArchitectureType::MoE;
+
+            // Set up MoE config from PretrainedConfig fields
+            MoEConfig moe;
+            moe.num_experts = config.NumExperts;
+            moe.top_k = config.NumExpertsPerTok;
+            moe.moe_intermediate_size = config.MoeIntermediateSize;
+            moe.decoder_sparse_step = config.DecoderSparseStep;
+            moe.mlp_only_layers = config.MlpOnlyLayers;
+            moe.norm_topk_prob = config.NormTopkProb;
+            moe.router_aux_loss_coef = config.RouterAuxLossCoef;
+            config.moe_config = moe;
+        }
+
         return config;
     }
 

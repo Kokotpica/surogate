@@ -142,13 +142,36 @@ void BnBWeightsManager::allocate_single_block(int layer_idx) {
 void BnBWeightsManager::import_and_quantize(const std::string& file_name,
                                             NCCLCommunicator& comm,
                                             cudaStream_t stream) {
+    // Debug: Check CUDA memory and print allocation breakdown before any allocations
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[BnB] BEFORE import - CUDA memory: "
+                  << (total_mem - free_mem) / 1024 / 1024 << " MB used, "
+                  << free_mem / 1024 / 1024 << " MB free\n";
+        std::cerr << "[BnB] Pre-import allocation breakdown:\n";
+        mAllocator->print_stats();
+    }
+
     std::cerr << "[BnB] importing and quantizing weights from " << file_name << "\n";
     std::cerr << "[BnB] block_size=" << mScaleConfig.block_size
               << ", double_quant=" << (mScaleConfig.double_quant ? "true" : "false") << "\n";
 
     if (is_moe()) {
+        const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                              mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
         std::cerr << "[BnB] MoE model detected: " << mConfig.qlora_config.num_experts << " experts, "
-                  << "top_k=" << mConfig.qlora_config.num_experts_per_tok << "\n";
+                  << "top_k=" << mConfig.qlora_config.num_experts_per_tok
+                  << ", moe_intermediate_size=" << mConfig.qlora_config.moe_intermediate_size
+                  << ", using moe_inter=" << moe_inter
+                  << ", hidden=" << mConfig.hidden_size << "\n";
+        // Calculate expected NF4 memory for experts
+        long expert_gate_up_bytes = (2L * moe_inter * mConfig.hidden_size) / 2;  // NF4 packed
+        long expert_down_bytes = (long(mConfig.hidden_size) * moe_inter) / 2;
+        long per_layer_bytes = mConfig.qlora_config.num_experts * (expert_gate_up_bytes + expert_down_bytes);
+        long total_expert_bytes = per_layer_bytes * mConfig.num_layers;
+        std::cerr << "[BnB] Expected expert NF4 memory: " << (total_expert_bytes / 1024 / 1024) << " MB ("
+                  << (per_layer_bytes / 1024 / 1024) << " MB/layer)\n";
     }
 
     SafeTensorsReader reader(file_name);
@@ -549,6 +572,16 @@ float BnBWeightsManager::memory_savings_ratio() const {
 void BnBWeightsManager::allocate_moe_block(int layer_idx) {
     auto ctx = mAllocator->with_context("BnB_MoE_Weights");
 
+    // Debug: print CUDA memory info at start of each layer
+    if (layer_idx % 10 == 0) {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cerr << "[BnB] Layer " << layer_idx << " - CUDA memory: "
+                  << (total_mem - free_mem) / 1024 / 1024 << " MB used, "
+                  << free_mem / 1024 / 1024 << " MB free, "
+                  << total_mem / 1024 / 1024 << " MB total\n";
+    }
+
     const int hidden = mConfig.hidden_size;
     const int num_q_heads = mConfig.num_query_heads;
     const int num_kv_heads = mConfig.num_kv_heads;
@@ -691,6 +724,9 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     // Router gate (BF16, not quantized)
     if (const auto* entry = find_entry_opt(reader, prefix + ".mlp.gate.weight")) {
         entry->read_tensor(block.router_gate, true);
+    } else {
+        std::cerr << "[BnB WARN] layer " << layer_idx << " router gate not found: "
+                  << prefix << ".mlp.gate.weight - this will cause NaN!\n";
     }
 
     // Load and quantize each expert
@@ -713,6 +749,8 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
             up_view.Sizes[0] = moe_inter;
             if (const auto* entry = find_entry_opt(reader, exp_prefix + ".up_proj.weight")) {
                 entry->read_tensor(up_view, true);
+            } else if (e == 0 && layer_idx == 0) {
+                std::cerr << "[BnB WARN] expert 0 up_proj not found: " << exp_prefix << ".up_proj.weight\n";
             }
 
             // Load gate into second part
@@ -721,6 +759,8 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
             gate_view.Sizes[0] = moe_inter;
             if (const auto* entry = find_entry_opt(reader, exp_prefix + ".gate_proj.weight")) {
                 entry->read_tensor(gate_view, true);
+            } else if (e == 0 && layer_idx == 0) {
+                std::cerr << "[BnB WARN] expert 0 gate_proj not found: " << exp_prefix << ".gate_proj.weight\n";
             }
 
             mLoadBuffer.Sizes[0] = 2 * moe_inter;

@@ -896,6 +896,13 @@ void ModularGradientManager<Block>::allocate_block_gradients(BlockGradients& gra
     if constexpr (requires { grads.ln2_grads.d_weight; }) {
         grads.ln2_grads.d_weight = mAllocator->allocate(dtype, "d_ln2_w", kind, {C});
     }
+    // MoE blocks use grads.ln1/ln2.d_weight instead of grads.ln1_grads/ln2_grads.d_weight
+    if constexpr (requires { grads.ln1.d_weight; }) {
+        grads.ln1.d_weight = mAllocator->allocate(dtype, "d_ln1_w", kind, {C});
+    }
+    if constexpr (requires { grads.ln2.d_weight; }) {
+        grads.ln2.d_weight = mAllocator->allocate(dtype, "d_ln2_w", kind, {C});
+    }
 
     if constexpr (requires { grads.attention_grads.d_qkv_weight; }) {
         grads.attention_grads.d_qkv_weight = mAllocator->allocate(dtype, "d_qkv_w", kind, {qkv_channels, C});
@@ -952,6 +959,13 @@ void ModularGradientManager<Block>::allocate_block_gradients_shard(BlockGradient
     }
     if constexpr (requires { grads.ln2_grads.d_weight; }) {
         grads.ln2_grads.d_weight = alloc_shard_1d("d_ln2_w_shard", C);
+    }
+    // MoE blocks use grads.ln1/ln2.d_weight instead of grads.ln1_grads/ln2_grads.d_weight
+    if constexpr (requires { grads.ln1.d_weight; }) {
+        grads.ln1.d_weight = alloc_shard_1d("d_ln1_w_shard", C);
+    }
+    if constexpr (requires { grads.ln2.d_weight; }) {
+        grads.ln2.d_weight = alloc_shard_1d("d_ln2_w_shard", C);
     }
 
     if constexpr (requires { grads.attention_grads.d_qkv_weight; }) {

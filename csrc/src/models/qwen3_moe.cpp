@@ -139,7 +139,7 @@ std::optional<PretrainedConfig> Qwen3MoEArchitecture::create_from_preset_name(st
             /*hidden_size=*/2048,
             /*intermediate_size=*/6144,  // Dense MLP intermediate size
             /*moe_intermediate_size=*/768, // Expert intermediate size
-            /*max_position_embeddings=*/40960,
+            /*max_position_embeddings=*/262144,
             /*num_attention_heads=*/32,
             /*num_hidden_layers=*/48,
             /*num_key_value_heads=*/4,
@@ -150,7 +150,7 @@ std::optional<PretrainedConfig> Qwen3MoEArchitecture::create_from_preset_name(st
             /*norm_topk_prob=*/true,
             /*router_aux_loss_coef=*/0.001f,
             /*rms_norm_eps=*/1e-6f,
-            /*rope_theta=*/1000000.0f,
+            /*rope_theta=*/10000000.0f,
             /*tie_word_embeddings=*/false,
             /*vocab_size=*/151936,
             dtype

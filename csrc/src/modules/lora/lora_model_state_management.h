@@ -53,6 +53,14 @@ ModularLoRAModel<Block>::ModularLoRAModel(std::unique_ptr<ModularTransformerMode
     }
     mLoRAWeights = std::make_unique<ModularLoRAWeightsManager>(wm, *mAllocator);
 
+    // Debug: print memory after LoRA weights allocation
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        fprintf(stderr, "[LoRA] After weights alloc - CUDA memory: %zu MB used, %zu MB free\n",
+                (total_mem - free_mem) / 1024 / 1024, free_mem / 1024 / 1024);
+    }
+
     ModularLoRAGradsManager::Config gm{};
     gm.num_layers = cfg.NumLayers;
     gm.hidden_size = cfg.HiddenSize;
@@ -72,6 +80,14 @@ ModularLoRAModel<Block>::ModularLoRAModel(std::unique_ptr<ModularTransformerMode
                                     : cfg.IntermediateSize;
     }
     mLoRAGrads = std::make_unique<ModularLoRAGradsManager>(gm, mAllocator);
+
+    // Debug: print memory after LoRA grads allocation
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        fprintf(stderr, "[LoRA] After grads alloc - CUDA memory: %zu MB used, %zu MB free\n",
+                (total_mem - free_mem) / 1024 / 1024, free_mem / 1024 / 1024);
+    }
 }
 
 template<typename Block>
@@ -97,7 +113,26 @@ void ModularLoRAModel<Block>::allocate_run_state(const RuntimeOptions& options, 
     }
     // Use the ModelOptions overload to apply LoRA-specific flags
     mBaseModel->allocate_run_state(model_opts, comm, B, T, /*allocate_optimizer=*/false);
+
+    // Debug: print memory after base model run state allocation
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        fprintf(stderr, "[LoRA] After base run_state alloc - CUDA memory: %zu MB used, %zu MB free\n",
+                (total_mem - free_mem) / 1024 / 1024, free_mem / 1024 / 1024);
+        fprintf(stderr, "[LoRA] Allocator stats after base run_state:\n");
+        mAllocator->print_stats();
+    }
+
     allocate_lora_run_state(comm, B, T);
+
+    // Debug: print memory after LoRA run state allocation
+    {
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        fprintf(stderr, "[LoRA] After lora run_state alloc - CUDA memory: %zu MB used, %zu MB free\n",
+                (total_mem - free_mem) / 1024 / 1024, free_mem / 1024 / 1024);
+    }
 
     // Allocate 8-bit AdamW optimizer state for LoRA
     if (lora_enabled() && !mLoRAAdamW8BitState) {

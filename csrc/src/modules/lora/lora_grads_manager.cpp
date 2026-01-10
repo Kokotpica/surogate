@@ -71,31 +71,33 @@ void ModularLoRAGradsManager::allocate_gradients() {
             shard.attention.o = alloc_shard(q_out, C, prefix + "_o_shard");
         }
 
-        // MLP LoRA gradients: For MoE models, allocate per-expert gradients
+        // MLP LoRA gradients: For MoE models, use shared gradient buffers across all experts
+        // This drastically reduces memory: from O(num_experts * num_layers) to O(num_layers)
+        // During backward, we compute gradients for one expert at a time and accumulate into
+        // the weight's gradient, so we only need one buffer that gets reused.
         if (mConfig.is_moe && E > 0) {
             const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
                                        mConfig.lora_config.applies_to_up() ||
                                        mConfig.lora_config.applies_to_down();
             if (has_mlp_lora) {
-                full.moe.experts.resize(E);
-                shard.moe.experts.resize(E);
-                for (int e = 0; e < E; ++e) {
-                    std::string expert_prefix = fmt::format("{}_expert_{}", prefix, e);
-                    auto& full_expert = full.moe.experts[e];
-                    auto& shard_expert = shard.moe.experts[e];
+                // Allocate only ONE set of expert gradient buffers per layer (shared across all experts)
+                full.moe.experts.resize(1);  // Only 1 shared buffer, not E buffers
+                shard.moe.experts.resize(1);
+                std::string expert_prefix = fmt::format("{}_expert_shared", prefix);
+                auto& full_expert = full.moe.experts[0];
+                auto& shard_expert = shard.moe.experts[0];
 
-                    if (mConfig.lora_config.applies_to_gate()) {
-                        full_expert.gate = alloc_full(C, D_moe, expert_prefix + "_gate");
-                        shard_expert.gate = alloc_shard(C, D_moe, expert_prefix + "_gate_shard");
-                    }
-                    if (mConfig.lora_config.applies_to_up()) {
-                        full_expert.up = alloc_full(C, D_moe, expert_prefix + "_up");
-                        shard_expert.up = alloc_shard(C, D_moe, expert_prefix + "_up_shard");
-                    }
-                    if (mConfig.lora_config.applies_to_down()) {
-                        full_expert.down = alloc_full(D_moe, C, expert_prefix + "_down");
-                        shard_expert.down = alloc_shard(D_moe, C, expert_prefix + "_down_shard");
-                    }
+                if (mConfig.lora_config.applies_to_gate()) {
+                    full_expert.gate = alloc_full(C, D_moe, expert_prefix + "_gate");
+                    shard_expert.gate = alloc_shard(C, D_moe, expert_prefix + "_gate_shard");
+                }
+                if (mConfig.lora_config.applies_to_up()) {
+                    full_expert.up = alloc_full(C, D_moe, expert_prefix + "_up");
+                    shard_expert.up = alloc_shard(C, D_moe, expert_prefix + "_up_shard");
+                }
+                if (mConfig.lora_config.applies_to_down()) {
+                    full_expert.down = alloc_full(D_moe, C, expert_prefix + "_down");
+                    shard_expert.down = alloc_shard(D_moe, C, expert_prefix + "_down_shard");
                 }
             }
         } else {
