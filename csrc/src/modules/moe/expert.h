@@ -214,6 +214,13 @@ inline Tensor ExpertModule::backward_impl(
  *
  * Manages multiple experts and handles the scatter/gather operations
  * for routing tokens to experts and combining outputs.
+ *
+ * Uses a permute-based approach inspired by Unsloth's MoE implementation:
+ * 1. Permute tokens to expert-grouped order (scatter)
+ * 2. Run batched expert computation
+ * 3. Unpermute and weight-combine outputs (gather)
+ *
+ * This approach enables efficient grouped GEMM computation across all experts.
  */
 class ExpertGroupModule : public ModuleBase<ExpertGroupModule> {
 public:
@@ -231,15 +238,20 @@ public:
 
     /**
      * @brief Weights for all experts
+     *
+     * Supports two layouts:
+     * - Separate: std::vector<ExpertModule::Weights> - simple but less efficient
+     * - Batched: single tensors with expert dimension - enables grouped GEMM
      */
     struct Weights {
         // Option 1: Separate weights per expert
         std::vector<ExpertModule::Weights> experts;
 
-        // Option 2: Batched weights for efficient computation
-        // Tensor gate_proj;  // (num_experts, hidden_size, intermediate_size)
-        // Tensor up_proj;    // (num_experts, hidden_size, intermediate_size)
-        // Tensor down_proj;  // (num_experts, intermediate_size, hidden_size)
+        // Option 2: Batched weights for grouped GEMM (preferred for performance)
+        Tensor gate_up_proj;  ///< (num_experts, hidden_size, 2 * intermediate_size) - fused gate+up
+        Tensor down_proj;     ///< (num_experts, intermediate_size, hidden_size)
+
+        bool use_batched = false;  ///< Which layout to use
     };
 
     /**
@@ -248,17 +260,27 @@ public:
     struct Activations {
         std::vector<ExpertModule::Activations> expert_acts;
 
+        // Permutation state
+        Tensor gather_indices;      ///< (total_tokens,) - maps permuted position to original token
+        Tensor scatter_indices;     ///< (total_tokens,) - maps original token to permuted position
+        Tensor expert_offsets;      ///< (num_experts + 1,) - cumsum of tokens per expert
+
         // Dispatch/combine state
-        Tensor dispatched_input;    ///< (num_experts, capacity, hidden_size)
-        Tensor expert_outputs;      ///< (num_experts, capacity, hidden_size)
-        Tensor combined_output;     ///< (B*T, hidden_size)
+        Tensor permuted_input;      ///< (total_tokens, hidden_size) - tokens in expert-grouped order
+        Tensor expert_outputs;      ///< (total_tokens, hidden_size) - outputs in expert-grouped order
+        Tensor combined_output;     ///< (B*T, hidden_size) - final output
     };
 
     /**
      * @brief Gradients for all experts
      */
     struct Gradients {
-        std::vector<ExpertModule::Gradients> experts;
+        // Per-expert gradients (for sequential execution)
+        std::vector<ExpertModule::Gradients> expert_grads;
+
+        // Batched gradients (for grouped GEMM)
+        Tensor d_gate_up_proj;  ///< (num_experts, hidden_size, 2 * intermediate_size)
+        Tensor d_down_proj;     ///< (num_experts, intermediate_size, hidden_size)
     };
 
     explicit ExpertGroupModule(Config config);
@@ -286,12 +308,6 @@ public:
 private:
     Config mConfig;
     std::vector<ExpertModule> mExperts;
-
-    // Helper functions for token dispatch/combine
-    void dispatch_tokens(Tensor& input, const RouterModule::RouterOutput& routing,
-                         Tensor& dispatched, cudaStream_t stream);
-    void combine_outputs(Tensor& expert_outputs, const RouterModule::RouterOutput& routing,
-                         Tensor& combined, cudaStream_t stream);
 };
 
 // ============================================================================
@@ -317,33 +333,72 @@ inline Tensor ExpertGroupModule::forward_impl(
     const int BT = ctx.B * ctx.T;
     const int C = mConfig.hidden_size;
     const int E = mConfig.num_experts;
-    const int capacity = (BT * mConfig.top_k * mConfig.capacity_factor) / E;
+    const int K = mConfig.top_k;
+    const int total_tokens = BT * K;  // Each token is sent to K experts
 
-    // Step 1: Dispatch tokens to experts based on routing
-    // dispatched_input[e] contains tokens routed to expert e
-    dispatch_tokens(input, routing, acts.dispatched_input, ctx.stream);
+    // Step 1: Permute tokens to expert-grouped order
+    // This reorders tokens so that all tokens for expert 0 come first, then expert 1, etc.
+    // Uses gather_indices computed from routing.expert_indices
+    if (input.DType == ETensorDType::BF16) {
+        moe_permute_tokens(
+            acts.permuted_input.get<nv_bfloat16>(),
+            input.get<nv_bfloat16>(),
+            acts.gather_indices.get<int>(),
+            total_tokens, BT, C, K, ctx.stream
+        );
+    } else {
+        moe_permute_tokens(
+            acts.permuted_input.get<float>(),
+            input.get<float>(),
+            acts.gather_indices.get<int>(),
+            total_tokens, BT, C, K, ctx.stream
+        );
+    }
 
-    // Step 2: Run each expert on its assigned tokens
+    // Step 2: Run experts on permuted tokens
+    // For now, use sequential per-expert execution
+    // TODO: Implement grouped GEMM for batched execution
     acts.expert_acts.resize(E);
-    for (int e = 0; e < E; ++e) {
-        // Get slice of dispatched input for this expert
-        Tensor expert_input = acts.dispatched_input;
-        expert_input.Data = acts.dispatched_input.Data +
-                            e * capacity * C * get_dtype_size(expert_input.DType);
-        expert_input.Sizes[0] = capacity;
+    int offset = 0;
 
-        // Get expert output slice
-        Tensor expert_output = acts.expert_outputs;
-        expert_output.Data = acts.expert_outputs.Data +
-                             e * capacity * C * get_dtype_size(expert_output.DType);
-        expert_output.Sizes[0] = capacity;
+    for (int e = 0; e < E; ++e) {
+        // Get token count for this expert from routing.token_counts
+        const int* h_count_ptr = routing.token_counts.get<int>();
+        int expert_tokens = h_count_ptr[e];  // Note: need to async copy this
+
+        if (expert_tokens == 0) continue;
+
+        // Slice of permuted input for this expert
+        Tensor expert_input = slice(acts.permuted_input, 0, offset, offset + expert_tokens);
+
+        // Slice for expert output
+        Tensor expert_output = slice(acts.expert_outputs, 0, offset, offset + expert_tokens);
 
         // Run expert forward
         mExperts[e].forward(ctx, w.experts[e], expert_input, acts.expert_acts[e]);
+
+        offset += expert_tokens;
     }
 
-    // Step 3: Combine expert outputs weighted by routing
-    combine_outputs(acts.expert_outputs, routing, acts.combined_output, ctx.stream);
+    // Step 3: Unpermute and combine expert outputs weighted by routing weights
+    // For each original token, gather outputs from its assigned experts and weight-combine
+    if (acts.expert_outputs.DType == ETensorDType::BF16) {
+        moe_unpermute_and_combine(
+            acts.combined_output.get<nv_bfloat16>(),
+            acts.expert_outputs.get<nv_bfloat16>(),
+            routing.routing_weights.get<nv_bfloat16>(),
+            acts.scatter_indices.get<int>(),
+            BT, total_tokens, C, K, ctx.stream
+        );
+    } else {
+        moe_unpermute_and_combine(
+            acts.combined_output.get<float>(),
+            acts.expert_outputs.get<float>(),
+            routing.routing_weights.get<float>(),
+            acts.scatter_indices.get<int>(),
+            BT, total_tokens, C, K, ctx.stream
+        );
+    }
 
     return acts.combined_output;
 }
@@ -356,65 +411,71 @@ inline Tensor ExpertGroupModule::backward_impl(
     const int BT = ctx.B * ctx.T;
     const int C = mConfig.hidden_size;
     const int E = mConfig.num_experts;
-    const int capacity = (BT * mConfig.top_k * mConfig.capacity_factor) / E;
+    const int K = mConfig.top_k;
+    const int total_tokens = BT * K;
 
-    // Step 1: Backward through combine (scatter gradient to experts)
+    // Step 1: Backward through unpermute+combine
+    // d_expert_outputs[permuted_idx] += routing_weights[token, k] * grad_output[token]
+    // d_routing_weights[token, k] += dot(expert_outputs[permuted_idx], grad_output[token])
+    //
+    // For now, use permute of grad_output (gradient flows through expert path only)
+    // Note: d_expert_outputs should be allocated by the caller
     Tensor d_expert_outputs;
-    // combine_outputs_backward(grad_output, routing, d_expert_outputs, ctx.stream);
+    d_expert_outputs.DType = grad_output.DType;
+    // TODO: Allocate d_expert_outputs (total_tokens, C) from workspace
 
-    // Step 2: Backward through each expert
-    Tensor d_dispatched;
-    d_dispatched.DType = grad_output.DType;
-    grads.experts.resize(E);
-
-    for (int e = 0; e < E; ++e) {
-        Tensor d_expert_output = d_expert_outputs;
-        d_expert_output.Data = d_expert_outputs.Data +
-                               e * capacity * C * get_dtype_size(d_expert_output.DType);
-        d_expert_output.Sizes[0] = capacity;
-
-        Tensor d_expert_input = d_dispatched;
-        d_expert_input.Data = d_dispatched.Data +
-                              e * capacity * C * get_dtype_size(d_expert_input.DType);
-
-        mExperts[e].backward(ctx, w.experts[e], acts.expert_acts[e],
-                             d_expert_output, grads.experts[e], accumulate);
+    // Permute gradient to expert-grouped order (inverse of combine)
+    if (grad_output.DType == ETensorDType::BF16) {
+        moe_permute_tokens(
+            d_expert_outputs.get<nv_bfloat16>(),
+            grad_output.get<nv_bfloat16>(),
+            acts.gather_indices.get<int>(),
+            total_tokens, BT, C, K, ctx.stream
+        );
+    } else {
+        moe_permute_tokens(
+            d_expert_outputs.get<float>(),
+            grad_output.get<float>(),
+            acts.gather_indices.get<int>(),
+            total_tokens, BT, C, K, ctx.stream
+        );
     }
 
-    // Step 3: Backward through dispatch (gather gradient from experts)
+    // Scale by routing weights (element-wise on the hidden dimension)
+    // TODO: implement fused scale kernel
+
+    // Step 2: Backward through each expert
+    Tensor d_permuted_input;
+    d_permuted_input.DType = grad_output.DType;
+    // TODO: Allocate d_permuted_input (total_tokens, C) from workspace
+    grads.expert_grads.resize(E);
+    int offset = 0;
+
+    for (int e = 0; e < E; ++e) {
+        const int* h_count_ptr = routing.token_counts.get<int>();
+        int expert_tokens = h_count_ptr[e];
+
+        if (expert_tokens == 0) continue;
+
+        Tensor d_expert_output = slice(d_expert_outputs, 0, offset, offset + expert_tokens);
+        Tensor d_expert_input = slice(d_permuted_input, 0, offset, offset + expert_tokens);
+
+        mExperts[e].backward(ctx, w.experts[e], acts.expert_acts[e],
+                             d_expert_output, grads.expert_grads[e], accumulate);
+
+        offset += expert_tokens;
+    }
+
+    // Step 3: Unpermute gradient back to token order
     Tensor d_input;
-    // dispatch_tokens_backward(d_dispatched, routing, d_input, ctx.stream);
+    d_input.DType = grad_output.DType;
+    // TODO: Allocate d_input (BT, C) from workspace
+
+    // Use unpermute_and_combine with uniform weights=1/K to sum gradients
+    // (each token receives gradient from K expert paths)
+    // TODO: implement proper gradient accumulation kernel
 
     return d_input;
-}
-
-inline void ExpertGroupModule::dispatch_tokens(
-    Tensor& input, const RouterModule::RouterOutput& routing,
-    Tensor& dispatched, cudaStream_t stream) {
-
-    // Scatter tokens to their assigned experts
-    // For each expert e:
-    //   dispatched[e, :, :] = input[routing.token_indices[e], :]
-    //
-    // This requires a scatter operation that:
-    // 1. Iterates over token_indices for each expert
-    // 2. Copies tokens to the dispatched buffer
-    // 3. Handles capacity overflow (drop tokens if needed)
-
-    // Placeholder - requires specialized CUDA kernel
-}
-
-inline void ExpertGroupModule::combine_outputs(
-    Tensor& expert_outputs, const RouterModule::RouterOutput& routing,
-    Tensor& combined, cudaStream_t stream) {
-
-    // Gather and combine expert outputs
-    // For each token t:
-    //   combined[t] = sum_k(routing_weights[t, k] * expert_outputs[expert_indices[t, k], position[t, k]])
-    //
-    // This requires a weighted gather operation
-
-    // Placeholder - requires specialized CUDA kernel
 }
 
 /**

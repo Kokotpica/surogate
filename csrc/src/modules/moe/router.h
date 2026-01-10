@@ -119,8 +119,7 @@ private:
     Config mConfig;
 
     // Internal helpers
-    void compute_aux_loss(Activations& acts, int B, int T);
-    void top_k_routing(Tensor& probs, Tensor& weights, Tensor& indices, int BT, int k);
+    void compute_aux_loss(Activations& acts, int B, int T, cudaStream_t stream);
 };
 
 // ============================================================================
@@ -156,29 +155,49 @@ inline RouterModule::RouterOutput RouterModule::forward_impl(
     }
 
     // Softmax to get routing probabilities
-    // softmax(acts.softmax_probs, acts.logits, BT, E, ctx.stream);
-    acts.softmax_probs = acts.logits;  // Placeholder - actual softmax needed
+    if (acts.logits.DType == ETensorDType::BF16) {
+        moe_softmax_forward(
+            acts.softmax_probs.get<nv_bfloat16>(),
+            acts.logits.get<nv_bfloat16>(),
+            BT, E, ctx.stream
+        );
+    } else {
+        moe_softmax_forward(
+            acts.softmax_probs.get<float>(),
+            acts.logits.get<float>(),
+            BT, E, ctx.stream
+        );
+    }
 
     // Top-k selection
     RouterOutput output;
-    top_k_routing(acts.softmax_probs, output.routing_weights, output.expert_indices, BT, K);
-
-    // Normalize routing weights if configured
-    if (mConfig.normalize_routing) {
-        // Normalize so selected weights sum to 1 per token
-        // normalize_along_dim(output.routing_weights, 1, ctx.stream);
+    if (acts.softmax_probs.DType == ETensorDType::BF16) {
+        moe_topk_forward(
+            output.expert_indices.get<int>(),
+            output.routing_weights.get<nv_bfloat16>(),
+            acts.softmax_probs.get<nv_bfloat16>(),
+            BT, E, K, mConfig.normalize_routing, ctx.stream
+        );
+    } else {
+        moe_topk_forward(
+            output.expert_indices.get<int>(),
+            output.routing_weights.get<float>(),
+            acts.softmax_probs.get<float>(),
+            BT, E, K, mConfig.normalize_routing, ctx.stream
+        );
     }
 
+    // Compute token counts per expert (for load balancing loss and dispatch)
+    moe_compute_expert_counts(
+        output.token_counts.get<int>(),
+        output.expert_indices.get<int>(),
+        BT, K, E, ctx.stream
+    );
+
     // Compute auxiliary losses
-    compute_aux_loss(acts, ctx.B, ctx.T);
+    compute_aux_loss(acts, ctx.B, ctx.T, ctx.stream);
     output.aux_loss = acts.output.aux_loss;
     output.z_loss = acts.output.z_loss;
-
-    // Compute dispatch/combine masks for expert execution
-    // This involves:
-    // 1. Creating per-expert token lists (respecting capacity)
-    // 2. Computing dispatch mask for scattering tokens to experts
-    // 3. Computing combine weights for gathering expert outputs
 
     acts.output = output;
     return output;
@@ -225,32 +244,39 @@ inline Tensor RouterModule::backward_impl(
     return d_input;
 }
 
-inline void RouterModule::compute_aux_loss(Activations& acts, int B, int T) {
+inline void RouterModule::compute_aux_loss(Activations& acts, int B, int T, cudaStream_t stream) {
     const int BT = B * T;
     const int E = mConfig.num_experts;
+    const int K = mConfig.top_k;
 
-    // Load balancing loss: encourages uniform expert utilization
-    // aux_loss = E * sum_e(f_e * P_e)
-    // where f_e = fraction of tokens routed to expert e
-    //       P_e = mean routing probability to expert e
+    // Allocate device memory for aux_loss output
+    float* d_aux_loss = nullptr;
+    cudaMallocAsync(&d_aux_loss, sizeof(float), stream);
 
-    // Router z-loss: prevents logits from growing too large
-    // z_loss = (1/BT) * sum(log(sum(exp(logits))))^2
+    // Compute load balancing loss using kernel
+    if (acts.softmax_probs.DType == ETensorDType::BF16) {
+        moe_compute_aux_loss(
+            d_aux_loss,
+            acts.softmax_probs.get<nv_bfloat16>(),
+            acts.output.expert_indices.get<int>(),
+            BT, E, K, mConfig.aux_loss_coef, stream
+        );
+    } else {
+        moe_compute_aux_loss(
+            d_aux_loss,
+            acts.softmax_probs.get<float>(),
+            acts.output.expert_indices.get<int>(),
+            BT, E, K, mConfig.aux_loss_coef, stream
+        );
+    }
 
-    acts.output.aux_loss = 0.0f;  // Placeholder
-    acts.output.z_loss = 0.0f;    // Placeholder
-}
+    // Copy result back to host
+    cudaMemcpyAsync(&acts.output.aux_loss, d_aux_loss, sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaFreeAsync(d_aux_loss, stream);
 
-inline void RouterModule::top_k_routing(Tensor& probs, Tensor& weights, Tensor& indices, int BT, int k) {
-    // Select top-k experts for each token
-    // This is typically done with a specialized CUDA kernel
-
-    // For each token:
-    // 1. Find the k experts with highest probability
-    // 2. Store their indices in 'indices'
-    // 3. Store their probabilities in 'weights'
-
-    // Placeholder - actual implementation requires top-k kernel
+    // Router z-loss is computed separately (requires logits before softmax)
+    acts.output.z_loss = 0.0f;  // TODO: implement z-loss kernel
 }
 
 /**

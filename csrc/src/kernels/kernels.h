@@ -1039,4 +1039,175 @@ void dequantize_bnb_nf4_double(nv_bfloat16* out, const unsigned char* in,
 /// @return Pointer to static array of 16 floats.
 const float* get_nf4_codebook();
 
+// ============================================================================
+// Mixture of Experts (MoE) Kernels
+// ============================================================================
+// Routing, expert selection, and token dispatch operations for MoE layers.
+
+/// @brief Row-wise softmax for MoE routing logits.
+/// @param out Output routing probabilities (num_tokens, num_experts).
+/// @param inp Input routing logits (num_tokens, num_experts).
+/// @param num_tokens Number of tokens (batch_size * seq_len).
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_softmax_forward(float* out, const float* inp, int num_tokens, int num_experts, cudaStream_t stream);
+void moe_softmax_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_tokens, int num_experts, cudaStream_t stream);
+
+/// @brief Element-wise sigmoid for DeepSeek-style MoE routing.
+/// @param out Output routing scores (num_elements).
+/// @param inp Input routing logits (num_elements).
+/// @param num_elements Total number of elements.
+/// @param stream CUDA stream.
+void moe_sigmoid_forward(float* out, const float* inp, int num_elements, cudaStream_t stream);
+void moe_sigmoid_forward(nv_bfloat16* out, const nv_bfloat16* inp, int num_elements, cudaStream_t stream);
+
+/// @brief Top-K expert selection per token.
+/// @param expert_indices Output expert indices (num_tokens, top_k).
+/// @param routing_weights Output routing weights (num_tokens, top_k).
+/// @param scores Input routing scores (num_tokens, num_experts).
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param top_k Number of experts per token.
+/// @param normalize_weights Whether to normalize weights to sum to 1.
+/// @param stream CUDA stream.
+void moe_topk_forward(int* expert_indices, float* routing_weights, const float* scores,
+                      int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
+void moe_topk_forward(int* expert_indices, nv_bfloat16* routing_weights, const nv_bfloat16* scores,
+                      int num_tokens, int num_experts, int top_k, bool normalize_weights, cudaStream_t stream);
+
+/// @brief Compute histogram of tokens assigned to each expert.
+/// @param expert_counts Output counts per expert (num_experts).
+/// @param expert_indices Input expert indices (num_tokens, top_k).
+/// @param num_tokens Number of tokens.
+/// @param top_k Number of experts per token.
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_compute_expert_counts(int* expert_counts, const int* expert_indices,
+                               int num_tokens, int top_k, int num_experts, cudaStream_t stream);
+
+/// @brief Compute expert offsets from counts (exclusive prefix sum).
+/// expert_offsets[i] = sum(expert_counts[0:i])
+/// expert_offsets[num_experts] = total_tokens (num_tokens * top_k)
+/// @param expert_offsets Output offsets (num_experts + 1).
+/// @param expert_counts Input counts per expert (num_experts).
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_compute_expert_offsets(int* expert_offsets, const int* expert_counts,
+                                int num_experts, cudaStream_t stream);
+
+/// @brief Build gather/scatter indices for token permutation.
+/// gather_indices[permuted_pos] = original token assignment index
+/// scatter_indices[assignment_idx] = permuted position
+/// @param gather_indices Output gather indices (total_tokens).
+/// @param scatter_indices Output scatter indices (total_tokens).
+/// @param expert_indices Expert assignments (num_tokens, top_k).
+/// @param expert_offsets Expert offsets from compute_expert_offsets (num_experts + 1).
+/// @param expert_positions Temporary storage for atomic counters (num_experts). Zeroed by caller.
+/// @param num_tokens Number of original tokens.
+/// @param top_k Number of experts per token.
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_build_indices(int* gather_indices, int* scatter_indices,
+                       const int* expert_indices, const int* expert_offsets,
+                       int* expert_positions, int num_tokens, int top_k,
+                       int num_experts, cudaStream_t stream);
+
+/// @brief Permute tokens from natural order to expert-grouped order.
+/// @param out Output permuted hidden states (total_tokens, hidden_size).
+/// @param inp Input hidden states (num_tokens, hidden_size).
+/// @param gather_indices Gather indices from compute_gather_indices (total_tokens).
+/// @param total_tokens Total token-expert assignments (num_tokens * top_k).
+/// @param num_tokens Number of original tokens.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_permute_tokens(float* out, const float* inp, const int* gather_indices,
+                        int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+void moe_permute_tokens(nv_bfloat16* out, const nv_bfloat16* inp, const int* gather_indices,
+                        int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+
+/// @brief Unpermute and weight-combine expert outputs back to token order.
+/// @param out Output combined hidden states (num_tokens, hidden_size).
+/// @param expert_out Expert outputs in permuted order (total_tokens, hidden_size).
+/// @param routing_weights Routing weights (num_tokens, top_k).
+/// @param scatter_indices Scatter indices (inverse of gather_indices).
+/// @param num_tokens Number of original tokens.
+/// @param total_tokens Total token-expert assignments.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_unpermute_and_combine(float* out, const float* expert_out, const float* routing_weights,
+                               const int* scatter_indices, int num_tokens, int total_tokens,
+                               int hidden_size, int top_k, cudaStream_t stream);
+void moe_unpermute_and_combine(nv_bfloat16* out, const nv_bfloat16* expert_out, const nv_bfloat16* routing_weights,
+                               const int* scatter_indices, int num_tokens, int total_tokens,
+                               int hidden_size, int top_k, cudaStream_t stream);
+
+/// @brief Compute auxiliary load-balancing loss for MoE training.
+/// aux_loss = coef * num_experts * sum_e(fraction_e * prob_e)
+/// @param aux_loss Output scalar loss value (device pointer).
+/// @param routing_probs Routing probabilities post-softmax (num_tokens, num_experts).
+/// @param expert_indices Expert indices (num_tokens, top_k).
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param top_k Number of experts per token.
+/// @param aux_loss_coef Loss coefficient (typically 0.01).
+/// @param stream CUDA stream.
+void moe_compute_aux_loss(float* aux_loss, const float* routing_probs, const int* expert_indices,
+                          int num_tokens, int num_experts, int top_k, float aux_loss_coef, cudaStream_t stream);
+void moe_compute_aux_loss(float* aux_loss, const nv_bfloat16* routing_probs, const int* expert_indices,
+                          int num_tokens, int num_experts, int top_k, float aux_loss_coef, cudaStream_t stream);
+
+// MoE Backward Kernels
+
+/// @brief Backward pass for softmax routing.
+/// d_logits = softmax_probs * (d_probs - sum_j(d_probs_j * softmax_probs_j))
+/// @param d_logits Output gradient w.r.t. logits (num_tokens, num_experts).
+/// @param d_probs Input gradient w.r.t. softmax output (num_tokens, num_experts).
+/// @param softmax_probs Saved softmax probabilities from forward (num_tokens, num_experts).
+/// @param num_tokens Number of tokens.
+/// @param num_experts Number of experts.
+/// @param stream CUDA stream.
+void moe_softmax_backward(float* d_logits, const float* d_probs, const float* softmax_probs,
+                          int num_tokens, int num_experts, cudaStream_t stream);
+void moe_softmax_backward(nv_bfloat16* d_logits, const nv_bfloat16* d_probs, const nv_bfloat16* softmax_probs,
+                          int num_tokens, int num_experts, cudaStream_t stream);
+
+/// @brief Backward pass for unpermute+combine operation.
+/// Computes gradients for expert outputs and optionally routing weights.
+/// @param d_expert_out Output gradient for expert outputs (total_tokens, hidden_size).
+/// @param d_routing_weights Optional output gradient for routing weights (num_tokens, top_k). Can be NULL.
+/// @param d_output Input gradient from downstream (num_tokens, hidden_size).
+/// @param expert_out Expert outputs from forward pass (for weight gradient computation).
+/// @param routing_weights Routing weights from forward pass.
+/// @param scatter_indices Scatter indices from forward pass.
+/// @param num_tokens Number of original tokens.
+/// @param total_tokens Total token-expert assignments.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_combine_backward(float* d_expert_out, float* d_routing_weights,
+                          const float* d_output, const float* expert_out, const float* routing_weights,
+                          const int* scatter_indices, int num_tokens, int total_tokens,
+                          int hidden_size, int top_k, cudaStream_t stream);
+void moe_combine_backward(nv_bfloat16* d_expert_out, nv_bfloat16* d_routing_weights,
+                          const nv_bfloat16* d_output, const nv_bfloat16* expert_out, const nv_bfloat16* routing_weights,
+                          const int* scatter_indices, int num_tokens, int total_tokens,
+                          int hidden_size, int top_k, cudaStream_t stream);
+
+/// @brief Backward pass for token permutation.
+/// Gathers gradients from permuted order back to token order.
+/// @param d_input Output gradient in token order (num_tokens, hidden_size).
+/// @param d_permuted Input gradient in permuted order (total_tokens, hidden_size).
+/// @param gather_indices Gather indices from forward pass.
+/// @param total_tokens Total token-expert assignments.
+/// @param num_tokens Number of original tokens.
+/// @param hidden_size Hidden dimension.
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_permute_backward(float* d_input, const float* d_permuted, const int* gather_indices,
+                          int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+void moe_permute_backward(nv_bfloat16* d_input, const nv_bfloat16* d_permuted, const int* gather_indices,
+                          int total_tokens, int num_tokens, int hidden_size, int top_k, cudaStream_t stream);
+
 #endif //SUROGATE_SRC_KERNELS_KERNELS_H

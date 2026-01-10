@@ -37,6 +37,13 @@ struct has_mlp_weights : std::false_type {};
 template<typename T>
 struct has_mlp_weights<T, std::void_t<decltype(std::declval<T>().mlp_up_weight)>> : std::true_type {};
 
+// Helper type trait to detect if a block has MoE-specific weights (router, experts)
+template<typename T, typename = void>
+struct has_moe_weights : std::false_type {};
+
+template<typename T>
+struct has_moe_weights<T, std::void_t<decltype(std::declval<T>().router)>> : std::true_type {};
+
 /**
  * @brief Status tracking for double-buffered prefetching
  */
@@ -1622,7 +1629,45 @@ void ModularWeightManager<Block>::iterate_tensors(
             callback(prefix + ".mlp.up.weight", shard(block.mlp_up_weight, {2 * D, C}));
             callback(prefix + ".mlp.down_proj.weight", shard(block.mlp_down_weight, {C, D}));
         }
-        // TODO: Add MoE-specific weights (router, experts) for MoE blocks
+
+        // MoE-specific weights (router, experts) - only for MoE blocks
+        if constexpr (has_moe_weights<BlockWeights>::value) {
+            // Get MoE params from block config (MoE blocks have num_experts directly in their Config)
+            const auto& bcfg = mConfig.block_config;
+            int num_experts = bcfg.num_experts;
+            callback(prefix + ".mlp.router.gate.weight", shard(block.router.gate, {num_experts, C}));
+
+            // Expert weights: iterate through all experts
+            // Each expert has: gate_proj (C, D), up_proj (C, D), down_proj (D, C)
+            // For batched layout: (num_experts, C, 2*D) and (num_experts, D, C)
+            if (block.experts.use_batched) {
+                callback(prefix + ".mlp.experts.gate_up_proj.weight",
+                         shard(block.experts.gate_up_proj, {num_experts, 2 * D, C}));
+                callback(prefix + ".mlp.experts.down_proj.weight",
+                         shard(block.experts.down_proj, {num_experts, C, D}));
+            } else {
+                // Per-expert weights
+                for (int e = 0; e < static_cast<int>(block.experts.experts.size()); ++e) {
+                    std::string exp_prefix = prefix + ".mlp.experts." + std::to_string(e);
+                    auto& expert = block.experts.experts[e];
+                    callback(exp_prefix + ".gate_proj.weight", shard(expert.gate_proj, {D, C}));
+                    callback(exp_prefix + ".up_proj.weight", shard(expert.up_proj, {D, C}));
+                    callback(exp_prefix + ".down_proj.weight", shard(expert.down_proj, {C, D}));
+                }
+            }
+
+            // Shared expert (if present)
+            if (block.shared_expert.has_value()) {
+                int shared_D = bcfg.shared_expert_intermediate > 0 ?
+                               bcfg.shared_expert_intermediate : static_cast<int>(D);
+                callback(prefix + ".mlp.shared_expert.gate_proj.weight",
+                         shard(block.shared_expert->gate_proj, {shared_D, C}));
+                callback(prefix + ".mlp.shared_expert.up_proj.weight",
+                         shard(block.shared_expert->up_proj, {shared_D, C}));
+                callback(prefix + ".mlp.shared_expert.down_proj.weight",
+                         shard(block.shared_expert->down_proj, {C, shared_D}));
+            }
+        }
     }
 }
 
@@ -1675,7 +1720,35 @@ void ModularWeightManager<Block>::allocate_block_weights(BlockWeights& block, ET
         block.mlp_up_weight = alloc(matmul_dtype, "mlp_up_w", {2 * D, C});
         block.mlp_down_weight = alloc(matmul_dtype, "mlp_down_w", {C, D});
     }
-    // TODO: Add MoE-specific weight allocation (router, experts) for MoE blocks
+
+    // MoE-specific weight allocation (router, experts) - only for MoE blocks
+    if constexpr (has_moe_weights<BlockWeights>::value) {
+        // MoE block config has num_experts directly in its Config type
+        int num_experts = cfg.num_experts;
+        long D = cfg.intermediate_size;
+
+        // Router gate: (hidden_size, num_experts)
+        block.router.gate = alloc(matmul_dtype, "router_gate_w", {num_experts, C});
+
+        // Use batched layout for grouped GEMM efficiency
+        block.experts.use_batched = true;
+
+        // Batched expert weights
+        // gate_up_proj: (num_experts, hidden_size, 2 * intermediate_size)
+        // down_proj: (num_experts, intermediate_size, hidden_size)
+        block.experts.gate_up_proj = alloc(matmul_dtype, "experts_gate_up_w", {num_experts, 2 * D, C});
+        block.experts.down_proj = alloc(matmul_dtype, "experts_down_w", {num_experts, C, D});
+
+        // Shared expert (if configured)
+        if (cfg.use_shared_expert) {
+            int shared_D = cfg.shared_expert_intermediate > 0 ?
+                           cfg.shared_expert_intermediate : static_cast<int>(D);
+            block.shared_expert.emplace();
+            block.shared_expert->gate_proj = alloc(matmul_dtype, "shared_expert_gate_w", {shared_D, C});
+            block.shared_expert->up_proj = alloc(matmul_dtype, "shared_expert_up_w", {shared_D, C});
+            block.shared_expert->down_proj = alloc(matmul_dtype, "shared_expert_down_w", {C, shared_D});
+        }
+    }
 }
 
 template<typename Block>

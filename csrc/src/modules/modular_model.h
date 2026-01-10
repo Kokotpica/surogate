@@ -1190,9 +1190,243 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     rs.temp_free(acts.swiglu);
                     rs.temp_free(acts.mlp_up);
                 }
+            } else if constexpr (has_moe_weights<BlockWeights>::value) {
+                // MoE block forward pass
+                // Full implementation using the tested MoE kernels (moe_kernels.cu)
+
+                const int BT = B * T;
+                // MoE config is required for MoE blocks
+                assert(mConfig.moe_config.has_value() && "MoE config must be set for MoE blocks");
+                const auto& moe_cfg = *mConfig.moe_config;
+                const int num_experts = moe_cfg.num_experts;
+                const int top_k = moe_cfg.top_k;
+                const int expert_D = mConfig.IntermediateSize; // Per-expert intermediate size
+                const int total_expert_tokens = BT * top_k;
+                const int dev = rs.DeviceId;
+
+                // Create flat view of ln2 for routing: (B, T, C) -> (BT, C)
+                Tensor flat_ln2;
+                flat_ln2.Data = acts.ln2.Data;
+                flat_ln2.DType = acts.ln2.DType;
+                flat_ln2.Sizes[0] = BT;
+                flat_ln2.Sizes[1] = C;
+                flat_ln2.Rank = 2;
+                flat_ln2.Device = dev;
+
+                // Allocate temporary tensors for router outputs from stack
+                // Router computation always in FP32 for numerical stability
+                Tensor router_logits{ETensorDType::FP32, {BT, num_experts}, nullptr, nullptr, 2, dev};
+                Tensor router_probs{ETensorDType::FP32, {BT, num_experts}, nullptr, nullptr, 2, dev};
+                Tensor routing_weights_fp32{ETensorDType::FP32, {BT, top_k}, nullptr, nullptr, 2, dev};
+                Tensor expert_indices{ETensorDType::INT32, {BT, top_k}, nullptr, nullptr, 2, dev};
+                Tensor expert_counts{ETensorDType::INT32, {num_experts}, nullptr, nullptr, 1, dev};
+
+                rs.temp_acquire(router_logits);
+                rs.temp_acquire(router_probs);
+                rs.temp_acquire(routing_weights_fp32);
+                rs.temp_acquire(expert_indices);
+                rs.temp_acquire(expert_counts);
+
+                // Zero expert counts before atomic adds
+                fill_zero(expert_counts, main_stream);
+
+                // Step 1: Compute routing logits via matmul
+                // router_logits = flat_ln2 @ router.gate^T -> (BT, num_experts)
+                matmul(
+                    router_logits, weights.router.gate, flat_ln2, std::nullopt,
+                    nullptr, nullptr,
+                    rs.CublasLtHandle, rs.CuBlasWorkspace,
+                    num_experts, BT, C, EMMTranspose::TN, false,
+                    main_stream
+                );
+
+                // Step 2: Softmax over experts
+                moe_softmax_forward(
+                    router_probs.get<float>(),
+                    router_logits.get<float>(),
+                    BT, num_experts, main_stream
+                );
+
+                // Step 3: Top-K selection with weight normalization
+                moe_topk_forward(
+                    expert_indices.get<int>(),
+                    routing_weights_fp32.get<float>(),
+                    router_probs.get<float>(),
+                    BT, num_experts, top_k, true, main_stream
+                );
+
+                // Step 4: Compute expert token counts for load balancing
+                moe_compute_expert_counts(
+                    expert_counts.get<int>(),
+                    expert_indices.get<int>(),
+                    BT, top_k, num_experts, main_stream
+                );
+
+                // Step 5: Build gather/scatter indices for token permutation
+                // gather_indices: maps permuted position -> original token index
+                // scatter_indices: maps original token assignment -> permuted position
+                Tensor gather_indices{ETensorDType::INT32, {total_expert_tokens}, nullptr, nullptr, 1, dev};
+                Tensor scatter_indices{ETensorDType::INT32, {total_expert_tokens}, nullptr, nullptr, 1, dev};
+                rs.temp_acquire(gather_indices);
+                rs.temp_acquire(scatter_indices);
+
+                // Build indices using atomic position tracking
+                Tensor expert_offsets{ETensorDType::INT32, {num_experts + 1}, nullptr, nullptr, 1, dev};
+                Tensor expert_positions{ETensorDType::INT32, {num_experts}, nullptr, nullptr, 1, dev};
+                rs.temp_acquire(expert_offsets);
+                rs.temp_acquire(expert_positions);
+                fill_zero(expert_positions, main_stream);
+
+                // Compute expert offsets (cumsum of counts) - simple kernel or thrust scan
+                // For now, use exclusive scan pattern
+                moe_compute_expert_offsets(
+                    expert_offsets.get<int>(),
+                    expert_counts.get<int>(),
+                    num_experts, main_stream
+                );
+
+                // Build gather/scatter indices
+                moe_build_indices(
+                    gather_indices.get<int>(),
+                    scatter_indices.get<int>(),
+                    expert_indices.get<int>(),
+                    expert_offsets.get<int>(),
+                    expert_positions.get<int>(),
+                    BT, top_k, num_experts, main_stream
+                );
+
+                // Step 6: Permute tokens to expert-grouped order
+                Tensor permuted_input{acts.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
+                rs.temp_acquire(permuted_input);
+
+                if (acts.ln2.DType == ETensorDType::BF16) {
+                    moe_permute_tokens(
+                        permuted_input.get<nv_bfloat16>(),
+                        flat_ln2.get<nv_bfloat16>(),
+                        gather_indices.get<int>(),
+                        total_expert_tokens, BT, C, top_k, main_stream
+                    );
+                } else {
+                    moe_permute_tokens(
+                        permuted_input.get<float>(),
+                        flat_ln2.get<float>(),
+                        gather_indices.get<int>(),
+                        total_expert_tokens, BT, C, top_k, main_stream
+                    );
+                }
+
+                // Step 7: Expert computation (sequential for now, TODO: grouped GEMM)
+                // Each expert processes its assigned tokens with gate+up -> SwiGLU -> down
+                Tensor expert_outputs{acts.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
+                rs.temp_acquire(expert_outputs);
+                fill_zero(expert_outputs, main_stream);
+
+                // Copy expert_offsets to host for sequential expert dispatch
+                // TODO: Replace with grouped GEMM for efficiency
+                std::vector<int> h_expert_offsets(num_experts + 1);
+                CUDA_CHECK(cudaMemcpyAsync(h_expert_offsets.data(), expert_offsets.get<int>(),
+                                           (num_experts + 1) * sizeof(int), cudaMemcpyDeviceToHost, main_stream));
+                CUDA_CHECK(cudaStreamSynchronize(main_stream));
+
+                // Allocate per-expert intermediate buffers
+                Tensor expert_gate_up{acts.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
+                Tensor expert_swiglu{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                rs.temp_acquire(expert_gate_up);
+                rs.temp_acquire(expert_swiglu);
+
+                // Sequential expert execution
+                for (int e = 0; e < num_experts; ++e) {
+                    int start = h_expert_offsets[e];
+                    int end = h_expert_offsets[e + 1];
+                    int expert_tokens = end - start;
+                    if (expert_tokens == 0) continue;
+
+                    // Slice tensors for this expert's tokens
+                    Tensor exp_inp = slice(permuted_input, 0, start, end);
+                    Tensor exp_gate_up = slice(expert_gate_up, 0, start, end);
+                    Tensor exp_swiglu = slice(expert_swiglu, 0, start, end);
+                    Tensor exp_out = slice(expert_outputs, 0, start, end);
+
+                    // Get this expert's weights from batched layout
+                    // gate_up_proj: (num_experts, 2*D, C) -> slice expert e: (2*D, C)
+                    // down_proj: (num_experts, C, D) -> slice expert e: (C, D)
+                    Tensor exp_gate_up_w = slice(weights.experts.gate_up_proj, 0, e, e + 1);
+                    exp_gate_up_w.Sizes[0] = 2 * expert_D;
+                    exp_gate_up_w.Sizes[1] = C;
+                    exp_gate_up_w.Rank = 2;
+
+                    Tensor exp_down_w = slice(weights.experts.down_proj, 0, e, e + 1);
+                    exp_down_w.Sizes[0] = C;
+                    exp_down_w.Sizes[1] = expert_D;
+                    exp_down_w.Rank = 2;
+
+                    // Gate+Up projection: exp_gate_up = exp_inp @ exp_gate_up_w^T
+                    matmul(
+                        exp_gate_up, exp_gate_up_w, exp_inp, std::nullopt,
+                        nullptr, nullptr,
+                        rs.CublasLtHandle, rs.CuBlasWorkspace,
+                        2 * expert_D, expert_tokens, C, EMMTranspose::TN, false,
+                        main_stream
+                    );
+
+                    // SwiGLU activation
+                    swiglu_forward(exp_swiglu, exp_gate_up, nullptr, 1, expert_tokens, expert_D, main_stream);
+
+                    // Down projection: exp_out = exp_swiglu @ exp_down_w^T
+                    matmul(
+                        exp_out, exp_down_w, exp_swiglu, std::nullopt,
+                        nullptr, nullptr,
+                        rs.CublasLtHandle, rs.CuBlasWorkspace,
+                        C, expert_tokens, expert_D, EMMTranspose::TN, false,
+                        main_stream
+                    );
+                }
+
+                // Step 8: Unpermute and combine expert outputs
+                // Output goes directly to acts.mlp_down
+                Tensor& mlp_down_out = acts.mlp_down;
+                if (acts.ln2.DType == ETensorDType::BF16) {
+                    // Convert routing weights to BF16 for the combine kernel
+                    Tensor routing_weights_bf16{ETensorDType::BF16, {BT, top_k}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(routing_weights_bf16);
+                    convert_dtype(routing_weights_bf16.get<nv_bfloat16>(),
+                                  routing_weights_fp32.get<float>(),
+                                  BT * top_k, main_stream);
+                    moe_unpermute_and_combine(
+                        mlp_down_out.get<nv_bfloat16>(),
+                        expert_outputs.get<nv_bfloat16>(),
+                        routing_weights_bf16.get<nv_bfloat16>(),
+                        scatter_indices.get<int>(),
+                        BT, total_expert_tokens, C, top_k, main_stream
+                    );
+                    rs.temp_free(routing_weights_bf16);
+                } else {
+                    moe_unpermute_and_combine(
+                        mlp_down_out.get<float>(),
+                        expert_outputs.get<float>(),
+                        routing_weights_fp32.get<float>(),
+                        scatter_indices.get<int>(),
+                        BT, total_expert_tokens, C, top_k, main_stream
+                    );
+                }
+
+                // Free temporaries in reverse order
+                rs.temp_free(expert_swiglu);
+                rs.temp_free(expert_gate_up);
+                rs.temp_free(expert_outputs);
+                rs.temp_free(permuted_input);
+                rs.temp_free(expert_positions);
+                rs.temp_free(expert_offsets);
+                rs.temp_free(scatter_indices);
+                rs.temp_free(gather_indices);
+                rs.temp_free(expert_counts);
+                rs.temp_free(expert_indices);
+                rs.temp_free(routing_weights_fp32);
+                rs.temp_free(router_probs);
+                rs.temp_free(router_logits);
+
             } else {
-                // MoE block - TODO: implement expert routing
-                // For now, skip MLP processing (will result in zeros)
+                // Unknown block type - zero output
                 fill_zero(acts.mlp_down, main_stream);
             }
         }, main_stream, rs.forward_block_graph(l), use_cuda_graphs,

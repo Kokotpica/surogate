@@ -230,6 +230,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/encoder.cu
     src/kernels/matmul.cpp
     src/kernels/swiglu.cu
+    src/kernels/moe_kernels.cu
     src/kernels/rope.cu
     src/kernels/rmsnorm.cu
     src/kernels/qk_norm.cu
@@ -333,6 +334,7 @@ if (BUILD_TESTS)
 	            src/testing/test-normuon.cu
 	            src/testing/test-fp4.cu
 	            src/testing/test-bnb-quant.cpp
+	            src/testing/test-moe.cu
 	    )
     target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
     target_compile_options(unit-tests PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
