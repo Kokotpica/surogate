@@ -8,8 +8,6 @@
 #include <memory>
 #include <vector>
 
-#include <fmt/format.h>
-
 #include "qlora_config.h"
 #include "fp8_weights.h"
 #include "block_quantized_tensor.h"
@@ -162,7 +160,7 @@ public:
     const QLoRAConfig& qlora_config() const { return mConfig.qlora_config; }
 
     // =========================================================================
-    // MoE Support - Selective Expert Dequantization
+    // MoE Support
     // =========================================================================
 
     /**
@@ -180,32 +178,15 @@ public:
     }
 
     /**
-     * @brief Get router gate weights (BF16, no dequant needed)
-     */
-    Tensor& get_router_gate(int layer_idx, cudaStream_t stream);
-
-    /**
-     * @brief Get dequantized weights for active experts (selective dequantization)
+     * @brief Get router gate weights for MoE (BF16, no dequant needed)
      *
-     * Call after routing to dequantize only the selected experts.
-     * Only dequantizes the top_k active experts instead of all num_experts.
+     * Router gate is small and kept in BF16.
      *
      * @param layer_idx Layer index
-     * @param active_expert_indices Array of expert indices selected by router
-     * @param num_active Number of active experts (top_k)
-     * @param stream CUDA stream
-     * @return Vector of pointers to dequantized expert weights
+     * @param stream CUDA stream (unused, kept for interface consistency)
+     * @return Reference to router gate tensor (num_experts, hidden_size)
      */
-    std::vector<DequantizedExpertWeights*> get_active_experts(
-        int layer_idx, const int* active_expert_indices, int num_active, cudaStream_t stream);
-
-    /**
-     * @brief Get MoE attention weights (dequantizes attention weights for MoE layer)
-     *
-     * For MoE models, attention weights are stored separately from experts.
-     * This method dequantizes qkv_proj and out_proj for a given layer.
-     */
-    void get_moe_attention_weights(int layer_idx, cudaStream_t stream);
+    Tensor& get_router_gate(int layer_idx, cudaStream_t stream);
 
     /**
      * @brief Get memory stats
@@ -258,6 +239,17 @@ public:
     }
 
 private:
+    /**
+     * @brief Get attention and expert weights for MoE blocks
+     *
+     * Dequantizes attention weights (QKV + output) and ALL expert weights
+     * into batched tensors for efficient forward pass.
+     *
+     * @param layer_idx Layer index
+     * @param stream CUDA stream for dequantization
+     */
+    void get_moe_attention_weights(int layer_idx, cudaStream_t stream);
+
     Config mConfig;
     TensorAllocator* mAllocator;
     cudaDeviceProp mDeviceProps;  // Store by value to avoid dangling pointer
@@ -304,31 +296,22 @@ private:
     uint64_t mBufferVersion = 0;  ///< Step version when buffers were last filled
 
     // =========================================================================
-    // MoE-specific members
+    // MoE-specific members for batched expert dequantization
     // =========================================================================
 
-    /// Expert dequantization buffers (top_k sets, not num_experts)
-    std::vector<Tensor> mDequantExpertGateUp;  ///< [top_k] gate_up buffers
-    std::vector<Tensor> mDequantExpertDown;    ///< [top_k] down buffers
+    /// Batched expert dequantization buffers (all experts, for forward pass)
+    /// Shape: (num_experts, 2 * moe_intermediate, hidden_size)
+    Tensor mBatchedExpertGateUp;
+    /// Shape: (num_experts, hidden_size, moe_intermediate)
+    Tensor mBatchedExpertDown;
 
-    /// Dequantized expert weights output structure
-    std::vector<DequantizedExpertWeights> mDequantExperts;
-
-    /// Expert cache: tracks which experts are currently in each buffer slot
-    std::vector<ExpertCacheEntry> mExpertCache;
-
-    /// Number of expert buffers allocated (= top_k for MoE)
-    int mNumExpertBuffers = 0;
+    /// Number of experts in MoE model
+    int mNumMoEExperts = 0;
 
     void allocate_dequant_buffers();
+    void allocate_moe_expert_buffers();
     void setup_block_weights_structure();
     void setup_fp8_block_weights_structure();
-
-    /// Allocate MoE expert dequantization buffers
-    void allocate_moe_expert_buffers();
-
-    /// Find or allocate a buffer slot for an expert
-    int find_or_allocate_expert_slot(int layer_idx, int expert_idx);
 
     /**
      * @brief Check if we should use native FP8 weights (no dequantization)
@@ -448,6 +431,15 @@ void FP8WeightProvider<Block>::setup_block_weights_structure() {
     if constexpr (has_mlp_weights<BlockWeights>::value) {
         mDequantBlock.mlp_up_weight = mDequantGateUp;
         mDequantBlock.mlp_down_weight = mDequantDown;
+    }
+
+    // Set up MoE expert weights (batched layout)
+    if constexpr (has_moe_weights<BlockWeights>::value) {
+        if (mConfig.qlora_config.is_moe()) {
+            mDequantBlock.experts.use_batched = true;
+            mDequantBlock.experts.gate_up_proj = mBatchedExpertGateUp;
+            mDequantBlock.experts.down_proj = mBatchedExpertDown;
+        }
     }
 }
 
@@ -660,59 +652,25 @@ template<typename Block>
 void FP8WeightProvider<Block>::allocate_moe_expert_buffers() {
     auto ctx = mAllocator->with_context("FP8_MoE_DequantBuf");
 
-    const int top_k = mConfig.qlora_config.num_experts_per_tok;
     const int hidden = mConfig.hidden_size;
-    const int moe_intermediate = mConfig.qlora_config.moe_intermediate_size > 0
-        ? mConfig.qlora_config.moe_intermediate_size
-        : mConfig.intermediate_size;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+    const int num_experts = mConfig.qlora_config.num_experts;
 
-    mNumExpertBuffers = top_k;
+    mNumMoEExperts = num_experts;
 
-    // Allocate top_k buffers for selective dequantization
-    mDequantExpertGateUp.resize(top_k);
-    mDequantExpertDown.resize(top_k);
-    mDequantExperts.resize(top_k);
-    mExpertCache.resize(top_k);
+    // Allocate batched expert buffers (all experts for forward pass)
+    // gate_up_proj: (num_experts, 2 * moe_intermediate, hidden_size)
+    // down_proj: (num_experts, hidden_size, moe_intermediate)
+    mBatchedExpertGateUp = mAllocator->allocate(ETensorDType::BF16,
+        "batched_expert_gate_up",
+        EAllocationType::ON_DEVICE,
+        {(long)num_experts, (long)(2 * moe_inter), (long)hidden});
 
-    for (int i = 0; i < top_k; ++i) {
-        mDequantExpertGateUp[i] = mAllocator->allocate(
-            ETensorDType::BF16, fmt::format("expert_{}_gate_up", i).c_str(),
-            EAllocationType::ON_DEVICE,
-            {(long)(2 * moe_intermediate), (long)hidden});
-
-        mDequantExpertDown[i] = mAllocator->allocate(
-            ETensorDType::BF16, fmt::format("expert_{}_down", i).c_str(),
-            EAllocationType::ON_DEVICE,
-            {(long)hidden, (long)moe_intermediate});
-
-        // Set up DequantizedExpertWeights structure
-        mDequantExperts[i].gate_up_proj = mDequantExpertGateUp[i];
-        mDequantExperts[i].down_proj = mDequantExpertDown[i];
-
-        // Initialize cache entry as empty
-        mExpertCache[i].clear();
-    }
-}
-
-template<typename Block>
-int FP8WeightProvider<Block>::find_or_allocate_expert_slot(int layer_idx, int expert_idx) {
-    // First, check if this expert is already cached
-    for (int i = 0; i < mNumExpertBuffers; ++i) {
-        if (mExpertCache[i].matches(layer_idx, expert_idx, mStepVersion)) {
-            return i;  // Cache hit
-        }
-    }
-
-    // Find an empty or stale slot (different step version)
-    for (int i = 0; i < mNumExpertBuffers; ++i) {
-        if (mExpertCache[i].step_version != mStepVersion) {
-            return i;  // This slot is from a previous step, can reuse
-        }
-    }
-
-    // All slots are used in current step - shouldn't happen if top_k is correct
-    // Return slot 0 as fallback (will overwrite)
-    return 0;
+    mBatchedExpertDown = mAllocator->allocate(ETensorDType::BF16,
+        "batched_expert_down",
+        EAllocationType::ON_DEVICE,
+        {(long)num_experts, (long)hidden, (long)moe_inter});
 }
 
 template<typename Block>
@@ -722,88 +680,91 @@ Tensor& FP8WeightProvider<Block>::get_router_gate(int layer_idx, cudaStream_t st
 }
 
 template<typename Block>
-std::vector<DequantizedExpertWeights*> FP8WeightProvider<Block>::get_active_experts(
-    int layer_idx, const int* active_expert_indices, int num_active, cudaStream_t stream) {
-
-    std::vector<DequantizedExpertWeights*> result;
-    result.reserve(num_active);
-
-    const auto& moe_block = mFP8Weights->get_moe_block(layer_idx);
-    const int block_size = mConfig.qlora_config.block_size();
-
-    for (int i = 0; i < num_active; ++i) {
-        const int expert_idx = active_expert_indices[i];
-        int slot = find_or_allocate_expert_slot(layer_idx, expert_idx);
-
-        // Check if we need to dequantize
-        if (!mExpertCache[slot].matches(layer_idx, expert_idx, mStepVersion)) {
-            // Cache miss - need to dequantize this expert
-            const auto& expert = moe_block.experts[expert_idx];
-
-            // Dequantize gate_up projection
-            dequantize_per_block(
-                mDequantExpertGateUp[slot].get<nv_bfloat16>(),
-                expert.gate_up_proj.data.get<__nv_fp8_e4m3>(),
-                expert.gate_up_proj.block_scales.get<float>(),
-                expert.gate_up_proj.M, expert.gate_up_proj.K,
-                block_size, mDeviceProps, stream);
-
-            // Dequantize down projection
-            dequantize_per_block(
-                mDequantExpertDown[slot].get<nv_bfloat16>(),
-                expert.down_proj.data.get<__nv_fp8_e4m3>(),
-                expert.down_proj.block_scales.get<float>(),
-                expert.down_proj.M, expert.down_proj.K,
-                block_size, mDeviceProps, stream);
-
-            // Update cache
-            mExpertCache[slot].update(layer_idx, expert_idx, mStepVersion);
-        }
-
-        result.push_back(&mDequantExperts[slot]);
-    }
-
-    return result;
-}
-
-template<typename Block>
 void FP8WeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStream_t stream) {
-    const auto& moe_block = mFP8Weights->get_moe_block(layer_idx);
+    const auto& qblock = mFP8Weights->get_moe_block(layer_idx);
     const int block_size = mConfig.qlora_config.block_size();
 
-    // Check if we already have this layer's attention weights cached
+    // Check cache for this layer's weights
     const bool cache_hit = (mCurrentLayer == layer_idx) && (mBufferVersion == mStepVersion);
 
     if (!cache_hit) {
-        // Dequantize attention weights (QKV and Out projections)
+        // Dequantize attention weights
         dequantize_per_block(
             mDequantQKV.get<nv_bfloat16>(),
-            moe_block.qkv_proj.data.get<__nv_fp8_e4m3>(),
-            moe_block.qkv_proj.block_scales.get<float>(),
-            moe_block.qkv_proj.M, moe_block.qkv_proj.K,
+            qblock.qkv_proj.data.get<__nv_fp8_e4m3>(),
+            qblock.qkv_proj.block_scales.get<float>(),
+            qblock.qkv_proj.M, qblock.qkv_proj.K,
             block_size, mDeviceProps, stream);
 
         dequantize_per_block(
             mDequantOut.get<nv_bfloat16>(),
-            moe_block.out_proj.data.get<__nv_fp8_e4m3>(),
-            moe_block.out_proj.block_scales.get<float>(),
-            moe_block.out_proj.M, moe_block.out_proj.K,
+            qblock.out_proj.data.get<__nv_fp8_e4m3>(),
+            qblock.out_proj.block_scales.get<float>(),
+            qblock.out_proj.M, qblock.out_proj.K,
             block_size, mDeviceProps, stream);
 
-        // Update cache
+        // Dequantize ALL expert weights into batched buffers
+        // Each expert's weights are dequantized into a slice of the batched tensor
+        const int hidden = mConfig.hidden_size;
+        const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                              mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+
+        for (int e = 0; e < mNumMoEExperts; ++e) {
+            const auto& expert_weights = qblock.experts[e];
+
+            // Create slice views into the batched buffers for this expert
+            // gate_up_proj slice: offset by e * (2 * moe_inter * hidden) bytes
+            Tensor gate_up_slice = Tensor::from_pointer(
+                static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
+                    static_cast<size_t>(e) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+                mBatchedExpertGateUp.Device,
+                ETensorDType::BF16,
+                std::array<long, 2>{2 * moe_inter, hidden}
+            );
+
+            // down_proj slice: offset by e * (hidden * moe_inter) bytes
+            Tensor down_slice = Tensor::from_pointer(
+                static_cast<std::byte*>(mBatchedExpertDown.Data) +
+                    static_cast<size_t>(e) * hidden * moe_inter * sizeof(nv_bfloat16),
+                mBatchedExpertDown.Device,
+                ETensorDType::BF16,
+                std::array<long, 2>{hidden, moe_inter}
+            );
+
+            // Dequantize this expert's weights into the slice
+            dequantize_per_block(
+                gate_up_slice.get<nv_bfloat16>(),
+                expert_weights.gate_up_proj.data.get<__nv_fp8_e4m3>(),
+                expert_weights.gate_up_proj.block_scales.get<float>(),
+                expert_weights.gate_up_proj.M, expert_weights.gate_up_proj.K,
+                block_size, mDeviceProps, stream);
+
+            dequantize_per_block(
+                down_slice.get<nv_bfloat16>(),
+                expert_weights.down_proj.data.get<__nv_fp8_e4m3>(),
+                expert_weights.down_proj.block_scales.get<float>(),
+                expert_weights.down_proj.M, expert_weights.down_proj.K,
+                block_size, mDeviceProps, stream);
+        }
+
         mCurrentLayer = layer_idx;
         mBufferVersion = mStepVersion;
     }
 
-    // Update layer norm pointers (they're references, always update)
-    mDequantBlock.ln1.weight = moe_block.ln1_weight;
-    mDequantBlock.ln2.weight = moe_block.ln2_weight;
+    // Update layer norm pointers
+    mDequantBlock.ln1.weight = qblock.ln1_weight;
+    mDequantBlock.ln2.weight = qblock.ln2_weight;
 
-    // QK-norm weights if present
+    // Update router gate pointer
+    if constexpr (has_moe_weights<BlockWeights>::value) {
+        mDequantBlock.router.gate = qblock.router_gate;
+    }
+
+    // Copy QK-norm weights if present
     if constexpr (requires { mDequantBlock.attention.q_norm_weight; mDequantBlock.attention.k_norm_weight; }) {
-        if (moe_block.q_norm_weight.has_value() && moe_block.k_norm_weight.has_value()) {
-            mDequantBlock.attention.q_norm_weight = moe_block.q_norm_weight;
-            mDequantBlock.attention.k_norm_weight = moe_block.k_norm_weight;
+        if (qblock.q_norm_weight.has_value() && qblock.k_norm_weight.has_value()) {
+            mDequantBlock.attention.q_norm_weight = qblock.q_norm_weight;
+            mDequantBlock.attention.k_norm_weight = qblock.k_norm_weight;
         }
     }
 }
