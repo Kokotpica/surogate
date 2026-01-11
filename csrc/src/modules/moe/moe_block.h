@@ -7,6 +7,8 @@
 
 #include "expert.h"
 #include "router.h"
+#include "switch_router.h"
+#include "expert_choice_router.h"
 #include "config/rope_config.h"
 #include "modules/module_base.h"
 #include "modules/primitives/attention.h"
@@ -95,7 +97,7 @@ public:
 
         // Router
         typename RouterType::Activations router;
-        typename RouterType::RouterOutput routing;
+        MoERouterOutput routing;  // Common router output type for all router variants
 
         // Experts
         ExpertGroupModule::Activations experts;
@@ -178,6 +180,21 @@ private:
 // Implementation
 // ============================================================================
 
+namespace detail {
+    // Helper to create router config of the correct type
+    template<typename RouterType>
+    typename RouterType::Config make_router_config(int hidden_size, int num_experts, int top_k,
+                                                    float aux_loss_coef, float capacity_factor) {
+        typename RouterType::Config cfg;
+        cfg.hidden_size = hidden_size;
+        cfg.num_experts = num_experts;
+        cfg.top_k = top_k;
+        cfg.aux_loss_coef = aux_loss_coef;
+        cfg.capacity_factor = capacity_factor;
+        return cfg;
+    }
+}
+
 template<typename AttentionType, typename RouterType, typename NormType>
 MoETransformerBlock<AttentionType, RouterType, NormType>::MoETransformerBlock(Config config)
     : mConfig(config)
@@ -190,13 +207,9 @@ MoETransformerBlock<AttentionType, RouterType, NormType>::MoETransformerBlock(Co
         .rope = config.rope,
         .use_qkv_bias = config.use_qkv_bias
       })
-    , mRouter({
-        .hidden_size = config.hidden_size,
-        .num_experts = config.num_experts,
-        .top_k = config.top_k,
-        .aux_loss_coef = config.aux_loss_coef,
-        .capacity_factor = config.capacity_factor
-      })
+    , mRouter(detail::make_router_config<RouterType>(
+        config.hidden_size, config.num_experts, config.top_k,
+        config.aux_loss_coef, config.capacity_factor))
     , mExperts({
         .num_experts = config.num_experts,
         .hidden_size = config.hidden_size,
@@ -442,15 +455,35 @@ Tensor MoETransformerBlock<AttentionType, RouterType, NormType>::backward_impl(
     return d_input;
 }
 
+// ============================================================================
+// Type Aliases for Model-Specific MoE Blocks
+// ============================================================================
+
 /**
- * @brief Type alias for standard MoE block
+ * @brief Type alias for standard MoE block (Mixtral style)
+ *
+ * Uses standard top-k routing without QK normalization.
  */
 using StandardMoEBlock = MoETransformerBlock<AttentionModule, RouterModule, FusedResidualRMSNormModule>;
 
 /**
  * @brief Type alias for Switch Transformer block (top-1 routing)
+ *
+ * Uses simplified top-1 routing for maximum efficiency.
  */
 using SwitchTransformerBlock = MoETransformerBlock<AttentionModule, SwitchRouterModule, FusedResidualRMSNormModule>;
+
+/**
+ * @brief Type alias for Expert Choice MoE block
+ *
+ * Uses expert-choice routing where experts select tokens.
+ * Guarantees perfect load balancing at the cost of potential token dropout.
+ */
+using ExpertChoiceMoEBlock = MoETransformerBlock<AttentionModule, ExpertChoiceRouterModule, FusedResidualRMSNormModule>;
+
+// ============================================================================
+// Configuration Builder
+// ============================================================================
 
 /**
  * @brief MoE block configuration builder

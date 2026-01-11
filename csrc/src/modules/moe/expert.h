@@ -5,12 +5,12 @@
 #ifndef SUROGATE_SRC_MODULES_MOE_EXPERT_H
 #define SUROGATE_SRC_MODULES_MOE_EXPERT_H
 
-#include "modules/module_base.h"
+#include "base_expert.h"
 #include "modules/primitives/linear.h"
 #include "modules/primitives/swiglu.h"
 #include "modules/forward_hooks.h"
 #include "kernels/kernels.h"
-#include "router.h"  // For RouterModule::RouterOutput
+#include "base_router.h"  // For MoERouterOutput
 
 namespace modules {
 
@@ -20,47 +20,27 @@ namespace modules {
  * An expert is essentially an MLP (same structure as the dense FFN).
  * In MoE, multiple experts share the same structure but have independent weights.
  *
- * Structure: input -> up_proj -> activation -> down_proj -> output
- * With gated variants: input -> [gate_proj, up_proj] -> activation(gate) * up -> down_proj
+ * Inherits from BaseExpertModule and composes the protected helper methods.
+ *
+ * Structure: input -> [gate_proj, up_proj] -> activation(gate) * up -> down_proj -> output
  */
-class ExpertModule : public ModuleBase<ExpertModule> {
+class ExpertModule : public BaseExpertModule<ExpertModule> {
 public:
-    /**
-     * @brief Configuration for a single expert
-     */
-    struct Config {
-        int hidden_size;            ///< Input/output dimension
-        int intermediate_size;      ///< FFN intermediate dimension
-        bool use_gated = true;      ///< Use gated activation (SwiGLU)
-        float dropout = 0.0f;       ///< Dropout probability
-    };
+    // Use base types
+    using Config = BaseConfig;
+    using Activations = BaseActivations;
+    using Gradients = BaseGradients;
 
     /**
      * @brief Weight tensors for a single expert
+     *
+     * Note: Uses fused gate_proj layout where gate and up are concatenated.
+     * This differs from BaseWeights for backwards compatibility.
      */
     struct Weights {
-        Tensor gate_proj;           ///< (hidden_size, intermediate_size) - only if gated
-        Tensor up_proj;             ///< (hidden_size, intermediate_size)
+        Tensor gate_proj;           ///< (hidden_size, 2 * intermediate_size) - fused gate+up
+        Tensor up_proj;             ///< (hidden_size, intermediate_size) - only used if not gated
         Tensor down_proj;           ///< (intermediate_size, hidden_size)
-    };
-
-    /**
-     * @brief Saved state for backward pass
-     */
-    struct Activations {
-        Tensor input;               ///< Input to expert
-        Tensor gate_up;             ///< Output of gate+up projection (before activation)
-        Tensor activated;           ///< Output after activation
-        Tensor output;              ///< Final output
-    };
-
-    /**
-     * @brief Weight gradients
-     */
-    struct Gradients {
-        Tensor d_gate_proj;
-        Tensor d_up_proj;
-        Tensor d_down_proj;
     };
 
     explicit ExpertModule(Config config) : mConfig(config) {}
@@ -116,52 +96,26 @@ private:
 inline Tensor ExpertModule::forward_impl(
     ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts) {
 
-    const int N = input.Sizes[0];  // Number of tokens routed to this expert
-    const int C = mConfig.hidden_size;
-    const int D = mConfig.intermediate_size;
-
+    // Save input for backward
     acts.input = input;
 
     if (mConfig.use_gated) {
-        // Gated activation (SwiGLU style)
-        // gate_up has shape (N, 2*D) with [gate, up] concatenated
+        // 1) Gated activation path: gate_up projection
+        forward_gate_up_proj(ctx, mConfig, w.gate_proj, input, acts.gate_up);
 
-        // Combined projection: gate_up = input @ [gate_proj; up_proj]
-        // For efficiency, gate and up projections are often fused
-        matmul(
-            acts.gate_up, w.gate_proj, input, std::nullopt,
-            nullptr, nullptr,
-            ctx.cublas_handle, *ctx.workspace,
-            2 * D, N, C, EMMTranspose::TN, false,
-            ctx.stream
-        );
-
-        // SwiGLU activation: activated = swiglu(gate_up)
-        swiglu_forward(acts.activated, acts.gate_up, nullptr, 1, N, D, ctx.stream);
-
+        // 2) SwiGLU activation
+        apply_swiglu(ctx, mConfig, acts.gate_up, acts.activated);
     } else {
-        // Simple activation (ReLU/GeLU)
-        matmul(
-            acts.gate_up, w.up_proj, input, std::nullopt,
-            nullptr, nullptr,
-            ctx.cublas_handle, *ctx.workspace,
-            D, N, C, EMMTranspose::TN, false,
-            ctx.stream
-        );
+        // Non-gated path: up projection only
+        forward_up_proj(ctx, mConfig, w.up_proj, input, acts.gate_up);
 
-        // Apply activation (GeLU)
-        // gelu_forward(acts.activated, acts.gate_up, N * D, ctx.stream);
-        acts.activated = acts.gate_up;  // Placeholder
+        // Apply activation (GeLU) - placeholder
+        // TODO: Add GeLU helper to base class
+        acts.activated = acts.gate_up;
     }
 
-    // Down projection: output = activated @ down_proj
-    matmul(
-        acts.output, w.down_proj, acts.activated, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        C, N, D, EMMTranspose::TN, false,
-        ctx.stream
-    );
+    // 3) Down projection
+    forward_down_proj(ctx, mConfig, w.down_proj, acts.activated, acts.output);
 
     return acts.output;
 }
@@ -170,21 +124,12 @@ inline Tensor ExpertModule::forward_with_hook(
     ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts,
     const MoEExpertHook& expert_hook, int layer_idx, int expert_idx) {
 
-    const int N = input.Sizes[0];
-    const int C = mConfig.hidden_size;
-    const int D = mConfig.intermediate_size;
-
+    // Save input for backward
     acts.input = input;
 
     if (mConfig.use_gated) {
-        // Gated activation (SwiGLU style)
-        matmul(
-            acts.gate_up, w.gate_proj, input, std::nullopt,
-            nullptr, nullptr,
-            ctx.cublas_handle, *ctx.workspace,
-            2 * D, N, C, EMMTranspose::TN, false,
-            ctx.stream
-        );
+        // 1) Gated activation path: gate_up projection
+        forward_gate_up_proj(ctx, mConfig, w.gate_proj, input, acts.gate_up);
 
         // Hook point: After gate_up projection, before SwiGLU
         // LoRA can modify acts.gate_up in place here
@@ -192,17 +137,11 @@ inline Tensor ExpertModule::forward_with_hook(
             expert_hook(layer_idx, expert_idx, MoEExpertHookPoint::AfterExpertUpProjection, ctx.stream);
         }
 
-        // SwiGLU activation
-        swiglu_forward(acts.activated, acts.gate_up, nullptr, 1, N, D, ctx.stream);
-
+        // 2) SwiGLU activation
+        apply_swiglu(ctx, mConfig, acts.gate_up, acts.activated);
     } else {
-        matmul(
-            acts.gate_up, w.up_proj, input, std::nullopt,
-            nullptr, nullptr,
-            ctx.cublas_handle, *ctx.workspace,
-            D, N, C, EMMTranspose::TN, false,
-            ctx.stream
-        );
+        // Non-gated path: up projection only
+        forward_up_proj(ctx, mConfig, w.up_proj, input, acts.gate_up);
 
         if (expert_hook) {
             expert_hook(layer_idx, expert_idx, MoEExpertHookPoint::AfterExpertUpProjection, ctx.stream);
@@ -211,14 +150,8 @@ inline Tensor ExpertModule::forward_with_hook(
         acts.activated = acts.gate_up;
     }
 
-    // Down projection
-    matmul(
-        acts.output, w.down_proj, acts.activated, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        C, N, D, EMMTranspose::TN, false,
-        ctx.stream
-    );
+    // 3) Down projection
+    forward_down_proj(ctx, mConfig, w.down_proj, acts.activated, acts.output);
 
     // Hook point: After down projection
     // LoRA can modify acts.output in place here
@@ -233,65 +166,23 @@ inline Tensor ExpertModule::backward_impl(
     ModuleContext& ctx, Weights& w, Activations& acts,
     Tensor& grad_output, Gradients& grads, bool accumulate) {
 
-    const int N = acts.input.Sizes[0];
-    const int C = mConfig.hidden_size;
-    const int D = mConfig.intermediate_size;
+    // 1) Backward through down projection
+    Tensor d_activated = backward_down_proj(ctx, mConfig, w.down_proj, acts.activated,
+                                             grad_output, grads.d_down_proj, accumulate);
 
-    // Backward through down projection
-    // d_activated = grad_output @ down_proj^T
-    Tensor d_activated;
-    d_activated.DType = grad_output.DType;
-    matmul(
-        d_activated, w.down_proj, grad_output, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        D, N, C, EMMTranspose::NN, false,
-        ctx.stream
-    );
-
-    // d_down_proj = activated^T @ grad_output
-    matmul(
-        grads.d_down_proj, acts.activated, grad_output, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        D, C, N, EMMTranspose::NT, accumulate,
-        ctx.stream
-    );
-
-    // Backward through activation
+    // 2) Backward through activation
     Tensor d_gate_up;
     d_gate_up.DType = d_activated.DType;
     if (mConfig.use_gated) {
-        // SwiGLU backward
-        swiglu_backward(d_gate_up, d_activated, acts.gate_up, nullptr, 1, N, D, ctx.stream);
+        apply_swiglu_backward(ctx, mConfig, d_activated, acts.gate_up, d_gate_up);
     } else {
-        // GeLU backward
-        // gelu_backward(d_gate_up, d_activated, acts.gate_up, N * D, ctx.stream);
-        d_gate_up = d_activated;  // Placeholder
+        // GeLU backward - placeholder
+        d_gate_up = d_activated;
     }
 
-    // Backward through gate/up projection
-    // d_input = d_gate_up @ gate_proj^T (or up_proj^T if not gated)
-    Tensor d_input;
-    d_input.DType = acts.input.DType;
-    matmul(
-        d_input, w.gate_proj, d_gate_up, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        C, N, 2 * D, EMMTranspose::NN, false,
-        ctx.stream
-    );
-
-    // d_gate_proj = input^T @ d_gate_up
-    matmul(
-        grads.d_gate_proj, acts.input, d_gate_up, std::nullopt,
-        nullptr, nullptr,
-        ctx.cublas_handle, *ctx.workspace,
-        C, 2 * D, N, EMMTranspose::NT, accumulate,
-        ctx.stream
-    );
-
-    return d_input;
+    // 3) Backward through gate/up projection
+    return backward_gate_up_proj(ctx, mConfig, w.gate_proj, acts.input, d_gate_up,
+                                  grads.d_gate_proj, accumulate);
 }
 
 /**
@@ -300,26 +191,19 @@ inline Tensor ExpertModule::backward_impl(
  * Manages multiple experts and handles the scatter/gather operations
  * for routing tokens to experts and combining outputs.
  *
- * Uses a permute-based approach inspired by Unsloth's MoE implementation:
+ * Inherits from BaseExpertGroupModule and composes the protected helper methods.
+ *
+ * Uses a permute-based approach:
  * 1. Permute tokens to expert-grouped order (scatter)
  * 2. Run batched expert computation
  * 3. Unpermute and weight-combine outputs (gather)
  *
  * This approach enables efficient grouped GEMM computation across all experts.
  */
-class ExpertGroupModule : public ModuleBase<ExpertGroupModule> {
+class ExpertGroupModule : public BaseExpertGroupModule<ExpertGroupModule> {
 public:
-    /**
-     * @brief Configuration for expert group
-     */
-    struct Config {
-        int num_experts;            ///< Number of experts in the group
-        int hidden_size;            ///< Input/output dimension
-        int intermediate_size;      ///< FFN intermediate dimension per expert
-        int top_k = 2;              ///< Number of experts per token
-        int capacity_factor = 1;    ///< Capacity multiplier (tokens per expert = capacity_factor * tokens / num_experts * top_k)
-        bool use_gated = true;      ///< Use gated activation
-    };
+    // Use base config
+    using Config = BaseConfig;
 
     /**
      * @brief Weights for all experts
@@ -341,37 +225,21 @@ public:
 
     /**
      * @brief Activations for all experts
+     *
+     * Extends BaseActivations with per-expert activation storage.
      */
-    struct Activations {
+    struct Activations : public BaseActivations {
         std::vector<ExpertModule::Activations> expert_acts;
-
-        // Permutation state
-        Tensor gather_indices;      ///< (total_tokens,) - maps permuted position to original token
-        Tensor scatter_indices;     ///< (total_tokens,) - maps original token to permuted position
-        Tensor expert_offsets;      ///< (num_experts + 1,) - cumsum of tokens per expert
-
-        // Dispatch/combine state
-        Tensor permuted_input;      ///< (total_tokens, hidden_size) - tokens in expert-grouped order
-        Tensor expert_outputs;      ///< (total_tokens, hidden_size) - outputs in expert-grouped order
-        Tensor combined_output;     ///< (B*T, hidden_size) - final output
     };
 
     /**
      * @brief Gradients for all experts
+     *
+     * Extends BaseGradients with per-expert gradient storage.
      */
-    struct Gradients {
+    struct Gradients : public BaseGradients {
         // Per-expert gradients (for sequential execution)
         std::vector<ExpertModule::Gradients> expert_grads;
-
-        // Batched gradients (for grouped GEMM)
-        Tensor d_gate_up_proj;  ///< (num_experts, hidden_size, 2 * intermediate_size)
-        Tensor d_down_proj;     ///< (num_experts, intermediate_size, hidden_size)
-
-        // Intermediate tensors for backward pass (must be pre-allocated)
-        Tensor d_expert_outputs;    ///< (total_tokens, hidden_size) gradient w.r.t. expert outputs
-        Tensor d_routing_weights;   ///< (B*T, top_k) gradient w.r.t. routing weights
-        Tensor d_permuted_input;    ///< (total_tokens, hidden_size) gradient w.r.t. permuted input
-        Tensor d_input;             ///< (B*T, hidden_size) gradient w.r.t. original input
     };
 
     explicit ExpertGroupModule(Config config);
@@ -387,7 +255,7 @@ public:
      * @return Combined output (B*T, hidden_size)
      */
     Tensor forward_impl(ModuleContext& ctx, Weights& w, Tensor& input,
-                        const RouterModule::RouterOutput& routing, Activations& acts);
+                        const MoERouterOutput& routing, Activations& acts);
 
     /**
      * @brief Forward pass with per-expert hook for LoRA application
@@ -402,14 +270,14 @@ public:
      * @return Combined output (B*T, hidden_size)
      */
     Tensor forward_with_hook(ModuleContext& ctx, Weights& w, Tensor& input,
-                             const RouterModule::RouterOutput& routing, Activations& acts,
+                             const MoERouterOutput& routing, Activations& acts,
                              const MoEExpertHook& expert_hook, int layer_idx);
 
     /**
      * @brief Backward pass through expert group
      */
     Tensor backward_impl(ModuleContext& ctx, Weights& w, Activations& acts,
-                         const RouterModule::RouterOutput& routing,
+                         const MoERouterOutput& routing,
                          Tensor& grad_output, Gradients& grads, bool accumulate = false);
 
     [[nodiscard]] const Config& config() const { return mConfig; }
@@ -437,32 +305,13 @@ inline ExpertGroupModule::ExpertGroupModule(Config config) : mConfig(config) {
 
 inline Tensor ExpertGroupModule::forward_impl(
     ModuleContext& ctx, Weights& w, Tensor& input,
-    const RouterModule::RouterOutput& routing, Activations& acts) {
+    const MoERouterOutput& routing, Activations& acts) {
 
-    const int BT = ctx.B * ctx.T;
-    const int C = mConfig.hidden_size;
     const int E = mConfig.num_experts;
     const int K = mConfig.top_k;
-    const int total_tokens = BT * K;  // Each token is sent to K experts
 
-    // Step 1: Permute tokens to expert-grouped order
-    // This reorders tokens so that all tokens for expert 0 come first, then expert 1, etc.
-    // Uses gather_indices computed from routing.expert_indices
-    if (input.DType == ETensorDType::BF16) {
-        moe_permute_tokens(
-            acts.permuted_input.get<nv_bfloat16>(),
-            input.get<nv_bfloat16>(),
-            acts.gather_indices.get<int>(),
-            total_tokens, BT, C, K, ctx.stream
-        );
-    } else {
-        moe_permute_tokens(
-            acts.permuted_input.get<float>(),
-            input.get<float>(),
-            acts.gather_indices.get<int>(),
-            total_tokens, BT, C, K, ctx.stream
-        );
-    }
+    // Step 1: Permute tokens to expert-grouped order using base class helper
+    permute_tokens(ctx, mConfig, input, acts.gather_indices, acts.permuted_input, K);
 
     // Step 2: Run experts on permuted tokens
     // Note: Grouped GEMM is used in modular_model_forward.hpp for the main training path.
@@ -484,56 +333,23 @@ inline Tensor ExpertGroupModule::forward_impl(
         offset += expert_tokens;
     }
 
-    // Step 3: Unpermute and combine expert outputs weighted by routing weights
-    // For each original token, gather outputs from its assigned experts and weight-combine
-    if (acts.expert_outputs.DType == ETensorDType::BF16) {
-        moe_unpermute_and_combine(
-            acts.combined_output.get<nv_bfloat16>(),
-            acts.expert_outputs.get<nv_bfloat16>(),
-            routing.routing_weights.get<nv_bfloat16>(),
-            acts.scatter_indices.get<int>(),
-            BT, total_tokens, C, K, ctx.stream
-        );
-    } else {
-        moe_unpermute_and_combine(
-            acts.combined_output.get<float>(),
-            acts.expert_outputs.get<float>(),
-            routing.routing_weights.get<float>(),
-            acts.scatter_indices.get<int>(),
-            BT, total_tokens, C, K, ctx.stream
-        );
-    }
+    // Step 3: Unpermute and combine using base class helper
+    unpermute_and_combine(ctx, mConfig, acts.expert_outputs, routing.routing_weights,
+                          acts.scatter_indices, acts.combined_output, K);
 
     return acts.combined_output;
 }
 
 inline Tensor ExpertGroupModule::forward_with_hook(
     ModuleContext& ctx, Weights& w, Tensor& input,
-    const RouterModule::RouterOutput& routing, Activations& acts,
+    const MoERouterOutput& routing, Activations& acts,
     const MoEExpertHook& expert_hook, int layer_idx) {
 
-    const int BT = ctx.B * ctx.T;
-    const int C = mConfig.hidden_size;
     const int E = mConfig.num_experts;
     const int K = mConfig.top_k;
-    const int total_tokens = BT * K;
 
-    // Step 1: Permute tokens to expert-grouped order
-    if (input.DType == ETensorDType::BF16) {
-        moe_permute_tokens(
-            acts.permuted_input.get<nv_bfloat16>(),
-            input.get<nv_bfloat16>(),
-            acts.gather_indices.get<int>(),
-            total_tokens, BT, C, K, ctx.stream
-        );
-    } else {
-        moe_permute_tokens(
-            acts.permuted_input.get<float>(),
-            input.get<float>(),
-            acts.gather_indices.get<int>(),
-            total_tokens, BT, C, K, ctx.stream
-        );
-    }
+    // Step 1: Permute tokens using base class helper
+    permute_tokens(ctx, mConfig, input, acts.gather_indices, acts.permuted_input, K);
 
     // Step 2: Run experts on permuted tokens with hooks
     acts.expert_acts.resize(E);
@@ -549,75 +365,31 @@ inline Tensor ExpertGroupModule::forward_with_hook(
         Tensor expert_input = slice(acts.permuted_input, 0, offset, offset + expert_tokens);
         Tensor expert_output = slice(acts.expert_outputs, 0, offset, offset + expert_tokens);
 
-        // Run expert forward with hooks - this calls the hook at the right points
-        // (after gate_up matmul, after down matmul) within the expert forward pass
+        // Run expert forward with hooks
         mExperts[e].forward_with_hook(ctx, w.experts[e], expert_input, acts.expert_acts[e],
                                        expert_hook, layer_idx, e);
 
         offset += expert_tokens;
     }
 
-    // Step 3: Unpermute and combine expert outputs
-    if (acts.expert_outputs.DType == ETensorDType::BF16) {
-        moe_unpermute_and_combine(
-            acts.combined_output.get<nv_bfloat16>(),
-            acts.expert_outputs.get<nv_bfloat16>(),
-            routing.routing_weights.get<nv_bfloat16>(),
-            acts.scatter_indices.get<int>(),
-            BT, total_tokens, C, K, ctx.stream
-        );
-    } else {
-        moe_unpermute_and_combine(
-            acts.combined_output.get<float>(),
-            acts.expert_outputs.get<float>(),
-            routing.routing_weights.get<float>(),
-            acts.scatter_indices.get<int>(),
-            BT, total_tokens, C, K, ctx.stream
-        );
-    }
+    // Step 3: Unpermute and combine using base class helper
+    unpermute_and_combine(ctx, mConfig, acts.expert_outputs, routing.routing_weights,
+                          acts.scatter_indices, acts.combined_output, K);
 
     return acts.combined_output;
 }
 
 inline Tensor ExpertGroupModule::backward_impl(
     ModuleContext& ctx, Weights& w, Activations& acts,
-    const RouterModule::RouterOutput& routing,
+    const MoERouterOutput& routing,
     Tensor& grad_output, Gradients& grads, bool accumulate) {
 
-    const int BT = ctx.B * ctx.T;
-    const int C = mConfig.hidden_size;
     const int E = mConfig.num_experts;
     const int K = mConfig.top_k;
-    const int total_tokens = BT * K;
 
-    // Step 1: Backward through unpermute+combine
-    // Computes:
-    //   d_expert_outputs[permuted_idx] = routing_weights[token, k] * grad_output[token]
-    //   d_routing_weights[token, k] = dot(expert_outputs[permuted_idx], grad_output[token])
-    //
-    // Note: grads.d_expert_outputs and grads.d_routing_weights should be pre-allocated
-
-    if (grad_output.DType == ETensorDType::BF16) {
-        moe_combine_backward(
-            grads.d_expert_outputs.get<nv_bfloat16>(),
-            grads.d_routing_weights.get<nv_bfloat16>(),
-            grad_output.get<nv_bfloat16>(),
-            acts.expert_outputs.get<nv_bfloat16>(),
-            routing.routing_weights.get<nv_bfloat16>(),
-            acts.scatter_indices.get<int>(),
-            BT, total_tokens, C, K, ctx.stream
-        );
-    } else {
-        moe_combine_backward(
-            grads.d_expert_outputs.get<float>(),
-            grads.d_routing_weights.get<float>(),
-            grad_output.get<float>(),
-            acts.expert_outputs.get<float>(),
-            routing.routing_weights.get<float>(),
-            acts.scatter_indices.get<int>(),
-            BT, total_tokens, C, K, ctx.stream
-        );
-    }
+    // Step 1: Backward through unpermute+combine using base class helper
+    combine_backward(ctx, mConfig, grad_output, acts.expert_outputs, routing.routing_weights,
+                     acts.scatter_indices, grads.d_expert_outputs, grads.d_routing_weights, K);
 
     // Step 2: Backward through each expert
     // Note: Grouped GEMM backward is used in modular_model_block_ops.hpp for the main training path.
@@ -640,37 +412,32 @@ inline Tensor ExpertGroupModule::backward_impl(
         offset += expert_tokens;
     }
 
-    // Step 3: Unpermute gradient back to token order
-    // Each original token receives gradients from K expert paths
-    // Note: grads.d_input should be pre-allocated
-
-    if (grads.d_permuted_input.DType == ETensorDType::BF16) {
-        moe_permute_backward(
-            grads.d_input.get<nv_bfloat16>(),
-            grads.d_permuted_input.get<nv_bfloat16>(),
-            acts.gather_indices.get<int>(),
-            total_tokens, BT, C, K, ctx.stream
-        );
-    } else {
-        moe_permute_backward(
-            grads.d_input.get<float>(),
-            grads.d_permuted_input.get<float>(),
-            acts.gather_indices.get<int>(),
-            total_tokens, BT, C, K, ctx.stream
-        );
-    }
+    // Step 3: Backward through token permutation using base class helper
+    permute_backward(ctx, mConfig, grads.d_permuted_input, acts.gather_indices, grads.d_input, K);
 
     return grads.d_input;
 }
 
 /**
- * @brief Shared Expert - expert that processes all tokens (Nemotron/DeepSeek style)
+ * @brief Shared Expert - expert that processes all tokens (Nemotron/DeepSeek/Qwen3 style)
  *
  * In some MoE architectures, a "shared expert" processes all tokens
  * in addition to the routed experts. This helps with representation quality.
+ *
+ * Unlike routed experts, the shared expert:
+ * - Processes ALL tokens (not just those routed to it)
+ * - Has its output added to the combined routed expert output
+ * - May have a different intermediate size than routed experts
+ *
+ * Inherits from ExpertModule to reuse the MLP computation.
  */
 class SharedExpertModule : public ExpertModule {
 public:
+    /**
+     * @brief Configuration for shared expert
+     *
+     * Extends ExpertModule::Config with shared-expert-specific settings.
+     */
     struct Config : public ExpertModule::Config {
         float shared_expert_scale = 1.0f;  ///< Scale factor for shared expert output
     };
@@ -681,17 +448,30 @@ public:
 
     /**
      * @brief Forward: run on all tokens (no routing)
+     *
+     * Unlike routed experts which only process assigned tokens,
+     * the shared expert processes ALL tokens unconditionally.
+     *
+     * @param ctx Module context
+     * @param w Expert weights
+     * @param input ALL token representations (B*T, hidden_size)
+     * @param acts Activation storage
+     * @return Output (B*T, hidden_size) to be added to routed expert output
      */
     Tensor forward_all(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts) {
+        // Use base class forward_impl for the MLP computation
         Tensor output = forward_impl(ctx, w, input, acts);
 
-        // Scale output if configured
+        // Scale output if configured (e.g., for DeepSeek-style shared expert scaling)
         if (mSharedConfig.shared_expert_scale != 1.0f) {
+            // TODO: Add scale_tensor kernel call
             // scale_tensor(output, mSharedConfig.shared_expert_scale, ctx.stream);
         }
 
         return output;
     }
+
+    [[nodiscard]] float shared_expert_scale() const { return mSharedConfig.shared_expert_scale; }
 
 private:
     Config mSharedConfig;
