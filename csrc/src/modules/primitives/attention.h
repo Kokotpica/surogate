@@ -167,7 +167,6 @@ private:
 inline Tensor AttentionModule::forward_impl(ModuleContext& ctx, Weights& w, Tensor& input, Activations& acts) {
     const int B = ctx.B;
     const int T = ctx.T;
-    const int C = mConfig.hidden_size;
     const int Hq = mConfig.num_query_heads;
     const int Hkv = mConfig.num_kv_heads;
     const int Hs = mConfig.head_dim();

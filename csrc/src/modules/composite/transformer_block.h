@@ -195,8 +195,6 @@ template<typename Att, typename Act, typename Norm>
 Tensor DenseTransformerBlock<Att, Act, Norm>::forward_impl(
     ModuleContext& ctx, Weights& w, Tensor& residual, Activations& acts) {
 
-    const int B = ctx.B;
-    const int T = ctx.T;
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
 
@@ -325,8 +323,6 @@ Tensor DenseTransformerBlock<Att, Act, Norm>::backward_impl(
     ModuleContext& ctx, Weights& w, Activations& acts,
     Tensor& grad_residual, Gradients& grads, bool accumulate) {
 
-    const int B = ctx.B;
-    const int T = ctx.T;
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
 
