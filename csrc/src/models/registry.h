@@ -43,5 +43,17 @@ std::unique_ptr<PretrainedConfig> create_from_preset_name(std::string_view name,
 
 std::vector<std::string_view> supported_hf_architectures();
 
+// Get all registered architecture IDs
+std::vector<PretrainedConfig::ArchitectureId> supported_architecture_ids();
+
+// Check if an architecture is registered by HF name
+bool is_supported_hf_architecture(std::string_view hf_architecture_name);
+
+// Check if an architecture is registered by ID
+bool is_supported_architecture_id(PretrainedConfig::ArchitectureId id);
+
+// Get all registered preset names across all architectures
+std::vector<std::string_view> all_preset_names();
+
 } // namespace models
 

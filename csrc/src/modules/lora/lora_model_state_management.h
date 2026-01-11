@@ -177,7 +177,6 @@ void ModularLoRAModel<Block>::allocate_lora_run_state(NCCLCommunicator& comm, in
     const int rank = mLoRAConfig.rank;
     const int BT = B * T;
     const int max_features = std::max((int)cfg.HiddenSize, (int)cfg.IntermediateSize);
-    const long max_slice_elems = (long)BT * (long)max_features;
 
     ETensorDType work_dtype = cfg.DType;
 

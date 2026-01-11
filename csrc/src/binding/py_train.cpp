@@ -179,24 +179,12 @@ void MultiGPUPyTrainer::import_weights(std::string path) {
                 breakdown_ctx.seq_length = T;
 
                 // Get QLoRA stats if applicable
-                auto try_qlora_stats = [&]<typename Block>(std::type_identity<Block>) -> bool {
-                    if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<Block>*>(ctx.Model.get())) {
-                        if (lora_model->qlora_enabled()) {
-                            breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
-                            breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
-                        }
-                        return true;
+                modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
+                    if (lora_model->qlora_enabled()) {
+                        breakdown_ctx.qlora_quantized_bytes = lora_model->qlora_quantized_weights_bytes();
+                        breakdown_ctx.qlora_savings_ratio = lora_model->qlora_memory_savings_ratio();
                     }
-                    return false;
-                };
-
-                // Try all block types
-                (void)(try_qlora_stats(std::type_identity<modules::Qwen3TransformerBlock>{})
-                    || try_qlora_stats(std::type_identity<modules::Qwen2TransformerBlock>{})
-                    || try_qlora_stats(std::type_identity<modules::LlamaTransformerBlock>{})
-                    || try_qlora_stats(std::type_identity<modules::DenseTransformerBlock<>>{})
-                    || try_qlora_stats(std::type_identity<modules::Qwen3MoEBlock>{})
-                    || try_qlora_stats(std::type_identity<modules::StandardMoEBlock>{}));
+                });
 
                 // Use a temporary logger to print the breakdown
                 TrainingRunLogger logger("", 0, TrainingRunLogger::VERBOSE);
@@ -241,21 +229,9 @@ void MultiGPUPyTrainer::export_model(std::string path) {
  */
 void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_path) {
     run_work([path, base_model_path](sThreadContext& ctx) {
-        // Try all block types
-        auto try_export = [&]<typename Block>(std::type_identity<Block>) -> bool {
-            if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<Block>*>(ctx.Model.get())) {
-                lora_model->export_adapter(path, *ctx.Communicator, base_model_path);
-                return true;
-            }
-            return false;
-        };
-
-        bool found = try_export(std::type_identity<modules::Qwen3TransformerBlock>{})
-                  || try_export(std::type_identity<modules::Qwen2TransformerBlock>{})
-                  || try_export(std::type_identity<modules::LlamaTransformerBlock>{})
-                  || try_export(std::type_identity<modules::DenseTransformerBlock<>>{})
-                  || try_export(std::type_identity<modules::Qwen3MoEBlock>{})
-                  || try_export(std::type_identity<modules::StandardMoEBlock>{});
+        bool found = modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
+            lora_model->export_adapter(path, *ctx.Communicator, base_model_path);
+        });
 
         if (!found) {
             throw std::runtime_error("export_adapter: Model is not a modular LoRA model");
@@ -512,19 +488,8 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
 
     auto allocator = std::make_shared<TensorAllocator>();
 
-    modules::ModelConfig mod_config = modules::ModelConfig::from_pretrained_config(*mConfig);
-    modules::ModelOptions mod_options = modules::ModelOptions::from_runtime_options(mOptions);
-
-    // QLoRA: skip block weight allocation since weights are provided by QLoRA weight provider
-    if (mLoRAConfig.has_value() && mQLoRAConfig.has_value() && mQLoRAConfig->is_quantized()) {
-        mod_options.skip_block_allocation = true;
-    }
-
-    std::unique_ptr<IModel> model_storage = modules::ModelFactory::create(
-        mod_config, mod_options, comm.rank(), comm.world_size(), allocator);
-
     if (mLoRAConfig.has_value()) {
-        // Convert LoRAAdapterConfig -> modular LoRA config.
+        // Convert LoRAAdapterConfig -> modular LoRA config
         modules::ModularLoRAConfig mod_lora;
         mod_lora.rank = mLoRAConfig->Rank;
         mod_lora.alpha = mLoRAConfig->Alpha;
@@ -553,55 +518,13 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
             qlora_config = mQLoRAConfig.value();
         }
 
-        // Create LoRA model based on architecture type
-        if (mod_config.architecture == modules::ArchitectureType::Dense) {
-            // Helper lambda for dense model LoRA wrapping
-            auto try_dense_lora = [&]<typename Block>(std::type_identity<Block>) -> bool {
-                using Model = modules::ModularTransformerModel<Block>;
-                if (auto* ptr = dynamic_cast<Model*>(model_storage.get())) {
-                    std::unique_ptr<Model> base(static_cast<Model*>(model_storage.release()));
-                    ctx.Model = std::make_unique<modules::ModularLoRAModel<Block>>(
-                        std::move(base), mod_lora, mOptions, comm, allocator, qlora_config);
-                    return true;
-                }
-                return false;
-            };
-
-            // Try architecture-specific block types (most specific first)
-            bool found = try_dense_lora(std::type_identity<modules::Qwen3TransformerBlock>{})
-                      || try_dense_lora(std::type_identity<modules::Qwen2TransformerBlock>{})
-                      || try_dense_lora(std::type_identity<modules::LlamaTransformerBlock>{})
-                      || try_dense_lora(std::type_identity<modules::DenseTransformerBlock<>>{});
-
-            if (!found) {
-                throw std::runtime_error("MultiGPUPyTrainer: modular factory returned unknown dense model type");
-            }
-        } else if (mod_config.architecture == modules::ArchitectureType::MoE) {
-            // Try StandardMoEBlock first (Mixtral-style)
-            using StandardMoE = modules::StandardMoEBlock;
-            using StandardMoEModel = modules::ModularTransformerModel<StandardMoE>;
-            if (auto* std_moe_ptr = dynamic_cast<StandardMoEModel*>(model_storage.get())) {
-                std::unique_ptr<StandardMoEModel> moe_base(static_cast<StandardMoEModel*>(model_storage.release()));
-                ctx.Model = std::make_unique<modules::ModularLoRAModel<StandardMoE>>(
-                    std::move(moe_base), mod_lora, mOptions, comm, allocator, qlora_config);
-            }
-            // Try Qwen3MoEBlock (Qwen3 MoE-style with norm_topk_prob)
-            else {
-                using Qwen3MoE = modules::Qwen3MoEBlock;
-                using Qwen3MoEModel = modules::ModularTransformerModel<Qwen3MoE>;
-                auto* qwen3_moe_ptr = dynamic_cast<Qwen3MoEModel*>(model_storage.get());
-                if (!qwen3_moe_ptr) {
-                    throw std::runtime_error("MultiGPUPyTrainer: modular factory returned unknown MoE model type");
-                }
-                std::unique_ptr<Qwen3MoEModel> moe_base(static_cast<Qwen3MoEModel*>(model_storage.release()));
-                ctx.Model = std::make_unique<modules::ModularLoRAModel<Qwen3MoE>>(
-                    std::move(moe_base), mod_lora, mOptions, comm, allocator, qlora_config);
-            }
-        } else {
-            throw std::runtime_error("MultiGPUPyTrainer: LoRA not yet supported for Hybrid architecture");
-        }
+        // Use factory to create LoRA model with proper architecture dispatch
+        ctx.Model = modules::ModelFactory::create_lora_from_pretrained_config(
+            *mConfig, mod_lora, mOptions, comm, allocator, qlora_config);
     } else {
-        ctx.Model = std::move(model_storage);
+        // Use factory to create base model with proper architecture dispatch
+        ctx.Model = modules::ModelFactory::create_from_pretrained_config(
+            *mConfig, mOptions, comm.rank(), comm.world_size(), allocator);
     }
 
     ctx.Model->allocate_run_state(mOptions, comm, B, T, /*allocate_optimizer=*/true);
@@ -762,31 +685,9 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
             if (layer->B.Data) result.emplace_back(module_prefix + ".lora_B.weight", layer->B);
         };
 
-        // Helper lambda for dense gradient extraction
-        auto extract_dense_lora_grads = [&](auto* lora_model) {
+        bool found = modules::ModelFactory::try_lora_model(ctx.Model.get(), [&](auto* lora_model) {
             const auto& config = lora_model->base_model().config();
-            CUDA_CHECK(cudaDeviceSynchronize());
-
-            for (int l = 0; l < config.NumLayers; ++l) {
-                bool unused_accumulate = false;
-                auto& block = lora_model->lora_grads().get_block_full(l, /*stream=*/nullptr, *ctx.Communicator, unused_accumulate);
-                std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
-
-                add_layer(prefix + ".self_attn.q_proj", block.attention.q);
-                add_layer(prefix + ".self_attn.k_proj", block.attention.k);
-                add_layer(prefix + ".self_attn.v_proj", block.attention.v);
-                add_layer(prefix + ".self_attn.o_proj", block.attention.o);
-
-                add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-                add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-                add_layer(prefix + ".mlp.down_proj", block.mlp.down);
-            }
-            CUDA_CHECK(cudaDeviceSynchronize());
-        };
-
-        // Helper lambda for MoE gradient extraction
-        auto extract_moe_lora_grads = [&](auto* lora_model) {
-            const auto& config = lora_model->base_model().config();
+            const bool is_moe = lora_model->is_moe_model();
             CUDA_CHECK(cudaDeviceSynchronize());
 
             for (int l = 0; l < config.NumLayers; ++l) {
@@ -800,43 +701,24 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                 add_layer(prefix + ".self_attn.v_proj", block.attention.v);
                 add_layer(prefix + ".self_attn.o_proj", block.attention.o);
 
-                // MoE models use per-expert LoRA, not dense MLP LoRA
-                // Expert gradients are in block.moe.experts[e].{gate, up, down}
-                for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
-                    auto& expert = block.moe.experts[e];
-                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
-                    add_layer(expert_prefix + ".gate_proj", expert.gate);
-                    add_layer(expert_prefix + ".up_proj", expert.up);
-                    add_layer(expert_prefix + ".down_proj", expert.down);
+                if (is_moe) {
+                    // MoE models use per-expert LoRA
+                    for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                        auto& expert = block.moe.experts[e];
+                        std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                        add_layer(expert_prefix + ".gate_proj", expert.gate);
+                        add_layer(expert_prefix + ".up_proj", expert.up);
+                        add_layer(expert_prefix + ".down_proj", expert.down);
+                    }
+                } else {
+                    // Dense models use single MLP LoRA
+                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
                 }
             }
             CUDA_CHECK(cudaDeviceSynchronize());
-        };
-
-        // Try dense model types
-        auto try_dense = [&]<typename Block>(std::type_identity<Block>) -> bool {
-            if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<Block>*>(ctx.Model.get())) {
-                extract_dense_lora_grads(lora_model);
-                return true;
-            }
-            return false;
-        };
-
-        // Try MoE model types
-        auto try_moe = [&]<typename Block>(std::type_identity<Block>) -> bool {
-            if (auto* lora_model = dynamic_cast<modules::ModularLoRAModel<Block>*>(ctx.Model.get())) {
-                extract_moe_lora_grads(lora_model);
-                return true;
-            }
-            return false;
-        };
-
-        bool found = try_dense(std::type_identity<modules::Qwen3TransformerBlock>{})
-                  || try_dense(std::type_identity<modules::Qwen2TransformerBlock>{})
-                  || try_dense(std::type_identity<modules::LlamaTransformerBlock>{})
-                  || try_dense(std::type_identity<modules::DenseTransformerBlock<>>{})
-                  || try_moe(std::type_identity<modules::Qwen3MoEBlock>{})
-                  || try_moe(std::type_identity<modules::StandardMoEBlock>{});
+        });
 
         if (!found) {
             throw std::runtime_error("get_lora_gradients: model is not a modular LoRA model");

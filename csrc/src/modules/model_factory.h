@@ -27,6 +27,9 @@
 
 #include "training/model.h"
 #include "utilities/allocator.h"
+#include "lora/lora_model.h"
+#include "lora/lora_config.h"
+#include "qlora/qlora_config.h"
 
 namespace modules {
 
@@ -125,6 +128,120 @@ public:
             default:
                 return std::make_unique<LlamaModel>(mod_config, mod_options, rank, world, alloc);
         }
+    }
+
+    /**
+     * @brief Create a LoRA-wrapped model from PretrainedConfig
+     *
+     * Dispatches to the correct model + LoRA wrapper based on the config's architecture ID.
+     * This centralizes the type-dispatching logic that would otherwise be duplicated
+     * across callers (py_train.cpp, etc.).
+     *
+     * @param config PretrainedConfig (or derived) instance
+     * @param lora_config LoRA configuration (rank, alpha, targets, etc.)
+     * @param options Runtime options
+     * @param comm NCCL communicator for distributed setup
+     * @param alloc Tensor allocator
+     * @param qlora_config Optional QLoRA configuration for quantized base weights
+     * @return Unique pointer to LoRA-wrapped model (as IModel)
+     */
+    static std::unique_ptr<IModel> create_lora_from_pretrained_config(
+        const PretrainedConfig& config,
+        const ModularLoRAConfig& lora_config,
+        const RuntimeOptions& options,
+        NCCLCommunicator& comm,
+        const std::shared_ptr<TensorAllocator>& alloc,
+        const QLoRAConfig& qlora_config = QLoRAConfig{}) {
+
+        ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
+        ModelOptions mod_options = ModelOptions::from_runtime_options(options);
+
+        // QLoRA: skip block weight allocation since weights are provided by QLoRA weight provider
+        if (qlora_config.is_quantized()) {
+            mod_options.skip_block_allocation = true;
+        }
+
+        // Dispatch based on config architecture ID (most specific first)
+        switch (config.Architecture) {
+            case PretrainedConfig::QWEN3_MOE: {
+                // Qwen3 MoE
+                using Block = Qwen3MoEBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+
+            case PretrainedConfig::QWEN3: {
+                // Qwen3 dense
+                using Block = Qwen3TransformerBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+
+            case PretrainedConfig::QWEN2: {
+                // Qwen2 dense
+                using Block = Qwen2TransformerBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+
+            case PretrainedConfig::LLAMA:
+            default: {
+                // LLaMA dense
+                using Block = LlamaTransformerBlock;
+                auto base = std::make_unique<ModularTransformerModel<Block>>(
+                    mod_config, mod_options, comm.rank(), comm.world_size(), alloc);
+                return std::make_unique<ModularLoRAModel<Block>>(
+                    std::move(base), lora_config, options, comm, alloc, qlora_config);
+            }
+        }
+    }
+
+    /**
+     * @brief Try to cast a model to a LoRA model and invoke a callback
+     *
+     * Helper for operations that need access to the typed ModularLoRAModel
+     * (e.g., export_adapter, get_lora_gradients). Returns true if cast succeeded.
+     *
+     * @tparam Callback Callable taking ModularLoRAModel<Block>*
+     * @param model The IModel to try casting
+     * @param callback The callback to invoke if cast succeeds
+     * @return true if any cast succeeded and callback was invoked
+     */
+    template<typename Callback>
+    static bool try_lora_model(IModel* model, Callback&& callback) {
+        // Try dense block types (most specific first)
+        if (auto* lora = dynamic_cast<ModularLoRAModel<Qwen3TransformerBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        if (auto* lora = dynamic_cast<ModularLoRAModel<Qwen2TransformerBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        if (auto* lora = dynamic_cast<ModularLoRAModel<LlamaTransformerBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        if (auto* lora = dynamic_cast<ModularLoRAModel<DenseTransformerBlock<>>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        // Try MoE block types
+        if (auto* lora = dynamic_cast<ModularLoRAModel<Qwen3MoEBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        if (auto* lora = dynamic_cast<ModularLoRAModel<StandardMoEBlock>*>(model)) {
+            callback(lora);
+            return true;
+        }
+        return false;
     }
 
 private:

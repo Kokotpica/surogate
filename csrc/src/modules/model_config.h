@@ -201,11 +201,7 @@ struct ModelConfig : public PretrainedConfig {
         }
 
         // Check for MoE configuration (Qwen3MoEConfig)
-        fprintf(stderr, "[ModelConfig] base.Architecture=%d, base.is_moe()=%d\n",
-                static_cast<int>(base.Architecture), base.is_moe());
         if (const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&base)) {
-            fprintf(stderr, "[ModelConfig] dynamic_cast to Qwen3MoEConfig succeeded! NumExperts=%d\n",
-                    moe_cfg->NumExperts);
             if (moe_cfg->NumExperts > 0) {
                 config.architecture = ArchitectureType::MoE;
 
@@ -224,11 +220,7 @@ struct ModelConfig : public PretrainedConfig {
                 config.NumExperts = moe_cfg->NumExperts;
                 config.NumExpertsPerTok = moe_cfg->NumExpertsPerTok;
                 config.MoeIntermediateSize = moe_cfg->MoeIntermediateSize;
-                fprintf(stderr, "[ModelConfig] MoE config set: experts=%d, top_k=%d, moe_intermediate=%d\n",
-                        config.NumExperts, config.NumExpertsPerTok, config.MoeIntermediateSize);
             }
-        } else {
-            fprintf(stderr, "[ModelConfig] dynamic_cast to Qwen3MoEConfig FAILED\n");
         }
 
         return config;
