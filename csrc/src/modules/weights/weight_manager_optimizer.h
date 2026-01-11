@@ -133,11 +133,14 @@ void ModularWeightManager<Block>::fetch_master_block(int layer_idx, cudaStream_t
         copy_h2d(src.attention.qkv_bias.value(), dst.attention.qkv_bias.value());
     }
     copy_h2d(src.attention.out_weight, dst.attention.out_weight);
-    if (src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
-        copy_h2d(src.attention.q_norm_weight.value(), dst.attention.q_norm_weight.value());
-    }
-    if (src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
-        copy_h2d(src.attention.k_norm_weight.value(), dst.attention.k_norm_weight.value());
+    using AttentionWeightsType = std::decay_t<decltype(src.attention)>;
+    if constexpr (has_qk_norm_weights<AttentionWeightsType>::value) {
+        if (src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
+            copy_h2d(src.attention.q_norm_weight.value(), dst.attention.q_norm_weight.value());
+        }
+        if (src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
+            copy_h2d(src.attention.k_norm_weight.value(), dst.attention.k_norm_weight.value());
+        }
     }
     copy_h2d(src.ln2.weight, dst.ln2.weight);
     if constexpr (has_mlp_weights<BlockWeights>::value) {
@@ -189,11 +192,14 @@ void ModularWeightManager<Block>::release_master_block(int layer_idx, cudaStream
         copy_d2h(src.attention.qkv_bias.value(), dst.attention.qkv_bias.value());
     }
     copy_d2h(src.attention.out_weight, dst.attention.out_weight);
-    if (src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
-        copy_d2h(src.attention.q_norm_weight.value(), dst.attention.q_norm_weight.value());
-    }
-    if (src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
-        copy_d2h(src.attention.k_norm_weight.value(), dst.attention.k_norm_weight.value());
+    using ReleaseAttentionWeightsType = std::decay_t<decltype(src.attention)>;
+    if constexpr (has_qk_norm_weights<ReleaseAttentionWeightsType>::value) {
+        if (src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
+            copy_d2h(src.attention.q_norm_weight.value(), dst.attention.q_norm_weight.value());
+        }
+        if (src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
+            copy_d2h(src.attention.k_norm_weight.value(), dst.attention.k_norm_weight.value());
+        }
     }
     copy_d2h(src.ln2.weight, dst.ln2.weight);
     if constexpr (has_mlp_weights<BlockWeights>::value) {

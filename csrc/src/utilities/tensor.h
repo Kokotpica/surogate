@@ -90,6 +90,12 @@ struct Tensor {
             return nullptr;
         return Stats + 1;
     }
+
+    const float* scale() const {
+        if(Stats == nullptr)
+            return nullptr;
+        return Stats + 1;
+    }
 };
 
 void fill_zero(Tensor& dst, cudaStream_t stream);

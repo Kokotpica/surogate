@@ -58,16 +58,16 @@ public:
 
         // Derived configs for sub-modules
         [[nodiscard]] typename AttentionType::Config attention_config() const {
-            return {
-                .hidden_size = hidden_size,
-                .num_query_heads = num_query_heads,
-                .num_kv_heads = num_kv_heads,
-                .rope = rope,
-                .use_qkv_bias = use_qkv_bias,
-                .use_qk_norm = use_qk_norm,
-                .qk_norm_eps = rms_norm_eps,  // Use same epsilon as layer norm
-                .head_size = head_size
-            };
+            typename AttentionType::Config cfg;
+            cfg.hidden_size = hidden_size;
+            cfg.num_query_heads = num_query_heads;
+            cfg.num_kv_heads = num_kv_heads;
+            cfg.rope = rope;
+            cfg.use_qkv_bias = use_qkv_bias;
+            cfg.use_qk_norm = use_qk_norm;
+            cfg.qk_norm_eps = rms_norm_eps;  // Use same epsilon as layer norm
+            cfg.head_size = head_size;
+            return cfg;
         }
 
         [[nodiscard]] typename NormType::Config norm_config() const {
@@ -215,7 +215,7 @@ Tensor DenseTransformerBlock<Att, Act, Norm>::forward_impl(
         acts.ln1_acts.output.Value = ln1_output;
         acts.ln1_acts.rstd = standalone_acts.rstd;
     } else {
-        Norm norm_module{};
+        Norm norm_module(typename Norm::Config{mConfig.hidden_size, mConfig.rms_norm_eps});
         ln1_output = norm_module.forward(ctx, w.ln1, residual, acts.ln1_acts);
     }
 

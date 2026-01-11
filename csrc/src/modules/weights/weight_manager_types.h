@@ -34,6 +34,14 @@ struct has_moe_weights : std::false_type {};
 template<typename T>
 struct has_moe_weights<T, std::void_t<decltype(std::declval<T>().router)>> : std::true_type {};
 
+// Helper type trait to detect if an attention Weights struct has QK norm weights
+// (Qwen3-style attention with q_norm_weight and k_norm_weight)
+template<typename T, typename = void>
+struct has_qk_norm_weights : std::false_type {};
+
+template<typename T>
+struct has_qk_norm_weights<T, std::void_t<decltype(std::declval<T>().q_norm_weight)>> : std::true_type {};
+
 /**
  * @brief Status tracking for double-buffered prefetching
  */

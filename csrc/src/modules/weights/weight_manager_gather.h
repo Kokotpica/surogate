@@ -102,11 +102,13 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             convert_into(src.attention.qkv_bias.value(), shard_dst(dst.attention.qkv_bias.value()));
         }
         convert_into(src.attention.out_weight, shard_dst(dst.attention.out_weight));
-        if (src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
-            convert_into(src.attention.q_norm_weight.value(), shard_dst(dst.attention.q_norm_weight.value()));
-        }
-        if (src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
-            convert_into(src.attention.k_norm_weight.value(), shard_dst(dst.attention.k_norm_weight.value()));
+        if constexpr (has_qk_norm_weights<std::decay_t<decltype(src.attention)>>::value) {
+            if (src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
+                convert_into(src.attention.q_norm_weight.value(), shard_dst(dst.attention.q_norm_weight.value()));
+            }
+            if (src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
+                convert_into(src.attention.k_norm_weight.value(), shard_dst(dst.attention.k_norm_weight.value()));
+            }
         }
         convert_into(src.ln2.weight, shard_dst(dst.ln2.weight));
         if constexpr (has_mlp_weights<BlockWeights>::value) {
@@ -131,8 +133,10 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
         gather_full(dst.attention.qkv_weight);
         if (dst.attention.qkv_bias.has_value()) gather_full(dst.attention.qkv_bias.value());
         gather_full(dst.attention.out_weight);
-        if (dst.attention.q_norm_weight.has_value()) gather_full(dst.attention.q_norm_weight.value());
-        if (dst.attention.k_norm_weight.has_value()) gather_full(dst.attention.k_norm_weight.value());
+        if constexpr (has_qk_norm_weights<std::decay_t<decltype(dst.attention)>>::value) {
+            if (dst.attention.q_norm_weight.has_value()) gather_full(dst.attention.q_norm_weight.value());
+            if (dst.attention.k_norm_weight.has_value()) gather_full(dst.attention.k_norm_weight.value());
+        }
         gather_full(dst.ln2.weight);
         if constexpr (has_mlp_weights<BlockWeights>::value) {
             gather_full(dst.mlp_up_weight);
@@ -191,11 +195,13 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             convert_into(master_src.attention.qkv_bias.value(), quant_dst.attention.qkv_bias.value());
         }
         convert_into(master_src.attention.out_weight, quant_dst.attention.out_weight);
-        if (master_src.attention.q_norm_weight.has_value() && quant_dst.attention.q_norm_weight.has_value()) {
-            convert_into(master_src.attention.q_norm_weight.value(), quant_dst.attention.q_norm_weight.value());
-        }
-        if (master_src.attention.k_norm_weight.has_value() && quant_dst.attention.k_norm_weight.has_value()) {
-            convert_into(master_src.attention.k_norm_weight.value(), quant_dst.attention.k_norm_weight.value());
+        if constexpr (has_qk_norm_weights<std::decay_t<decltype(master_src.attention)>>::value) {
+            if (master_src.attention.q_norm_weight.has_value() && quant_dst.attention.q_norm_weight.has_value()) {
+                convert_into(master_src.attention.q_norm_weight.value(), quant_dst.attention.q_norm_weight.value());
+            }
+            if (master_src.attention.k_norm_weight.has_value() && quant_dst.attention.k_norm_weight.has_value()) {
+                convert_into(master_src.attention.k_norm_weight.value(), quant_dst.attention.k_norm_weight.value());
+            }
         }
         convert_into(master_src.ln2.weight, quant_dst.ln2.weight);
         if constexpr (has_mlp_weights<BlockWeights>::value) {
@@ -276,11 +282,13 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             convert_into(quant_device.attention.qkv_bias.value(), shard_dst(dst.attention.qkv_bias.value()));
         }
         convert_into(quant_device.attention.out_weight, shard_dst(dst.attention.out_weight));
-        if (quant_device.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
-            convert_into(quant_device.attention.q_norm_weight.value(), shard_dst(dst.attention.q_norm_weight.value()));
-        }
-        if (quant_device.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
-            convert_into(quant_device.attention.k_norm_weight.value(), shard_dst(dst.attention.k_norm_weight.value()));
+        if constexpr (has_qk_norm_weights<std::decay_t<decltype(quant_device.attention)>>::value) {
+            if (quant_device.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
+                convert_into(quant_device.attention.q_norm_weight.value(), shard_dst(dst.attention.q_norm_weight.value()));
+            }
+            if (quant_device.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
+                convert_into(quant_device.attention.k_norm_weight.value(), shard_dst(dst.attention.k_norm_weight.value()));
+            }
         }
         convert_into(quant_device.ln2.weight, shard_dst(dst.ln2.weight));
         if constexpr (has_mlp_weights<BlockWeights>::value) {
@@ -303,11 +311,13 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             convert_into(quant_src.attention.qkv_bias.value(), shard_dst(dst.attention.qkv_bias.value()));
         }
         convert_into(quant_src.attention.out_weight, shard_dst(dst.attention.out_weight));
-        if (quant_src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
-            convert_into(quant_src.attention.q_norm_weight.value(), shard_dst(dst.attention.q_norm_weight.value()));
-        }
-        if (quant_src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
-            convert_into(quant_src.attention.k_norm_weight.value(), shard_dst(dst.attention.k_norm_weight.value()));
+        if constexpr (has_qk_norm_weights<std::decay_t<decltype(quant_src.attention)>>::value) {
+            if (quant_src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
+                convert_into(quant_src.attention.q_norm_weight.value(), shard_dst(dst.attention.q_norm_weight.value()));
+            }
+            if (quant_src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
+                convert_into(quant_src.attention.k_norm_weight.value(), shard_dst(dst.attention.k_norm_weight.value()));
+            }
         }
         convert_into(quant_src.ln2.weight, shard_dst(dst.ln2.weight));
         if constexpr (has_mlp_weights<BlockWeights>::value) {
@@ -322,11 +332,13 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
             convert_into(master_src.attention.qkv_bias.value(), shard_dst(dst.attention.qkv_bias.value()));
         }
         convert_into(master_src.attention.out_weight, shard_dst(dst.attention.out_weight));
-        if (master_src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
-            convert_into(master_src.attention.q_norm_weight.value(), shard_dst(dst.attention.q_norm_weight.value()));
-        }
-        if (master_src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
-            convert_into(master_src.attention.k_norm_weight.value(), shard_dst(dst.attention.k_norm_weight.value()));
+        if constexpr (has_qk_norm_weights<std::decay_t<decltype(master_src.attention)>>::value) {
+            if (master_src.attention.q_norm_weight.has_value() && dst.attention.q_norm_weight.has_value()) {
+                convert_into(master_src.attention.q_norm_weight.value(), shard_dst(dst.attention.q_norm_weight.value()));
+            }
+            if (master_src.attention.k_norm_weight.has_value() && dst.attention.k_norm_weight.has_value()) {
+                convert_into(master_src.attention.k_norm_weight.value(), shard_dst(dst.attention.k_norm_weight.value()));
+            }
         }
         convert_into(master_src.ln2.weight, shard_dst(dst.ln2.weight));
         if constexpr (has_mlp_weights<BlockWeights>::value) {
@@ -346,8 +358,10 @@ void ModularWeightManager<Block>::gather_block(int layer_idx, NCCLCommunicator& 
     gather_full(dst.attention.qkv_weight);
     if (dst.attention.qkv_bias.has_value()) gather_full(dst.attention.qkv_bias.value());
     gather_full(dst.attention.out_weight);
-    if (dst.attention.q_norm_weight.has_value()) gather_full(dst.attention.q_norm_weight.value());
-    if (dst.attention.k_norm_weight.has_value()) gather_full(dst.attention.k_norm_weight.value());
+    if constexpr (has_qk_norm_weights<std::decay_t<decltype(dst.attention)>>::value) {
+        if (dst.attention.q_norm_weight.has_value()) gather_full(dst.attention.q_norm_weight.value());
+        if (dst.attention.k_norm_weight.has_value()) gather_full(dst.attention.k_norm_weight.value());
+    }
     gather_full(dst.ln2.weight);
     if constexpr (has_mlp_weights<BlockWeights>::value) {
         gather_full(dst.mlp_up_weight);

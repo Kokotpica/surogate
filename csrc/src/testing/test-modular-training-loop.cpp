@@ -23,6 +23,10 @@
 #include "modules/composite/transformer_block.h"
 #include "modules/lora/lora_model.h"
 #include "modules/model_factory.h"
+#include "models/llama/llama_model.h"
+#include "models/llama/transformer_block.h"
+#include "models/qwen2/qwen2_model.h"
+#include "models/qwen2/transformer_block.h"
 #include "training/model.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
@@ -242,8 +246,8 @@ TEST_CASE("Modular cuda-graphs: 1 step forward/backward/update runs", "[modular]
         REQUIRE(std::isfinite(model->get_loss()));
         REQUIRE(std::isfinite(model->get_norm()));
 
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
+        using DenseBlock = modules::Qwen2TransformerBlock;
+        using DenseModel = modules::Qwen2Model;
         auto* dense = dynamic_cast<DenseModel*>(model.get());
         REQUIRE(dense != nullptr);
         REQUIRE(dense->run_state().forward_block_graph(/*layer_idx=*/0) != nullptr);
@@ -540,8 +544,8 @@ TEST_CASE("Modular ZeRO-2: all-to-all reducer + offload-gradients runs (2 GPUs)"
         REQUIRE(std::isfinite(model->get_loss()));
         REQUIRE(std::isfinite(model->get_norm()));
 
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
+        using DenseBlock = modules::Qwen2TransformerBlock;
+        using DenseModel = modules::Qwen2Model;
         auto* dense = dynamic_cast<DenseModel*>(model.get());
         REQUIRE(dense != nullptr);
         auto& bg = dense->grads().get_block_shard(/*layer_idx=*/0, comm.stream());
@@ -561,8 +565,8 @@ TEST_CASE("Modular recompute-block shares large activations across layers", "[mo
         auto model = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
         model->allocate_run_state(opts, comm, /*B=*/1, /*T=*/64, /*allocate_optimizer=*/false);
 
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
+        using DenseBlock = modules::Qwen2TransformerBlock;
+        using DenseModel = modules::Qwen2Model;
         auto* dense = dynamic_cast<DenseModel*>(model.get());
         REQUIRE(dense != nullptr);
 
@@ -593,8 +597,8 @@ TEST_CASE("Modular LoRA: recompute-block forward/backward/update runs", "[modula
 
         auto allocator = std::make_shared<TensorAllocator>();
 
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
+        using DenseBlock = modules::Qwen2TransformerBlock;
+        using DenseModel = modules::Qwen2Model;
 
         auto base_any = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
         auto* dense_ptr = dynamic_cast<DenseModel*>(base_any.release());
@@ -644,8 +648,8 @@ TEST_CASE("Modular leaf recompute flags affect activation sharing", "[modular][r
         PretrainedConfig cfg = create_test_config(/*num_layers=*/3, /*vocab_size=*/128);
         auto allocator = std::make_shared<TensorAllocator>();
 
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
+        using DenseBlock = modules::Qwen2TransformerBlock;
+        using DenseModel = modules::Qwen2Model;
 
         // recompute-qkv: qkv shared, att not shared
         {
@@ -704,8 +708,8 @@ TEST_CASE("Modular LoRA: base weights stay fixed, adapter weights update", "[mod
         auto allocator = std::make_shared<TensorAllocator>();
         auto base_any = modules::ModelFactory::create_from_pretrained_config(cfg, opts, comm.rank(), comm.world_size(), allocator);
 
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
+        using DenseBlock = modules::Qwen2TransformerBlock;
+        using DenseModel = modules::Qwen2Model;
         auto* dense_ptr = dynamic_cast<DenseModel*>(base_any.get());
         REQUIRE(dense_ptr != nullptr);
 
@@ -1303,8 +1307,8 @@ TEST_CASE("Recompute-block: activation values match recomputed values", "[modula
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Capture stored activations (ln1, ln2, qkv for each layer)
-        using DenseBlock = modules::DenseTransformerBlock<>;
-        using DenseModel = modules::ModularTransformerModel<DenseBlock>;
+        using DenseBlock = modules::Qwen2TransformerBlock;
+        using DenseModel = modules::Qwen2Model;
         auto* dense1 = dynamic_cast<DenseModel*>(model1.get());
         REQUIRE(dense1 != nullptr);
 

@@ -15,6 +15,16 @@
 #include "composite/transformer_block.h"
 #include "moe/moe_block.h"
 
+// Model class headers for inheritance-based dispatch
+#include "models/llama/llama_model.h"
+#include "models/qwen2/qwen2_model.h"
+#include "models/qwen3/qwen3_model.h"
+#include "models/qwen3moe/qwen3_moe_model.h"
+#include "models/llama/transformer_block.h"
+#include "models/qwen2/transformer_block.h"
+#include "models/qwen3/transformer_block.h"
+#include "models/qwen3moe/qwen3_moe_block.h"
+
 #include "training/model.h"
 #include "utilities/allocator.h"
 
@@ -65,6 +75,25 @@ public:
         }
     }
 
+    /**
+     * @brief Create a model from PretrainedConfig using inheritance-based dispatch
+     *
+     * Dispatches to the correct model class based on the config's architecture ID:
+     * - QWEN3_MOE -> Qwen3MoEModel or Qwen3HybridModel
+     * - QWEN3     -> Qwen3Model
+     * - QWEN2     -> Qwen2Model
+     * - LLAMA     -> LlamaModel
+     *
+     * This follows the Transformers-like inheritance pattern where config type
+     * determines model class, enabling model-specific behaviors.
+     *
+     * @param config PretrainedConfig (or derived) instance
+     * @param options Runtime options
+     * @param rank Process rank for sharding
+     * @param world World size
+     * @param alloc Optional tensor allocator
+     * @return Unique pointer to model (as IModel)
+     */
     static std::unique_ptr<IModel> create_from_pretrained_config(
         const PretrainedConfig& config,
         const RuntimeOptions& options,
@@ -75,12 +104,40 @@ public:
         ModelConfig mod_config = ModelConfig::from_pretrained_config(config);
         ModelOptions mod_options = ModelOptions::from_runtime_options(options);
 
-        return create(mod_config, mod_options, rank, world, alloc);
+        // Dispatch based on config architecture ID (most specific first)
+        switch (config.Architecture) {
+            case PretrainedConfig::QWEN3_MOE: {
+                // Qwen3 MoE - use dynamic_cast for additional config fields
+                if (const auto* moe_cfg = dynamic_cast<const Qwen3MoEConfig*>(&config)) {
+                    return create_qwen3_moe_model(*moe_cfg, mod_options, rank, world, alloc);
+                }
+                // Fallback if dynamic_cast fails but Architecture says MoE
+                return create_moe_model(mod_config, mod_options, rank, world, alloc);
+            }
+
+            case PretrainedConfig::QWEN3:
+                return std::make_unique<Qwen3Model>(mod_config, mod_options, rank, world, alloc);
+
+            case PretrainedConfig::QWEN2:
+                return std::make_unique<Qwen2Model>(mod_config, mod_options, rank, world, alloc);
+
+            case PretrainedConfig::LLAMA:
+            default:
+                return std::make_unique<LlamaModel>(mod_config, mod_options, rank, world, alloc);
+        }
     }
 
 private:
     /**
      * @brief Create a dense transformer model
+     *
+     * Dispatches to the correct model class based on ModelConfig's architecture
+     * hint or uses inheritance-based selection when available.
+     *
+     * Model hierarchy for dense architectures:
+     * - LlamaModel (default, uses LlamaTransformerBlock)
+     * - Qwen2Model (uses Qwen2TransformerBlock with sliding window support)
+     * - Qwen3Model (uses Qwen3TransformerBlock with QK normalization)
      */
     static std::unique_ptr<IModel> create_dense_model(
         const ModelConfig& config,
@@ -89,22 +146,45 @@ private:
         int world,
         const std::shared_ptr<TensorAllocator>& alloc) {
 
-        // Select block type based on activation and norm types
-        // For now, default to DenseTransformerBlock with standard components
+        // Dispatch based on config hints
+        // The config may have been converted from a PretrainedConfig, so we check
+        // for model-specific features to select the correct block type.
 
-        using DefaultBlock = DenseTransformerBlock<>;
+        // Check for Qwen3-specific features (QK normalization)
+        if (config.use_qk_norm) {
+            return std::make_unique<Qwen3Model>(config, options, rank, world, alloc);
+        }
 
-        return std::make_unique<ModularTransformerModel<DefaultBlock>>(
-            config, options, rank, world, alloc);
+        // Check for Qwen2-specific features (sliding window)
+        if (config.use_sliding_window && config.sliding_window_size > 0) {
+            return std::make_unique<Qwen2Model>(config, options, rank, world, alloc);
+        }
+
+        // Check for QKV bias (common in Qwen2, but also can be in others)
+        // This is a weaker signal, so we use LlamaModel which handles bias correctly
+        if (config.UseQKVBias) {
+            // Qwen2 typically has bias, but if no sliding window, it might be
+            // a variant - use Qwen2 block anyway for proper bias handling
+            return std::make_unique<Qwen2Model>(config, options, rank, world, alloc);
+        }
+
+        // Default to LlamaModel
+        return std::make_unique<LlamaModel>(config, options, rank, world, alloc);
     }
 
     /**
      * @brief Create a Mixture-of-Experts model
      *
      * Supports various MoE configurations:
+     * - Qwen3 MoE (Qwen3MoEModel with Qwen3RouterModule)
      * - Standard top-k routing (Mixtral-style)
      * - Switch routing (top-1)
      * - With or without shared expert (Nemotron/DeepSeek style)
+     *
+     * Model hierarchy for MoE architectures:
+     * - Qwen3MoEModel (uses Qwen3MoEBlock with Qwen3Router)
+     * - StandardMoEBlock (generic MoE with TopKRouter)
+     * - SwitchTransformerBlock (top-1 routing)
      */
     static std::unique_ptr<IModel> create_moe_model(
         const ModelConfig& config,
@@ -118,6 +198,11 @@ private:
         }
 
         const auto& moe_cfg = config.moe_config.value();
+
+        // Check for Qwen3-specific features (QK norm) to use Qwen3MoEModel
+        if (config.use_qk_norm) {
+            return std::make_unique<Qwen3MoEModel>(config, options, rank, world, alloc);
+        }
 
         // Select router type based on top_k
         if (moe_cfg.top_k == 1) {

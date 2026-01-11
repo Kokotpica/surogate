@@ -100,22 +100,25 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
             inp_quant, cached_qkv, /*delayed_quantizer_idx=*/-1, stream,
             fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
 
-        if (weights.attention.q_norm_weight.has_value() && weights.attention.k_norm_weight.has_value()) {
-            const int q_rows = Hq * Hs;
-            qkv_head_rmsnorm_forward(
-                a.qkv, a.q_rstd, weights.attention.q_norm_weight.value(),
-                mConfig.RmsNormEps,
-                B, T, qkv_channels,
-                /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
-                stream
-            );
-            qkv_head_rmsnorm_forward(
-                a.qkv, a.k_rstd, weights.attention.k_norm_weight.value(),
-                mConfig.RmsNormEps,
-                B, T, qkv_channels,
-                /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
-                stream
-            );
+        using AttentionWeightsType = std::decay_t<decltype(weights.attention)>;
+        if constexpr (has_qk_norm_weights<AttentionWeightsType>::value) {
+            if (weights.attention.q_norm_weight.has_value() && weights.attention.k_norm_weight.has_value()) {
+                const int q_rows = Hq * Hs;
+                qkv_head_rmsnorm_forward(
+                    a.qkv, a.q_rstd, weights.attention.q_norm_weight.value(),
+                    mConfig.RmsNormEps,
+                    B, T, qkv_channels,
+                    /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
+                    stream
+                );
+                qkv_head_rmsnorm_forward(
+                    a.qkv, a.k_rstd, weights.attention.k_norm_weight.value(),
+                    mConfig.RmsNormEps,
+                    B, T, qkv_channels,
+                    /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
+                    stream
+                );
+            }
         }
 
         // RoPE: operates in-place on a.qkv (can't fuse with quantization here)
@@ -587,73 +590,76 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 	        });
 
 	        // Optional Q/K head RMSNorm backward (Qwen3-style).
-	        if (weights.attention.q_norm_weight.has_value() && weights.attention.k_norm_weight.has_value()) {
-	            with_ctx("qk_norm_backward", [&]() {
-	                // If we didn't keep pre-RoPE QKV, convert activations back to pre-RoPE space.
-	                if (a.qkv_rope.Data == nullptr) {
-	                    if (mOptions.use_fused_rope) {
-	                        rope_fused_backward(
-	                            a.qkv, a.qkv,
-	                            rs.PositionIDs.template get<int>(),
-	                            nullptr,
-	                            mConfig.RopeTheta, B, T, Hq, Hkv, Hs,
-	                            stream
-	                        );
-	                    } else {
-	                        rope_backward(
-	                            a.qkv, a.qkv,
-	                            rs.non_block_activations().freq_cis,
-	                            rs.PositionIDs.template get<int>(),
-	                            nullptr,
-	                            B, T, Hq, Hkv, Hs,
-	                            stream
-	                        );
-	                    }
-	                }
-
-	                const int q_rows = Hq * Hs;
-
-	                // Weight gradients must use dy (post-attention backward, pre-qk_norm_backward_dx).
-	                // Skip in LoRA-only mode since QK-norm weights are frozen.
-	                if constexpr (requires { grads.attention_grads.d_q_norm_weight; grads.attention_grads.d_k_norm_weight; }) {
-	                    if (!lora_only) {
-	                        if (grads.attention_grads.d_q_norm_weight.has_value()) {
-	                            qkv_head_rmsnorm_backward_dweight(
-	                                grads.attention_grads.d_q_norm_weight.value(),
-	                                da.d_qkv, a.qkv, weights.attention.q_norm_weight.value(),
-	                                B, T, qkv_channels,
-	                                /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
-	                                /*accumulate=*/accumulate,
+	        using BwdAttentionWeightsType = std::decay_t<decltype(weights.attention)>;
+	        if constexpr (has_qk_norm_weights<BwdAttentionWeightsType>::value) {
+	            if (weights.attention.q_norm_weight.has_value() && weights.attention.k_norm_weight.has_value()) {
+	                with_ctx("qk_norm_backward", [&]() {
+	                    // If we didn't keep pre-RoPE QKV, convert activations back to pre-RoPE space.
+	                    if (a.qkv_rope.Data == nullptr) {
+	                        if (mOptions.use_fused_rope) {
+	                            rope_fused_backward(
+	                                a.qkv, a.qkv,
+	                                rs.PositionIDs.template get<int>(),
+	                                nullptr,
+	                                mConfig.RopeTheta, B, T, Hq, Hkv, Hs,
 	                                stream
 	                            );
-	                        }
-	                        if (grads.attention_grads.d_k_norm_weight.has_value()) {
-	                            qkv_head_rmsnorm_backward_dweight(
-	                                grads.attention_grads.d_k_norm_weight.value(),
-	                                da.d_qkv, a.qkv, weights.attention.k_norm_weight.value(),
-	                                B, T, qkv_channels,
-	                                /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
-	                                /*accumulate=*/accumulate,
+	                        } else {
+	                            rope_backward(
+	                                a.qkv, a.qkv,
+	                                rs.non_block_activations().freq_cis,
+	                                rs.PositionIDs.template get<int>(),
+	                                nullptr,
+	                                B, T, Hq, Hkv, Hs,
 	                                stream
 	                            );
 	                        }
 	                    }
-	                }
 
-	                // Transform dy -> dx in-place.
-	                qkv_head_rmsnorm_backward_dx(
-	                    da.d_qkv, a.qkv, weights.attention.q_norm_weight.value(), a.q_rstd,
-	                    B, T, qkv_channels,
-	                    /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
-	                    stream
-	                );
-	                qkv_head_rmsnorm_backward_dx(
-	                    da.d_qkv, a.qkv, weights.attention.k_norm_weight.value(), a.k_rstd,
-	                    B, T, qkv_channels,
-	                    /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
-	                    stream
-	                );
-	            });
+	                    const int q_rows = Hq * Hs;
+
+	                    // Weight gradients must use dy (post-attention backward, pre-qk_norm_backward_dx).
+	                    // Skip in LoRA-only mode since QK-norm weights are frozen.
+	                    if constexpr (requires { grads.attention_grads.d_q_norm_weight; grads.attention_grads.d_k_norm_weight; }) {
+	                        if (!lora_only) {
+	                            if (grads.attention_grads.d_q_norm_weight.has_value()) {
+	                                qkv_head_rmsnorm_backward_dweight(
+	                                    grads.attention_grads.d_q_norm_weight.value(),
+	                                    da.d_qkv, a.qkv, weights.attention.q_norm_weight.value(),
+	                                    B, T, qkv_channels,
+	                                    /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
+	                                    /*accumulate=*/accumulate,
+	                                    stream
+	                                );
+	                            }
+	                            if (grads.attention_grads.d_k_norm_weight.has_value()) {
+	                                qkv_head_rmsnorm_backward_dweight(
+	                                    grads.attention_grads.d_k_norm_weight.value(),
+	                                    da.d_qkv, a.qkv, weights.attention.k_norm_weight.value(),
+	                                    B, T, qkv_channels,
+	                                    /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
+	                                    /*accumulate=*/accumulate,
+	                                    stream
+	                                );
+	                            }
+	                        }
+	                    }
+
+	                    // Transform dy -> dx in-place.
+	                    qkv_head_rmsnorm_backward_dx(
+	                        da.d_qkv, a.qkv, weights.attention.q_norm_weight.value(), a.q_rstd,
+	                        B, T, qkv_channels,
+	                        /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
+	                        stream
+	                    );
+	                    qkv_head_rmsnorm_backward_dx(
+	                        da.d_qkv, a.qkv, weights.attention.k_norm_weight.value(), a.k_rstd,
+	                        B, T, qkv_channels,
+	                        /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
+	                        stream
+	                    );
+	                });
+	            }
 	        }
 
         // -------------------- QKV backward --------------------

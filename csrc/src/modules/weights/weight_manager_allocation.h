@@ -471,16 +471,20 @@ void ModularWeightManager<Block>::allocate_block_weights(
         block.attention.qkv_bias = alloc(other_dtype, "attn_qkv_b", {qkv_channels});
     }
     block.attention.out_weight = alloc(matmul_dtype, "attn_out_w", {C, HS * HQ});
-    const bool use_qk_norm = [&]() -> bool {
-        if constexpr (requires { cfg.use_qk_norm; }) return cfg.use_qk_norm;
-        return false;
-    }();
-    if (use_qk_norm) {
-        block.attention.q_norm_weight = alloc(other_dtype, "attn_q_norm_w", {HS});
-        block.attention.k_norm_weight = alloc(other_dtype, "attn_k_norm_w", {HS});
-    } else {
-        block.attention.q_norm_weight.reset();
-        block.attention.k_norm_weight.reset();
+    // QK normalization weights (Qwen3-style) - only allocate if the Weights struct has these fields
+    using AttentionWeightsType = std::decay_t<decltype(block.attention)>;
+    if constexpr (has_qk_norm_weights<AttentionWeightsType>::value) {
+        const bool use_qk_norm = [&]() -> bool {
+            if constexpr (requires { cfg.use_qk_norm; }) return cfg.use_qk_norm;
+            return false;
+        }();
+        if (use_qk_norm) {
+            block.attention.q_norm_weight = alloc(other_dtype, "attn_q_norm_w", {HS});
+            block.attention.k_norm_weight = alloc(other_dtype, "attn_k_norm_w", {HS});
+        } else {
+            block.attention.q_norm_weight.reset();
+            block.attention.k_norm_weight.reset();
+        }
     }
 
     // LN2 weights

@@ -174,26 +174,33 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                 hook(l, main_stream, ForwardHookPoint::AfterQKVProjection);
             }
 
-            const bool use_qk_norm =
-                weights.attention.q_norm_weight.has_value() && weights.attention.k_norm_weight.has_value();
+            // 2.5) Optional Q/K head RMSNorm (Qwen3-style) - only for attention modules that have these fields
+            using AttentionWeightsType = std::decay_t<decltype(weights.attention)>;
+            const bool use_qk_norm = [&]() {
+                if constexpr (has_qk_norm_weights<AttentionWeightsType>::value) {
+                    return weights.attention.q_norm_weight.has_value() && weights.attention.k_norm_weight.has_value();
+                }
+                return false;
+            }();
 
-            // 2.5) Optional Q/K head RMSNorm (Qwen3-style).
-            if (use_qk_norm) {
-                const int q_rows = Hq * Hs;
-                qkv_head_rmsnorm_forward(
-                    acts.qkv, acts.q_rstd, weights.attention.q_norm_weight.value(),
-                    mConfig.RmsNormEps,
-                    (int)B, (int)T, (int)qkv_channels,
-                    /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
-                    main_stream
-                );
-                qkv_head_rmsnorm_forward(
-                    acts.qkv, acts.k_rstd, weights.attention.k_norm_weight.value(),
-                    mConfig.RmsNormEps,
-                    (int)B, (int)T, (int)qkv_channels,
-                    /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
-                    main_stream
-                );
+            if constexpr (has_qk_norm_weights<AttentionWeightsType>::value) {
+                if (use_qk_norm) {
+                    const int q_rows = Hq * Hs;
+                    qkv_head_rmsnorm_forward(
+                        acts.qkv, acts.q_rstd, weights.attention.q_norm_weight.value(),
+                        mConfig.RmsNormEps,
+                        (int)B, (int)T, (int)qkv_channels,
+                        /*num_heads=*/Hq, /*head_size=*/Hs, /*channel_offset=*/0,
+                        main_stream
+                    );
+                    qkv_head_rmsnorm_forward(
+                        acts.qkv, acts.k_rstd, weights.attention.k_norm_weight.value(),
+                        mConfig.RmsNormEps,
+                        (int)B, (int)T, (int)qkv_channels,
+                        /*num_heads=*/Hkv, /*head_size=*/Hs, /*channel_offset=*/q_rows,
+                        main_stream
+                    );
+                }
             }
 
             // 3) Apply RoPE

@@ -70,11 +70,14 @@ void ModularWeightManager<Block>::iterate_tensors(
             callback(prefix + ".self_attn.qkv.bias", shard(block.attention.qkv_bias.value(), {qkv_rows}));
         }
         callback(prefix + ".self_attn.o_proj.weight", shard(block.attention.out_weight, {C, q_rows}));
-        if (block.attention.q_norm_weight.has_value()) {
-            callback(prefix + ".self_attn.q_norm.weight", shard(block.attention.q_norm_weight.value(), {HS}));
-        }
-        if (block.attention.k_norm_weight.has_value()) {
-            callback(prefix + ".self_attn.k_norm.weight", shard(block.attention.k_norm_weight.value(), {HS}));
+        // QK norm weights - only for attention modules that have them (Qwen3-style)
+        if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
+            if (block.attention.q_norm_weight.has_value()) {
+                callback(prefix + ".self_attn.q_norm.weight", shard(block.attention.q_norm_weight.value(), {HS}));
+            }
+            if (block.attention.k_norm_weight.has_value()) {
+                callback(prefix + ".self_attn.k_norm.weight", shard(block.attention.k_norm_weight.value(), {HS}));
+            }
         }
 
         // MLP weights - only for dense blocks
@@ -135,11 +138,13 @@ void ModularWeightManager<Block>::random_init(int seed, NCCLCommunicator& comm) 
 
         fill_constant(layer.ln1.weight, 1.f, layer.ln1.weight.nelem(), nullptr);
         fill_constant(layer.ln2.weight, 1.f, layer.ln2.weight.nelem(), nullptr);
-        if (layer.attention.q_norm_weight.has_value()) {
-            fill_constant(layer.attention.q_norm_weight.value(), 1.f, layer.attention.q_norm_weight->nelem(), nullptr);
-        }
-        if (layer.attention.k_norm_weight.has_value()) {
-            fill_constant(layer.attention.k_norm_weight.value(), 1.f, layer.attention.k_norm_weight->nelem(), nullptr);
+        if constexpr (has_qk_norm_weights<decltype(layer.attention)>::value) {
+            if (layer.attention.q_norm_weight.has_value()) {
+                fill_constant(layer.attention.q_norm_weight.value(), 1.f, layer.attention.q_norm_weight->nelem(), nullptr);
+            }
+            if (layer.attention.k_norm_weight.has_value()) {
+                fill_constant(layer.attention.k_norm_weight.value(), 1.f, layer.attention.k_norm_weight->nelem(), nullptr);
+            }
         }
 
         fill_normal(layer.attention.qkv_weight, layer.attention.qkv_weight.nelem(), 0.f, scale, seed, local_seeds[0], nullptr);
@@ -254,11 +259,13 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
             named_tensors.emplace(prefix + ".self_attn.qkv.bias", dst(block.attention.qkv_bias.value(), {fused_rows}));
         }
         named_tensors.emplace(prefix + ".self_attn.o_proj.weight", dst(block.attention.out_weight, {C, q_rows}));
-        if (block.attention.q_norm_weight.has_value()) {
-            named_tensors.emplace(prefix + ".self_attn.q_norm.weight", dst(block.attention.q_norm_weight.value(), {HS}));
-        }
-        if (block.attention.k_norm_weight.has_value()) {
-            named_tensors.emplace(prefix + ".self_attn.k_norm.weight", dst(block.attention.k_norm_weight.value(), {HS}));
+        if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
+            if (block.attention.q_norm_weight.has_value()) {
+                named_tensors.emplace(prefix + ".self_attn.q_norm.weight", dst(block.attention.q_norm_weight.value(), {HS}));
+            }
+            if (block.attention.k_norm_weight.has_value()) {
+                named_tensors.emplace(prefix + ".self_attn.k_norm.weight", dst(block.attention.k_norm_weight.value(), {HS}));
+            }
         }
 
         if constexpr (has_mlp_weights<BlockWeights>::value) {
@@ -389,11 +396,13 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
         writer.register_tensor(prefix + ".input_layernorm.weight", TensorShard(block.ln1.weight));
         writer.register_tensor(prefix + ".post_attention_layernorm.weight", TensorShard(block.ln2.weight));
         writer.register_tensor(prefix + ".self_attn.o_proj.weight", TensorShard(block.attention.out_weight));
-        if (block.attention.q_norm_weight.has_value()) {
-            writer.register_tensor(prefix + ".self_attn.q_norm.weight", TensorShard(block.attention.q_norm_weight.value()));
-        }
-        if (block.attention.k_norm_weight.has_value()) {
-            writer.register_tensor(prefix + ".self_attn.k_norm.weight", TensorShard(block.attention.k_norm_weight.value()));
+        if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
+            if (block.attention.q_norm_weight.has_value()) {
+                writer.register_tensor(prefix + ".self_attn.q_norm.weight", TensorShard(block.attention.q_norm_weight.value()));
+            }
+            if (block.attention.k_norm_weight.has_value()) {
+                writer.register_tensor(prefix + ".self_attn.k_norm.weight", TensorShard(block.attention.k_norm_weight.value()));
+            }
         }
 
         // Split QKV from fused tensor.
@@ -439,11 +448,13 @@ void ModularWeightManager<Block>::export_to_file(const std::string& filename, NC
         writer.write_tensor(prefix + ".input_layernorm.weight", TensorShard(block.ln1.weight), &comm);
         writer.write_tensor(prefix + ".post_attention_layernorm.weight", TensorShard(block.ln2.weight), &comm);
         writer.write_tensor(prefix + ".self_attn.o_proj.weight", TensorShard(block.attention.out_weight), &comm);
-        if (block.attention.q_norm_weight.has_value()) {
-            writer.write_tensor(prefix + ".self_attn.q_norm.weight", TensorShard(block.attention.q_norm_weight.value()), &comm);
-        }
-        if (block.attention.k_norm_weight.has_value()) {
-            writer.write_tensor(prefix + ".self_attn.k_norm.weight", TensorShard(block.attention.k_norm_weight.value()), &comm);
+        if constexpr (has_qk_norm_weights<decltype(block.attention)>::value) {
+            if (block.attention.q_norm_weight.has_value()) {
+                writer.write_tensor(prefix + ".self_attn.q_norm.weight", TensorShard(block.attention.q_norm_weight.value()), &comm);
+            }
+            if (block.attention.k_norm_weight.has_value()) {
+                writer.write_tensor(prefix + ".self_attn.k_norm.weight", TensorShard(block.attention.k_norm_weight.value()), &comm);
+            }
         }
 
         writer.write_tensor(prefix + ".self_attn.q_proj.weight",

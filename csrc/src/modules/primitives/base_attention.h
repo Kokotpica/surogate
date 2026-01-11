@@ -163,8 +163,8 @@ protected:
         }
 
         const Tensor& inp = qkv_input.for_matmul();
-        float* scale_a = qkv_weight.scale();
-        float* scale_b = qkv_input.scale();
+        const float* scale_a = qkv_weight.scale();
+        const float* scale_b = qkv_input.scale();
 
         matmul(
             qkv_output, qkv_weight, inp, qkv_bias,
@@ -341,8 +341,8 @@ protected:
         }
 
         const Tensor& inp = att_for_out.for_matmul();
-        float* scale_a = out_weight.scale();
-        float* scale_b = att_for_out.scale();
+        const float* scale_a = out_weight.scale();
+        const float* scale_b = att_for_out.scale();
 
         matmul(
             output, out_weight, inp, std::nullopt,
