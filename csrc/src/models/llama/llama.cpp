@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include "models/llama.h"
+#include "models/llama/llama.h"
 
 #include <nlohmann/json.hpp>
 

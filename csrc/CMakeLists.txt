@@ -211,10 +211,10 @@ target_sources(surogate-common PRIVATE
 
     src/config/pretrained_config.cpp
     src/models/registry.cpp
-    src/models/qwen25.cpp
-    src/models/qwen3.cpp
-    src/models/qwen3_moe.cpp
-    src/models/llama.cpp
+    src/models/qwen25/qwen25.cpp
+    src/models/qwen3/qwen3.cpp
+    src/models/qwen3moe/qwen3_moe.cpp
+    src/models/llama/llama.cpp
 
     src/modules/qlora/fp8_weights.cpp
     src/modules/qlora/fp4_weights.cpp

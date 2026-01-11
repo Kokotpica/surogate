@@ -9,10 +9,10 @@
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
 
-#include "models/llama.h"
-#include "models/qwen25.h"
-#include "models/qwen3.h"
-#include "models/qwen3_moe.h"
+#include "models/llama/llama.h"
+#include "models/qwen25/qwen25.h"
+#include "models/qwen3/qwen3.h"
+#include "models/qwen3moe/qwen3_moe.h"
 
 namespace models {
 

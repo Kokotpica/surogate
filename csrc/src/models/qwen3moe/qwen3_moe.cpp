@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include "models/qwen3_moe.h"
+#include "models/qwen3moe/qwen3_moe.h"
 
 #include <nlohmann/json.hpp>
 
