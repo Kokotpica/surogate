@@ -8,6 +8,8 @@
 #include "lora_model_core.h"
 #include "lora_model_utils.h"
 #include "lora_utils.h"
+#include "modules/lora/fast_expert_lora.h"
+#include "modules/moe/moe_types.h"
 
 namespace modules {
 
@@ -25,10 +27,53 @@ void ModularLoRAModel<Block>::backward(Tensor inputs, Tensor targets, NCCLCommun
 
     mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
 
-    auto hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream, BackwardHookPoint point) {
-        const int B = (int)mBaseModel->get_run_state().B;
-        const int T = (int)mBaseModel->get_run_state().T;
+    auto hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream, BackwardHookPoint point, void* context) {
+        const int B = (int)mBaseModel->run_state().B;
+        const int T = (int)mBaseModel->run_state().T;
+        auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+
         switch (point) {
+            case BackwardHookPoint::MoEExpertGroupManual: {
+                if (lora_block.moe.use_grouped && lora_block.moe.has_any() && context) {
+                    auto* moe_ctx = static_cast<MoEGroupedContext*>(context);
+                    bool lora_accum = false;
+                    auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                    lora_accum = lora_accum || accumulate;
+
+                    auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
+                    const int C = (int)mBaseModel->config().HiddenSize;
+                    const int D = (int)mBaseModel->config().IntermediateSize;
+                    const int rank = mLoRAConfig.rank;
+
+                    using WeightsType = std::remove_reference_t<decltype(base_weights)>;
+                    if constexpr (has_experts<WeightsType>::value) {
+                        if (base_weights.experts.use_batched && lora_grads.moe.use_grouped) {
+                            detail::grouped_fast_expert_lora_backward(
+                                lora_grads.moe.grouped,
+                                const_cast<Tensor&>(*moe_ctx->d_permuted_input),
+                                *moe_ctx->d_expert_outputs,
+                                base_weights.experts.gate_up_proj,
+                                base_weights.experts.down_proj,
+                                lora_block.moe.grouped,
+                                mLoRARunState->moe_lora_gate,   // contiguous buffer for gate output
+                                mLoRARunState->moe_lora_up,     // contiguous buffer for up output
+                                *moe_ctx->permuted_input,
+                                *moe_ctx->expert_offsets,
+                                mLoRAConfig.scaling(),
+                                moe_ctx->num_experts, C, D, rank,
+                                lora_accum,
+                                mLoRARunState->moe_lora_intermediate1,
+                                mLoRARunState->moe_lora_intermediate2,
+                                mLoRARunState->moe_lora_gate_up,
+                                mBaseModel->run_state().CublasHandle,
+                                stream,
+                                moe_ctx->host_offsets
+                            );
+                            moe_ctx->handled = true;
+                        }
+                    }
+                }
+            } break;
             case BackwardHookPoint::AfterMLPDownBackward:
                 backward_lora_mlp_down(layer_idx, B, T, accumulate, comm, stream);
                 break;

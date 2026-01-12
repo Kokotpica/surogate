@@ -33,6 +33,18 @@ ModularLoRAModel<Block>::ModularLoRAModel(std::unique_ptr<ModularTransformerMode
     // Check if this is an MoE model - per-expert LoRA is used instead of MLP LoRA
     mIsMoEModel = (cfg.architecture == ArchitectureType::MoE);
 
+    // DEBUG: Print MoE detection info
+    fprintf(stderr, "[LoRA DEBUG] Architecture type: %d (Dense=0, MoE=1, Hybrid=2)\n",
+            static_cast<int>(cfg.architecture));
+    fprintf(stderr, "[LoRA DEBUG] mIsMoEModel: %s\n", mIsMoEModel ? "true" : "false");
+    fprintf(stderr, "[LoRA DEBUG] moe_config.has_value(): %s\n",
+            cfg.moe_config.has_value() ? "true" : "false");
+    if (cfg.moe_config.has_value()) {
+        fprintf(stderr, "[LoRA DEBUG] moe_config.num_experts: %d\n", cfg.moe_config->num_experts);
+        fprintf(stderr, "[LoRA DEBUG] moe_config.top_k: %d\n", cfg.moe_config->top_k);
+        fprintf(stderr, "[LoRA DEBUG] moe_config.moe_intermediate_size: %d\n", cfg.moe_config->moe_intermediate_size);
+    }
+
     ModularLoRAWeightsManager::Config wm{};
     wm.num_layers = cfg.NumLayers;
     wm.hidden_size = cfg.HiddenSize;
@@ -189,6 +201,10 @@ void ModularLoRAModel<Block>::allocate_lora_run_state(NCCLCommunicator& comm, in
 
     auto& rs = mBaseModel->run_state();
     const long num_block_sums = std::max<long>(2, static_cast<long>(get_max_num_block_sums(rs.DeviceProp)));
+
+    // For MoE LoRA, use the activation dtype (BF16) instead of model dtype
+    // to match the dtype of activation tensors like expert_gate_up
+    ETensorDType moe_work_dtype = rs.config().activation_dtype;
     mLoRARunState->norm_buffer = mAllocator->allocate(
         ETensorDType::FP32, "lora_norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums + 2});
 
@@ -199,6 +215,44 @@ void ModularLoRAModel<Block>::allocate_lora_run_state(NCCLCommunicator& comm, in
             work_dtype, "lora_recompute_ln", EAllocationType::ON_DEVICE, {B, T, C});
         mLoRARunState->recompute_rstd = mAllocator->allocate(
             ETensorDType::FP32, "lora_recompute_rstd", EAllocationType::ON_DEVICE, {B, T});
+    }
+
+    if (mIsMoEModel) {
+        assert(cfg.moe_config.has_value());
+        const auto& moe_cfg = *cfg.moe_config;
+        const int top_k = moe_cfg.top_k;
+        const int total_tokens = BT * top_k;
+        const int expert_D = moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : (int)cfg.IntermediateSize;
+
+        // DEBUG: Print MoE buffer allocation info
+        fprintf(stderr, "[LoRA DEBUG] Allocating MoE buffers: top_k=%d, total_tokens=%d, expert_D=%d, rank=%d\n",
+                top_k, total_tokens, expert_D, rank);
+
+        mLoRARunState->moe_lora_intermediate1 = mAllocator->allocate(
+            moe_work_dtype, "moe_lora_intermediate1", EAllocationType::ON_DEVICE, {total_tokens, rank});
+        mLoRARunState->moe_lora_intermediate2 = mAllocator->allocate(
+            moe_work_dtype, "moe_lora_intermediate2", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
+        // moe_lora_gate and moe_lora_up are contiguous buffers for split gate_up values
+        mLoRARunState->moe_lora_gate = mAllocator->allocate(
+            moe_work_dtype, "moe_lora_gate", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
+        mLoRARunState->moe_lora_up = mAllocator->allocate(
+            moe_work_dtype, "moe_lora_up", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
+        mLoRARunState->moe_lora_gate_up = mAllocator->allocate(
+            moe_work_dtype, "moe_lora_gate_up", EAllocationType::ON_DEVICE, {total_tokens, 2 * expert_D});
+
+        // DEBUG: Verify buffer allocation
+        fprintf(stderr, "[LoRA DEBUG] MoE buffers allocated:\n");
+        fprintf(stderr, "  moe_lora_gate: ptr=%p, size=[%ld, %ld]\n",
+                mLoRARunState->moe_lora_gate.Data,
+                mLoRARunState->moe_lora_gate.Sizes[0], mLoRARunState->moe_lora_gate.Sizes[1]);
+        fprintf(stderr, "  moe_lora_up: ptr=%p, size=[%ld, %ld]\n",
+                mLoRARunState->moe_lora_up.Data,
+                mLoRARunState->moe_lora_up.Sizes[0], mLoRARunState->moe_lora_up.Sizes[1]);
+        fprintf(stderr, "  moe_lora_gate_up: ptr=%p, size=[%ld, %ld]\n",
+                mLoRARunState->moe_lora_gate_up.Data,
+                mLoRARunState->moe_lora_gate_up.Sizes[0], mLoRARunState->moe_lora_gate_up.Sizes[1]);
+    } else {
+        fprintf(stderr, "[LoRA DEBUG] NOT allocating MoE buffers (mIsMoEModel=false)\n");
     }
 }
 

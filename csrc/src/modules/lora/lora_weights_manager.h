@@ -120,6 +120,9 @@ private:
                                  int in_features, int out_features,
                                  const std::string& name);
     void allocate_block_weights(int layer_idx);
+    void allocate_grouped_moe_weights(LoRAGroupedExpertWeights<TensorShard>& master_moe,
+                                      LoRAGroupedExpertWeights<Tensor>& work_moe,
+                                      int layer_idx);
     void allocate_expert_weights(LoRAExpertWeights<TensorShard>& master_expert,
                                   LoRAExpertWeights<Tensor>& work_expert,
                                   int layer_idx, int expert_idx);

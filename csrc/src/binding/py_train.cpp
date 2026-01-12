@@ -311,7 +311,12 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         Tensor position_ids = ctx.Model->get_position_ids_buffer();
         Tensor targets = ctx.Model->get_target_buffer();
         ctx.Model->forward(inputs, position_ids, *ctx.Communicator, micro_idx);
-        ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
+        try {
+            ctx.Model->backward(inputs, targets, *ctx.Communicator, micro_batches, micro_idx);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[DEBUG] Exception in backward: %s\n", e.what());
+            throw;
+        }
     });
     ++mTrainMicroStep;
 }

@@ -89,16 +89,13 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
 
     // MLP LoRA: For dense models, use standard MLP LoRA. For MoE models, use per-expert LoRA.
     if (mConfig.is_moe && mConfig.num_experts > 0) {
-        // Allocate per-expert LoRA weights for MoE models
+        master.moe.use_grouped = true;
+        work.moe.use_grouped = true;
         const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
                                    mConfig.lora_config.applies_to_up() ||
                                    mConfig.lora_config.applies_to_down();
         if (has_mlp_lora) {
-            master.moe.experts.resize(mConfig.num_experts);
-            work.moe.experts.resize(mConfig.num_experts);
-            for (int e = 0; e < mConfig.num_experts; ++e) {
-                allocate_expert_weights(master.moe.experts[e], work.moe.experts[e], layer_idx, e);
-            }
+            allocate_grouped_moe_weights(master.moe.grouped, work.moe.grouped, layer_idx);
         }
     } else {
         // Dense model: standard MLP LoRA
@@ -117,6 +114,41 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
             work.mlp.down.emplace();
             allocate_layer_weights(*master.mlp.down, *work.mlp.down, /*in=*/D, /*out=*/C, prefix + "_down");
         }
+    }
+}
+
+void ModularLoRAWeightsManager::allocate_grouped_moe_weights(
+    LoRAGroupedExpertWeights<TensorShard>& master_moe,
+    LoRAGroupedExpertWeights<Tensor>& work_moe,
+    int layer_idx) {
+
+    const int C = mConfig.hidden_size;
+    const int D = mConfig.effective_moe_intermediate();
+    const int num_experts = mConfig.num_experts;
+    const int r = mConfig.lora_config.rank;
+    const ETensorDType master_dtype = mConfig.lora_config.dtype;
+    const ETensorDType work_dtype = mConfig.work_dtype;
+    const std::string prefix = fmt::format("lora_layer_{}_moe", layer_idx);
+
+    auto allocate_grouped = [&](auto& m_layer, auto& w_layer, int in, int out, const std::string& name) {
+        m_layer.emplace();
+        w_layer.emplace();
+
+        m_layer->A = TensorShard(mAllocator->allocate(master_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {num_experts, r, in}));
+        m_layer->B = mAllocator->allocate_shard(master_dtype, 0, 1, (name + "_B").c_str(), {num_experts, out, r});
+
+        w_layer->A = mAllocator->allocate(work_dtype, (name + "_A_work").c_str(), EAllocationType::ON_DEVICE, {num_experts, r, in});
+        w_layer->B = mAllocator->allocate(work_dtype, (name + "_B_work").c_str(), EAllocationType::ON_DEVICE, {num_experts, out, r});
+    };
+
+    if (mConfig.lora_config.applies_to_gate()) {
+        allocate_grouped(master_moe.gate, work_moe.gate, C, D, prefix + "_gate");
+    }
+    if (mConfig.lora_config.applies_to_up()) {
+        allocate_grouped(master_moe.up, work_moe.up, C, D, prefix + "_up");
+    }
+    if (mConfig.lora_config.applies_to_down()) {
+        allocate_grouped(master_moe.down, work_moe.down, D, C, prefix + "_down");
     }
 }
 
@@ -159,6 +191,15 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
         fill_zero(layer->B, nullptr);
     };
 
+    auto init_grouped = [&](std::optional<LoRAGroupedLayerWeights<TensorShard>>& layer,
+                            int in_features,
+                            unsigned long long subsequence) {
+        if (!layer.has_value()) return;
+        float std_a = 1.0f / std::sqrt(3.0f * static_cast<float>(in_features));
+        fill_normal(layer->A, layer->A.nelem(), 0.0f, std_a, seed, subsequence, nullptr);
+        fill_zero(layer->B, nullptr);
+    };
+
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
     const int D_moe = mConfig.effective_moe_intermediate();
@@ -179,13 +220,19 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
         init_layer(b.mlp.down, D, base + 6);
 
         // MoE expert LoRA
-        for (int e = 0; e < (int)b.moe.experts.size(); ++e) {
-            auto& expert = b.moe.experts[e];
-            // Use separate subsequence space for each expert to avoid correlation
-            unsigned long long expert_base = base + 8ULL + static_cast<unsigned long long>(e) * 4ULL;
-            init_layer(expert.gate, C, expert_base + 0);
-            init_layer(expert.up, C, expert_base + 1);
-            init_layer(expert.down, D_moe, expert_base + 2);
+        if (b.moe.use_grouped) {
+            init_grouped(b.moe.grouped.gate, C, base + 8);
+            init_grouped(b.moe.grouped.up, C, base + 9);
+            init_grouped(b.moe.grouped.down, D_moe, base + 10);
+        } else {
+            for (int e = 0; e < (int)b.moe.experts.size(); ++e) {
+                auto& expert = b.moe.experts[e];
+                // Use separate subsequence space for each expert to avoid correlation
+                unsigned long long expert_base = base + 8ULL + static_cast<unsigned long long>(e) * 4ULL;
+                init_layer(expert.gate, C, expert_base + 0);
+                init_layer(expert.up, C, expert_base + 1);
+                init_layer(expert.down, D_moe, expert_base + 2);
+            }
         }
     }
 
@@ -248,24 +295,39 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
         sync_tensor(dst->B, src->B, (std::string(layer_name) + ".B").c_str());
     };
 
+    auto sync_grouped = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& dst,
+                            const std::optional<LoRAGroupedLayerWeights<TensorShard>>& src,
+                            const char* layer_name) {
+        if (!dst.has_value() || !src.has_value()) return;
+        sync_tensor(dst->A, src->A, (std::string(layer_name) + ".A").c_str());
+        sync_tensor(dst->B, src->B, (std::string(layer_name) + ".B").c_str());
+    };
+
     sync_layer(work.attention.q, master.attention.q, "q_proj");
     sync_layer(work.attention.k, master.attention.k, "k_proj");
     sync_layer(work.attention.v, master.attention.v, "v_proj");
     sync_layer(work.attention.o, master.attention.o, "o_proj");
 
-    // Dense MLP LoRA
-    sync_layer(work.mlp.gate, master.mlp.gate, "gate_proj");
-    sync_layer(work.mlp.up, master.mlp.up, "up_proj");
-    sync_layer(work.mlp.down, master.mlp.down, "down_proj");
+    // MLP LoRA
+    if (work.moe.use_grouped) {
+        sync_grouped(work.moe.grouped.gate, master.moe.grouped.gate, "moe_gate_grouped");
+        sync_grouped(work.moe.grouped.up, master.moe.grouped.up, "moe_up_grouped");
+        sync_grouped(work.moe.grouped.down, master.moe.grouped.down, "moe_down_grouped");
+    } else {
+        // Dense MLP LoRA
+        sync_layer(work.mlp.gate, master.mlp.gate, "gate_proj");
+        sync_layer(work.mlp.up, master.mlp.up, "up_proj");
+        sync_layer(work.mlp.down, master.mlp.down, "down_proj");
 
-    // MoE expert LoRA
-    for (int e = 0; e < (int)master.moe.experts.size(); ++e) {
-        auto& master_expert = master.moe.experts[e];
-        auto& work_expert = work.moe.experts[e];
-        std::string expert_prefix = fmt::format("expert_{}", e);
-        sync_layer(work_expert.gate, master_expert.gate, (expert_prefix + "_gate").c_str());
-        sync_layer(work_expert.up, master_expert.up, (expert_prefix + "_up").c_str());
-        sync_layer(work_expert.down, master_expert.down, (expert_prefix + "_down").c_str());
+        // MoE expert LoRA
+        for (int e = 0; e < (int)master.moe.experts.size(); ++e) {
+            auto& master_expert = master.moe.experts[e];
+            auto& work_expert = work.moe.experts[e];
+            std::string expert_prefix = fmt::format("expert_{}", e);
+            sync_layer(work_expert.gate, master_expert.gate, (expert_prefix + "_gate").c_str());
+            sync_layer(work_expert.up, master_expert.up, (expert_prefix + "_up").c_str());
+            sync_layer(work_expert.down, master_expert.down, (expert_prefix + "_down").c_str());
+        }
     }
 
     return work;
@@ -355,22 +417,39 @@ void ModularLoRAWeightsManager::iterate_tensors(
             callback(prefix + ".mlp.down_proj.lora_B.weight", block.mlp.down->B);
         }
 
-        // MoE expert LoRA (HuggingFace naming convention: .mlp.experts.{e}.{proj})
-        for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
-            auto& expert = block.moe.experts[e];
-            std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+        // MoE expert LoRA
+        if (block.moe.use_grouped) {
+            auto& g = block.moe.grouped;
+            if (g.gate.has_value()) {
+                callback(prefix + ".mlp.experts.grouped.gate_proj.lora_A.weight", g.gate->A);
+                callback(prefix + ".mlp.experts.grouped.gate_proj.lora_B.weight", g.gate->B);
+            }
+            if (g.up.has_value()) {
+                callback(prefix + ".mlp.experts.grouped.up_proj.lora_A.weight", g.up->A);
+                callback(prefix + ".mlp.experts.grouped.up_proj.lora_B.weight", g.up->B);
+            }
+            if (g.down.has_value()) {
+                callback(prefix + ".mlp.experts.grouped.down_proj.lora_A.weight", g.down->A);
+                callback(prefix + ".mlp.experts.grouped.down_proj.lora_B.weight", g.down->B);
+            }
+        } else {
+            // MoE expert LoRA (HuggingFace naming convention: .mlp.experts.{e}.{proj})
+            for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                auto& expert = block.moe.experts[e];
+                std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
 
-            if (expert.gate.has_value()) {
-                callback(expert_prefix + ".gate_proj.lora_A.weight", expert.gate->A);
-                callback(expert_prefix + ".gate_proj.lora_B.weight", expert.gate->B);
-            }
-            if (expert.up.has_value()) {
-                callback(expert_prefix + ".up_proj.lora_A.weight", expert.up->A);
-                callback(expert_prefix + ".up_proj.lora_B.weight", expert.up->B);
-            }
-            if (expert.down.has_value()) {
-                callback(expert_prefix + ".down_proj.lora_A.weight", expert.down->A);
-                callback(expert_prefix + ".down_proj.lora_B.weight", expert.down->B);
+                if (expert.gate.has_value()) {
+                    callback(expert_prefix + ".gate_proj.lora_A.weight", expert.gate->A);
+                    callback(expert_prefix + ".gate_proj.lora_B.weight", expert.gate->B);
+                }
+                if (expert.up.has_value()) {
+                    callback(expert_prefix + ".up_proj.lora_A.weight", expert.up->A);
+                    callback(expert_prefix + ".up_proj.lora_B.weight", expert.up->B);
+                }
+                if (expert.down.has_value()) {
+                    callback(expert_prefix + ".down_proj.lora_A.weight", expert.down->A);
+                    callback(expert_prefix + ".down_proj.lora_B.weight", expert.down->B);
+                }
             }
         }
     }

@@ -22,17 +22,16 @@ struct LoRARunState {
     int B = 0;
     int T = 0;
 
+    // Grouped MoE LoRA scratch buffers
+    Tensor moe_lora_intermediate1; // (total_tokens, rank)
+    Tensor moe_lora_intermediate2; // (total_tokens, D)
+    Tensor moe_lora_gate;          // (total_tokens, D) - contiguous buffer for gate projection
+    Tensor moe_lora_up;            // (total_tokens, D) - contiguous buffer for up projection
+    Tensor moe_lora_gate_up;       // (total_tokens, 2*D) - combined gate+up buffer
+
     // MoE expert LoRA state: pointers to current expert activations during hook execution.
     // These are set by the MoE block before calling expert hooks and read by the hook callback.
     // This avoids the need to pass activation pointers through the hook signature.
-    struct MoEExpertContext {
-        Tensor* expert_input = nullptr;   // (N, C) - input tokens routed to this expert
-        Tensor* gate_up = nullptr;        // (N, 2*D) - gate_up projection output
-        Tensor* activated = nullptr;      // (N, D) - activated value after SwiGLU
-        Tensor* output = nullptr;         // (N, C) - down projection output
-        int num_tokens = 0;               // N - number of tokens for this expert
-    };
-    MoEExpertContext moe_expert_ctx;
 };
 
 } // namespace modules

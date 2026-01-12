@@ -77,6 +77,7 @@ enum class TensorTarget {
 
     // MoE tensors
     RouterGate,
+    RouterBias,
     ExpertsGateUp,
     ExpertsDown,
     SharedExpertGate,

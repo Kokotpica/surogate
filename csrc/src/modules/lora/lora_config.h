@@ -48,6 +48,9 @@ struct ModularLoRAConfig {
     /// Data type for LoRA weights
     ETensorDType dtype = ETensorDType::BF16;
 
+    /// Whether this is a Mixture-of-Experts LoRA (one LoRA per expert)
+    bool is_moe = false;
+
     /// Initialize A with Kaiming uniform, B with zeros (following PEFT)
     bool init_a_kaiming = true;
 

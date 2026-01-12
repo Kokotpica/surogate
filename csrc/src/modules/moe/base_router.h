@@ -83,6 +83,7 @@ public:
      */
     struct BaseWeights {
         Tensor gate;                    ///< (hidden_size, num_experts) routing projection
+        std::optional<Tensor> bias;     ///< (num_experts,) optional routing bias
     };
 
     /**
@@ -118,6 +119,7 @@ protected:
      * @param ctx Module context with CUDA resources
      * @param config Router configuration
      * @param gate Gate weight tensor (hidden_size, num_experts)
+     * @param bias Optional bias tensor (num_experts,)
      * @param input Input tensor (B*T, hidden_size)
      * @param logits Output tensor (B*T, num_experts)
      */
@@ -125,6 +127,7 @@ protected:
         ModuleContext& ctx,
         const BaseConfig& config,
         const Tensor& gate,
+        const std::optional<Tensor>& bias,
         const Tensor& input,
         Tensor& logits
     ) {
@@ -133,7 +136,7 @@ protected:
         const int E = config.num_experts;
 
         matmul(
-            logits, gate, input, std::nullopt,
+            logits, gate, input, bias,
             nullptr, nullptr,
             ctx.cublas_handle, *ctx.workspace,
             E, BT, C, EMMTranspose::TN, false,

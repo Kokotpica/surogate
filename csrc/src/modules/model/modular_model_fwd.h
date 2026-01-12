@@ -48,6 +48,9 @@
 #include "../primitives/swiglu.h"
 #include "../composite/transformer_block.h"
 
+#include "../moe/moe_block.h"
+#include "../moe/moe_types.h"
+
 #include "kernels/kernels.h"
 #include "training/runtime_options.h"
 #include "training/model.h"

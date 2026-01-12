@@ -83,7 +83,7 @@ inline RouterModule::RouterOutput RouterModule::forward_impl(
     acts.input = input;
 
     // 1) Compute routing logits using base class helper
-    compute_routing_logits(ctx, mConfig, w.gate, input, acts.logits);
+    compute_routing_logits(ctx, mConfig, w.gate, w.bias, input, acts.logits);
 
     // Add noise during training for exploration
     if (mConfig.use_noisy_routing && ctx.use_quantization) {  // use_quantization as training flag

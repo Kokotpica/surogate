@@ -18,6 +18,10 @@ public:
         // Router weights (both naming conventions)
         add_layer_pattern("model.layers.{layer}.mlp.gate.weight", TensorTarget::RouterGate);
         add_layer_pattern("model.layers.{layer}.mlp.router.gate.weight", TensorTarget::RouterGate);
+        add_layer_pattern("model.layers.{layer}.mlp.router.weight", TensorTarget::RouterGate);
+
+        // Router bias (optional)
+        add_layer_pattern("model.layers.{layer}.mlp.router.bias", TensorTarget::RouterBias, nullptr, true);
 
         // Batched expert weights (pre-fused format)
         add_layer_pattern("model.layers.{layer}.mlp.experts.gate_up_proj.weight",

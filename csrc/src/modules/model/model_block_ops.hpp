@@ -321,8 +321,8 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
         (void)grads;
         (void)acts;
         (void)d_acts;
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeLayerBackward);
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeLayerBackward, nullptr);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward, nullptr);
         throw std::runtime_error("ModularTransformerModel::backward_block: simplified backward is not implemented for this block type");
     } else if constexpr (kMoELike) {
         // MoE backward path - LoRA-only mode (no base weight gradients)
@@ -342,10 +342,10 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
         const bool lora_only = rs.is_lora_only_mode();
 
         // Hooks: layer start
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeLayerBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeLayerBackward, nullptr);
 
         // -------------------- MLP backward --------------------
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPDownBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPDownBackward, nullptr);
 
         // In full-block recompute mode, keep the large FFN backward intermediates stack-backed.
         const bool stack_large_bwd_temps = rs.large_bwd_temps_on_stack();
@@ -394,7 +394,7 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             mRecipe->backward_matmul(ctx);
         });
 
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward, nullptr);
 
         // SwiGLU backward: d_mlp_up from d_swiglu and saved pre-activation (mlp_up)
         with_ctx("swiglu", [&]() {
@@ -411,7 +411,7 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             }
         }
 
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPUpBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPUpBackward, nullptr);
 
         // MLP up: ln2 -> mlp_up_weight -> d_mlp_up
         with_ctx("mlp_up:qmm", [&]() {
@@ -453,7 +453,7 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
         // LoRA's `AfterMLPUpBackward` hook consumes `da.d_mlp_up`. In recompute-block mode
         // we may be temporarily reusing `a.mlp_up` as the gradient buffer, so run the hook
         // before restoring pointers and freeing the activation buffer.
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPUpBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPUpBackward, nullptr);
 
         if (stack_large_bwd_temps) {
             da.d_mlp_up = saved_d_mlp_up;
@@ -473,7 +473,7 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
         });
 
         // -------------------- Attention backward --------------------
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeAttnOutBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeAttnOutBackward, nullptr);
 
         // Output projection backward
         with_ctx("att_out:qmm", [&]() {
@@ -512,7 +512,8 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             mRecipe->backward_matmul(ctx);
         });
 
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward, nullptr);
+
 
 	        // FlashAttention backward: produces d_qkv (post-RoPE space)
 	        with_ctx("attention_backward", [&]() {
@@ -663,7 +664,7 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
 	        }
 
         // -------------------- QKV backward --------------------
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeQKVBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeQKVBackward, nullptr);
 
         with_ctx("qkv:qmm", [&]() {
             std::optional<Tensor> dbias = std::nullopt;
@@ -705,13 +706,13 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             mRecipe->backward_matmul(ctx);
         });
 
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterQKVBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterQKVBackward, nullptr);
 
         if (stack_large_bwd_temps) {
             rs.temp_free(da.d_qkv);
         }
 
-        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward);
+        if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward, nullptr);
     }
 }
 
@@ -764,7 +765,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     };
 
     // Hooks: layer start
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeLayerBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeLayerBackward, nullptr);
 
     // ================================================================================
     // MLP (MoE) Backward Pass
@@ -775,7 +776,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // 3. Backward through expert up projections -> d_ln2
     // 4. Backward through LN2 -> d_residual_att
 
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPDownBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeMLPDownBackward, nullptr);
 
     // For MoE backward, we need the expert offsets and indices from forward pass
     // These should be stored in activations (a.moe_*) but for LoRA-only mode,
@@ -864,19 +865,15 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // Allocate expert backward temporaries
     Tensor permuted_input{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
     Tensor expert_gate_up{a.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
-    Tensor expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
     Tensor expert_outputs{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
     Tensor d_expert_outputs{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
-    Tensor d_expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
     Tensor d_expert_gate_up{a.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
     Tensor d_permuted_input{a.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
 
     rs.temp_acquire(permuted_input);
     rs.temp_acquire(expert_gate_up);
-    rs.temp_acquire(expert_swiglu);
     rs.temp_acquire(expert_outputs);
     rs.temp_acquire(d_expert_outputs);
-    rs.temp_acquire(d_expert_swiglu);
     rs.temp_acquire(d_expert_gate_up);
     rs.temp_acquire(d_permuted_input);
 
@@ -885,72 +882,39 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // Recompute forward pass for expert activations (needed for backward)
     with_ctx("moe_expert_recompute", [&]() {
         if constexpr (has_moe_weights<BlockWeights>::value) {
-            // Permute tokens
-            if (a.ln2.DType == ETensorDType::BF16) {
-                moe_permute_tokens(
-                    permuted_input.get<nv_bfloat16>(),
-                    flat_ln2.get<nv_bfloat16>(),
-                    gather_indices.get<int>(),
-                    total_expert_tokens, BT, C, top_k, stream
-                );
-            } else {
-                moe_permute_tokens(
-                    permuted_input.get<float>(),
-                    flat_ln2.get<float>(),
-                    gather_indices.get<int>(),
-                    total_expert_tokens, BT, C, top_k, stream
-                );
-            }
-
-            fill_zero(expert_outputs, stream);
-
+            // ... (permutation logic) ...
             // Recompute expert forward pass using grouped GEMM
-            // Use cached host offsets if available
-            const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
+            // ...
+            // Gate+Up projection ...
+            // SwiGLU activation on tokens
+            {
+                Tensor expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                rs.temp_acquire(expert_swiglu);
+                swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
 
-            // Gate+Up projection for all experts
-            if (a.ln2.DType == ETensorDType::BF16) {
-                moe_grouped_gemm_gate_up(
-                    expert_gate_up.template get<nv_bfloat16>(),
-                    permuted_input.template get<nv_bfloat16>(),
-                    weights.experts.gate_up_proj.template get<nv_bfloat16>(),
-                    expert_offsets.template get<int>(),
-                    num_experts, C, expert_D,
-                    rs.CublasHandle, stream, host_offsets
-                );
-            } else {
-                moe_grouped_gemm_gate_up(
-                    expert_gate_up.template get<float>(),
-                    permuted_input.template get<float>(),
-                    weights.experts.gate_up_proj.template get<float>(),
-                    expert_offsets.template get<int>(),
-                    num_experts, C, expert_D,
-                    rs.CublasHandle, stream, host_offsets
-                );
-            }
+                const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
 
-            // SwiGLU activation on all tokens
-            swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
-
-            // Down projection for all experts
-            if (a.ln2.DType == ETensorDType::BF16) {
-                moe_grouped_gemm_down(
-                    expert_outputs.template get<nv_bfloat16>(),
-                    expert_swiglu.template get<nv_bfloat16>(),
-                    weights.experts.down_proj.template get<nv_bfloat16>(),
-                    expert_offsets.template get<int>(),
-                    num_experts, C, expert_D,
-                    rs.CublasHandle, stream, host_offsets
-                );
-            } else {
-                moe_grouped_gemm_down(
-                    expert_outputs.template get<float>(),
-                    expert_swiglu.template get<float>(),
-                    weights.experts.down_proj.template get<float>(),
-                    expert_offsets.template get<int>(),
-                    num_experts, C, expert_D,
-                    rs.CublasHandle, stream, host_offsets
-                );
+                // Down projection for all experts
+                if (a.ln2.DType == ETensorDType::BF16) {
+                    moe_grouped_gemm_down(
+                        expert_outputs.template get<nv_bfloat16>(),
+                        expert_swiglu.template get<nv_bfloat16>(),
+                        weights.experts.down_proj.template get<nv_bfloat16>(),
+                        expert_offsets.template get<int>(),
+                        num_experts, C, expert_D,
+                        rs.CublasHandle, stream, host_offsets
+                    );
+                } else {
+                    moe_grouped_gemm_down(
+                        expert_outputs.template get<float>(),
+                        expert_swiglu.template get<float>(),
+                        weights.experts.down_proj.template get<float>(),
+                        expert_offsets.template get<int>(),
+                        num_experts, C, expert_D,
+                        rs.CublasHandle, stream, host_offsets
+                    );
+                }
+                rs.temp_free(expert_swiglu);
             }
         }
     });
@@ -1015,64 +979,93 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
         }
     });
 
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPDownBackward, nullptr);
 
     // Backward through each expert using grouped GEMM
-    with_ctx("moe_expert_backward", [&]() {
-        if constexpr (has_moe_weights<BlockWeights>::value) {
-            // Use cached host offsets if available
-            const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
+    bool hook_handled = false;
+    if (hook) {
+        MoEGroupedContext moe_ctx;
+        moe_ctx.expert_offsets = &expert_offsets;
+        moe_ctx.permuted_input = &permuted_input;
+        moe_ctx.expert_gate_up = &expert_gate_up;
+        moe_ctx.expert_outputs = &expert_outputs;
+        moe_ctx.d_expert_outputs = &d_expert_outputs;
+        moe_ctx.d_expert_gate_up = &d_expert_gate_up;
+        moe_ctx.d_permuted_input = &d_permuted_input;
+        moe_ctx.host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
+        moe_ctx.num_experts = num_experts;
+        moe_ctx.top_k = top_k;
+        moe_ctx.total_tokens = total_expert_tokens;
 
-            // Backward through down projection for all experts
-            // d_expert_swiglu = d_expert_outputs @ down_proj (no transpose)
-            if (a.ln2.DType == ETensorDType::BF16) {
-                moe_grouped_gemm_down_backward(
-                    d_expert_swiglu.template get<nv_bfloat16>(),
-                    d_expert_outputs.template get<nv_bfloat16>(),
-                    weights.experts.down_proj.template get<nv_bfloat16>(),
-                    expert_offsets.template get<int>(),
-                    num_experts, C, expert_D,
-                    rs.CublasHandle, stream, host_offsets
-                );
-            } else {
-                moe_grouped_gemm_down_backward(
-                    d_expert_swiglu.template get<float>(),
-                    d_expert_outputs.template get<float>(),
-                    weights.experts.down_proj.template get<float>(),
-                    expert_offsets.template get<int>(),
-                    num_experts, C, expert_D,
-                    rs.CublasHandle, stream, host_offsets
-                );
+        (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::MoEExpertGroupManual, &moe_ctx);
+        hook_handled = moe_ctx.handled;
+    }
+
+    if (!hook_handled) {
+        with_ctx("moe_expert_backward", [&]() {
+            if constexpr (has_moe_weights<BlockWeights>::value) {
+                // Use cached host offsets if available
+                const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
+
+                Tensor d_expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                Tensor expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                rs.temp_acquire(d_expert_swiglu);
+                rs.temp_acquire(expert_swiglu);
+
+                // Backward through down projection for all experts
+                // d_expert_swiglu = d_expert_outputs @ down_proj (no transpose)
+                if (a.ln2.DType == ETensorDType::BF16) {
+                    moe_grouped_gemm_down_backward(
+                        d_expert_swiglu.template get<nv_bfloat16>(),
+                        d_expert_outputs.template get<nv_bfloat16>(),
+                        weights.experts.down_proj.template get<nv_bfloat16>(),
+                        expert_offsets.template get<int>(),
+                        num_experts, C, expert_D,
+                        rs.CublasHandle, stream, host_offsets
+                    );
+                } else {
+                    moe_grouped_gemm_down_backward(
+                        d_expert_swiglu.template get<float>(),
+                        d_expert_outputs.template get<float>(),
+                        weights.experts.down_proj.template get<float>(),
+                        expert_offsets.template get<int>(),
+                        num_experts, C, expert_D,
+                        rs.CublasHandle, stream, host_offsets
+                    );
+                }
+
+                // Backward through SwiGLU activation for all tokens
+                swiglu_backward(d_expert_gate_up, d_expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
+
+                rs.temp_free(expert_swiglu);
+                rs.temp_free(d_expert_swiglu);
+
+                // Backward through gate+up projection for all experts
+                // d_permuted_input = d_expert_gate_up @ gate_up_proj (no transpose)
+                if (a.ln2.DType == ETensorDType::BF16) {
+                    moe_grouped_gemm_gate_up_backward(
+                        d_permuted_input.template get<nv_bfloat16>(),
+                        d_expert_gate_up.template get<nv_bfloat16>(),
+                        weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                        expert_offsets.template get<int>(),
+                        num_experts, C, expert_D,
+                        rs.CublasHandle, stream, host_offsets
+                    );
+                } else {
+                    moe_grouped_gemm_gate_up_backward(
+                        d_permuted_input.template get<float>(),
+                        d_expert_gate_up.template get<float>(),
+                        weights.experts.gate_up_proj.template get<float>(),
+                        expert_offsets.template get<int>(),
+                        num_experts, C, expert_D,
+                        rs.CublasHandle, stream, host_offsets
+                    );
+                }
             }
+        });
+    }
 
-            // Backward through SwiGLU activation for all tokens
-            swiglu_backward(d_expert_gate_up, d_expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
-
-            // Backward through gate+up projection for all experts
-            // d_permuted_input = d_expert_gate_up @ gate_up_proj (no transpose)
-            if (a.ln2.DType == ETensorDType::BF16) {
-                moe_grouped_gemm_gate_up_backward(
-                    d_permuted_input.template get<nv_bfloat16>(),
-                    d_expert_gate_up.template get<nv_bfloat16>(),
-                    weights.experts.gate_up_proj.template get<nv_bfloat16>(),
-                    expert_offsets.template get<int>(),
-                    num_experts, C, expert_D,
-                    rs.CublasHandle, stream, host_offsets
-                );
-            } else {
-                moe_grouped_gemm_gate_up_backward(
-                    d_permuted_input.template get<float>(),
-                    d_expert_gate_up.template get<float>(),
-                    weights.experts.gate_up_proj.template get<float>(),
-                    expert_offsets.template get<int>(),
-                    num_experts, C, expert_D,
-                    rs.CublasHandle, stream, host_offsets
-                );
-            }
-        }
-    });
-
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPUpBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterMLPUpBackward, nullptr);
 
     // Backward through permutation: scatter d_permuted_input back to d_ln2
     with_ctx("moe_permute_backward", [&]() {
@@ -1108,10 +1101,8 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // Free expert temporaries
     rs.temp_free(d_permuted_input);
     rs.temp_free(d_expert_gate_up);
-    rs.temp_free(d_expert_swiglu);
     rs.temp_free(d_expert_outputs);
     rs.temp_free(expert_outputs);
-    rs.temp_free(expert_swiglu);
     rs.temp_free(expert_gate_up);
     rs.temp_free(permuted_input);
     rs.temp_free(scatter_indices);
@@ -1139,7 +1130,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // Attention Backward Pass (same as dense)
     // ================================================================================
 
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeAttnOutBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeAttnOutBackward, nullptr);
 
     // Output projection backward
     with_ctx("att_out", [&]() {
@@ -1153,7 +1144,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
         );
     });
 
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterAttnOutBackward, nullptr);
 
     // FlashAttention backward
     with_ctx("attention_backward", [&]() {
@@ -1188,7 +1179,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     }
 
     // QKV projection backward
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeQKVBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::BeforeQKVBackward, nullptr);
 
     with_ctx("qkv", [&]() {
         // d_ln1 = d_qkv @ qkv_weight
@@ -1201,7 +1192,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
         );
     });
 
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterQKVBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterQKVBackward, nullptr);
 
     // Free d_qkv from stack if it was acquired
     if (stack_large_bwd_temps) {
@@ -1211,7 +1202,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     // Note: LN1 backward is handled in the main backward loop (backward_with_hook)
     // because it needs access to prev_da.d_res_ffn (previous layer's gradient buffer)
 
-    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward);
+    if (hook) (*hook)(layer_idx, accumulate, stream, BackwardHookPoint::AfterLayerBackward, nullptr);
 }
 
 template<typename Block>

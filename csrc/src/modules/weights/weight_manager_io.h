@@ -331,6 +331,17 @@ void ModularWeightManager<Block>::import_from_file(const std::string& filename, 
                     return make_shard(block.router.gate, {cfg.num_experts, C});
                 }
                 return std::nullopt;
+            case TensorTarget::RouterBias:
+                if constexpr (has_moe_weights<BlockWeights>::value) {
+                    // bias: (num_experts,)
+                    if (!block.router.bias.has_value()) {
+                         // Allocate if not already there but mapped
+                         block.router.bias = Tensor();
+                         block.router.bias->DType = block.router.gate.DType;
+                    }
+                    return make_shard(*block.router.bias, {cfg.num_experts});
+                }
+                return std::nullopt;
             case TensorTarget::ExpertsGateUp:
                 if constexpr (has_moe_weights<BlockWeights>::value) {
                     if (block.experts.use_batched) {

@@ -365,6 +365,7 @@ public:
         // Dispatch/combine state
         Tensor permuted_input;      ///< (total_tokens, hidden_size) - tokens in expert-grouped order
         Tensor expert_outputs;      ///< (total_tokens, hidden_size) - outputs in expert-grouped order
+        Tensor expert_gate_up;      ///< (total_tokens, 2 * intermediate_size) - for fused/fast path (Saved for backward)
         Tensor combined_output;     ///< (B*T, hidden_size) - final output
     };
 

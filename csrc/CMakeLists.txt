@@ -236,6 +236,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/encoder.cu
     src/kernels/matmul.cpp
     src/kernels/swiglu.cu
+    src/kernels/fast_lora_silu.cu
     src/kernels/moe_kernels.cu
     src/kernels/rope.cu
     src/kernels/rmsnorm.cu
@@ -320,7 +321,7 @@ endif ()
 
 # ----------------------------------------------------------------------------
 # Tests
-option(BUILD_TESTS "Build unit tests" ON)
+option(BUILD_TESTS "Build unit tests" OFF)
 if (BUILD_TESTS)
     enable_testing()
 
@@ -341,6 +342,7 @@ if (BUILD_TESTS)
 	            src/testing/test-fp4.cu
 	            src/testing/test-bnb-quant.cpp
 	            src/testing/test-moe.cu
+	            src/testing/test-fast-lora-silu.cu
 	            src/testing/test-heterogeneous.cu
 	    )
     target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)

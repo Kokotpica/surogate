@@ -611,13 +611,13 @@ public:
      * @brief Backward hook callback type
      */
     using BackwardBlockHook = std::function<void(int layer_idx, bool accumulate,
-                                                  cudaStream_t stream, BackwardHookPoint point)>;
+                                                  cudaStream_t stream, BackwardHookPoint point, void* context)>;
 
     /**
      * @brief Forward hook callback type (matches modular model signature)
      */
     using ForwardBlockHook = std::function<void(int layer_idx, cudaStream_t stream,
-                                                 ForwardHookPoint point)>;
+                                                 ForwardHookPoint point, void* context)>;
 
     // Forward hook points for block-level hooks (not projection-level)
     static constexpr ForwardHookPoint kPreBlockHook = ForwardHookPoint::AfterQKVProjection;
@@ -845,7 +845,7 @@ protected:
         // Forward through all layers
         for (int i = 0; i < mConfig.NumLayers; ++i) {
             if (hook) {
-                (*hook)(i, ctx.stream, kPreBlockHook);
+                (*hook)(i, ctx.stream, kPreBlockHook, nullptr);
             }
 
             auto& weights = mWeights->get_block(i, ctx.stream);
@@ -857,7 +857,7 @@ protected:
             // residual = residual + block_output
 
             if (hook) {
-                (*hook)(i, ctx.stream, kPostBlockHook);
+                (*hook)(i, ctx.stream, kPostBlockHook, nullptr);
             }
 
             mWeights->release_block(i, ctx.stream);
@@ -886,7 +886,7 @@ protected:
         // Backward through all layers in reverse
         for (int i = mConfig.NumLayers - 1; i >= 0; --i) {
             if (hook) {
-                (*hook)(i, accumulate, ctx.stream, BackwardHookPoint::BeforeLayerBackward);
+                (*hook)(i, accumulate, ctx.stream, BackwardHookPoint::BeforeLayerBackward, nullptr);
             }
 
             auto& weights = mWeights->get_block(i, ctx.stream);
@@ -905,7 +905,7 @@ protected:
             // (handled by fused operations in actual implementation)
 
             if (hook) {
-                (*hook)(i, accumulate, ctx.stream, BackwardHookPoint::AfterLayerBackward);
+                (*hook)(i, accumulate, ctx.stream, BackwardHookPoint::AfterLayerBackward, nullptr);
             }
 
             mWeights->release_block(i, ctx.stream);

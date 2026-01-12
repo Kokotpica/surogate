@@ -49,6 +49,19 @@ void ModularLoRAGradsManager::allocate_gradients() {
         return w;
     };
 
+    auto alloc_grouped_full = [&](int in_f, int out_f, const std::string& name) -> LoRAGroupedLayerWeights<Tensor> {
+        LoRAGroupedLayerWeights<Tensor> w;
+        w.A = mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {E, r, in_f});
+        w.B = mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {E, out_f, r});
+        return w;
+    };
+    auto alloc_grouped_shard = [&](int in_f, int out_f, const std::string& name) -> LoRAGroupedLayerWeights<TensorShard> {
+        LoRAGroupedLayerWeights<TensorShard> w;
+        w.A = TensorShard(mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {E, r, in_f}));
+        w.B = TensorShard(mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {E, out_f, r}));
+        return w;
+    };
+
     for (int l = 0; l < mConfig.num_layers; ++l) {
         std::string prefix = fmt::format("lora_grad_layer_{}", l);
         auto& full = mFullGrads.blocks[l];
@@ -71,33 +84,27 @@ void ModularLoRAGradsManager::allocate_gradients() {
             shard.attention.o = alloc_shard(q_out, C, prefix + "_o_shard");
         }
 
-        // MLP LoRA gradients: For MoE models, use shared gradient buffers across all experts
-        // This drastically reduces memory: from O(num_experts * num_layers) to O(num_layers)
-        // During backward, we compute gradients for one expert at a time and accumulate into
-        // the weight's gradient, so we only need one buffer that gets reused.
+        // MLP LoRA gradients
         if (mConfig.is_moe && E > 0) {
             const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
                                        mConfig.lora_config.applies_to_up() ||
                                        mConfig.lora_config.applies_to_down();
             if (has_mlp_lora) {
-                // Allocate only ONE set of expert gradient buffers per layer (shared across all experts)
-                full.moe.experts.resize(1);  // Only 1 shared buffer, not E buffers
-                shard.moe.experts.resize(1);
-                std::string expert_prefix = fmt::format("{}_expert_shared", prefix);
-                auto& full_expert = full.moe.experts[0];
-                auto& shard_expert = shard.moe.experts[0];
+                full.moe.use_grouped = true;
+                shard.moe.use_grouped = true;
 
+                std::string exp_prefix = prefix + "_moe_grouped";
                 if (mConfig.lora_config.applies_to_gate()) {
-                    full_expert.gate = alloc_full(C, D_moe, expert_prefix + "_gate");
-                    shard_expert.gate = alloc_shard(C, D_moe, expert_prefix + "_gate_shard");
+                    full.moe.grouped.gate = alloc_grouped_full(C, D_moe, exp_prefix + "_gate");
+                    shard.moe.grouped.gate = alloc_grouped_shard(C, D_moe, exp_prefix + "_gate_shard");
                 }
                 if (mConfig.lora_config.applies_to_up()) {
-                    full_expert.up = alloc_full(C, D_moe, expert_prefix + "_up");
-                    shard_expert.up = alloc_shard(C, D_moe, expert_prefix + "_up_shard");
+                    full.moe.grouped.up = alloc_grouped_full(C, D_moe, exp_prefix + "_up");
+                    shard.moe.grouped.up = alloc_grouped_shard(C, D_moe, exp_prefix + "_up_shard");
                 }
                 if (mConfig.lora_config.applies_to_down()) {
-                    full_expert.down = alloc_full(D_moe, C, expert_prefix + "_down");
-                    shard_expert.down = alloc_shard(D_moe, C, expert_prefix + "_down_shard");
+                    full.moe.grouped.down = alloc_grouped_full(D_moe, C, exp_prefix + "_down");
+                    shard.moe.grouped.down = alloc_grouped_shard(D_moe, C, exp_prefix + "_down_shard");
                 }
             }
         } else {
@@ -139,11 +146,17 @@ void ModularLoRAGradsManager::start_micro_step(cudaStream_t stream, int micro_st
             zero_layer(block.mlp.up);
             zero_layer(block.mlp.down);
 
-            // MoE expert LoRA gradients
-            for (auto& expert : block.moe.experts) {
-                zero_layer(expert.gate);
-                zero_layer(expert.up);
-                zero_layer(expert.down);
+            if (block.moe.use_grouped) {
+                zero_layer(block.moe.grouped.gate);
+                zero_layer(block.moe.grouped.up);
+                zero_layer(block.moe.grouped.down);
+            } else {
+                // MoE expert LoRA gradients
+                for (auto& expert : block.moe.experts) {
+                    zero_layer(expert.gate);
+                    zero_layer(expert.up);
+                    zero_layer(expert.down);
+                }
             }
         }
     }
@@ -185,6 +198,12 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
         if (layer->B.Data) comm.all_reduce_avg(layer->B, stream);
     };
 
+    auto all_reduce_grouped_layer = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& layer) {
+        if (!layer.has_value()) return;
+        if (layer->A.Data) comm.all_reduce_avg(layer->A, stream);
+        if (layer->B.Data) comm.all_reduce_avg(layer->B, stream);
+    };
+
     for (auto& block : mFullGrads.blocks) {
         all_reduce_layer(block.attention.q);
         all_reduce_layer(block.attention.k);
@@ -194,11 +213,17 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
         all_reduce_layer(block.mlp.up);
         all_reduce_layer(block.mlp.down);
 
-        // MoE expert LoRA gradients
-        for (auto& expert : block.moe.experts) {
-            all_reduce_layer(expert.gate);
-            all_reduce_layer(expert.up);
-            all_reduce_layer(expert.down);
+        if (block.moe.use_grouped) {
+            all_reduce_grouped_layer(block.moe.grouped.gate);
+            all_reduce_grouped_layer(block.moe.grouped.up);
+            all_reduce_grouped_layer(block.moe.grouped.down);
+        } else {
+            // MoE expert LoRA gradients
+            for (auto& expert : block.moe.experts) {
+                all_reduce_layer(expert.gate);
+                all_reduce_layer(expert.up);
+                all_reduce_layer(expert.down);
+            }
         }
     }
 }

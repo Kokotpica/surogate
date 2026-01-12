@@ -171,7 +171,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
             }
 
             if (hook) {
-                hook(l, main_stream, ForwardHookPoint::AfterQKVProjection);
+                hook(l, main_stream, ForwardHookPoint::AfterQKVProjection, nullptr);
             }
 
             // 2.5) Optional Q/K head RMSNorm (Qwen3-style) - only for attention modules that have these fields
@@ -261,7 +261,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
             }
 
             if (hook) {
-                hook(l, main_stream, ForwardHookPoint::AfterAttnOutProjection);
+                hook(l, main_stream, ForwardHookPoint::AfterAttnOutProjection, nullptr);
             }
 
             // 6) Residual + LN2 (fused)
@@ -318,7 +318,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     }
 
                     if (hook) {
-                        hook(l, main_stream, ForwardHookPoint::AfterMLPUpProjection);
+                        hook(l, main_stream, ForwardHookPoint::AfterMLPUpProjection, nullptr);
                     }
 
                     // 8) SwiGLU activation
@@ -384,7 +384,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     }
 
                     if (hook) {
-                        hook(l, main_stream, ForwardHookPoint::AfterMLPUpProjection);
+                        hook(l, main_stream, ForwardHookPoint::AfterMLPUpProjection, nullptr);
                     }
 
                     // 8) SwiGLU activation
@@ -426,7 +426,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                 }
 
                 if (hook) {
-                    hook(l, main_stream, ForwardHookPoint::AfterMLPDownProjection);
+                    hook(l, main_stream, ForwardHookPoint::AfterMLPDownProjection, nullptr);
                 }
 
                 // LoRA's `AfterMLPDownProjection` hook consumes `acts.swiglu`.
@@ -570,69 +570,81 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     );
                 }
 
-                // Step 7: Expert computation using grouped GEMM
-                // All experts processed in parallel with batched weight layout
+                // Step 6.5: Try fused MoE LoRA fast path via hook
                 Tensor expert_outputs{acts.ln2.DType, {total_expert_tokens, C}, nullptr, nullptr, 2, dev};
                 rs.temp_acquire(expert_outputs);
                 fill_zero(expert_outputs, main_stream);
 
-                // Allocate per-expert intermediate buffers
                 Tensor expert_gate_up{acts.ln2.DType, {total_expert_tokens, 2 * expert_D}, nullptr, nullptr, 2, dev};
-                Tensor expert_swiglu{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
                 rs.temp_acquire(expert_gate_up);
-                rs.temp_acquire(expert_swiglu);
 
-                // Grouped GEMM for gate+up projection across all experts
-                // Input: permuted_input (total_tokens, C)
-                // Weights: gate_up_proj (num_experts, 2*D, C)
-                // Output: expert_gate_up (total_tokens, 2*D)
-                const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
-                if (acts.ln2.DType == ETensorDType::BF16) {
-                    moe_grouped_gemm_gate_up(
-                        expert_gate_up.template get<nv_bfloat16>(),
-                        permuted_input.template get<nv_bfloat16>(),
-                        weights.experts.gate_up_proj.template get<nv_bfloat16>(),
-                        expert_offsets.template get<int>(),
-                        num_experts, C, expert_D,
-                        rs.CublasHandle, main_stream, host_offsets
-                    );
-                } else {
-                    moe_grouped_gemm_gate_up(
-                        expert_gate_up.template get<float>(),
-                        permuted_input.template get<float>(),
-                        weights.experts.gate_up_proj.template get<float>(),
-                        expert_offsets.template get<int>(),
-                        num_experts, C, expert_D,
-                        rs.CublasHandle, main_stream, host_offsets
-                    );
+                bool hook_handled = false;
+                if (hook) {
+                    MoEGroupedContext moe_ctx;
+                    moe_ctx.expert_offsets = &expert_offsets;
+                    moe_ctx.permuted_input = &permuted_input;
+                    moe_ctx.expert_gate_up = &expert_gate_up;
+                    moe_ctx.expert_outputs = &expert_outputs;
+                    moe_ctx.host_offsets = rs.MoeHostExpertOffsets.data();
+                    moe_ctx.num_experts = num_experts;
+                    moe_ctx.top_k = top_k;
+                    moe_ctx.total_tokens = total_expert_tokens;
+
+                    hook(l, main_stream, ForwardHookPoint::MoEExpertGroupManual, &moe_ctx);
+                    hook_handled = moe_ctx.handled;
                 }
 
-                // SwiGLU activation on all tokens at once
-                // The activation is element-wise and doesn't depend on expert boundaries
-                swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, main_stream);
+                if (!hook_handled) {
+                    // Step 7: Expert computation using standard grouped GEMM
+                    const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
 
-                // Grouped GEMM for down projection across all experts
-                // Input: expert_swiglu (total_tokens, D)
-                // Weights: down_proj (num_experts, C, D)
-                // Output: expert_outputs (total_tokens, C)
-                if (acts.ln2.DType == ETensorDType::BF16) {
-                    moe_grouped_gemm_down(
-                        expert_outputs.template get<nv_bfloat16>(),
-                        expert_swiglu.template get<nv_bfloat16>(),
-                        weights.experts.down_proj.template get<nv_bfloat16>(),
-                        expert_offsets.template get<int>(),
-                        num_experts, C, expert_D,
-                        rs.CublasHandle, main_stream, host_offsets
-                    );
-                } else {
-                    moe_grouped_gemm_down(
-                        expert_outputs.template get<float>(),
-                        expert_swiglu.template get<float>(),
-                        weights.experts.down_proj.template get<float>(),
-                        expert_offsets.template get<int>(),
-                        num_experts, C, expert_D,
-                        rs.CublasHandle, main_stream, host_offsets
-                    );
+                    Tensor expert_swiglu{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(expert_swiglu);
+
+                    if (acts.ln2.DType == ETensorDType::BF16) {
+                        moe_grouped_gemm_gate_up(
+                            expert_gate_up.template get<nv_bfloat16>(),
+                            permuted_input.template get<nv_bfloat16>(),
+                            weights.experts.gate_up_proj.template get<nv_bfloat16>(),
+                            expert_offsets.template get<int>(),
+                            num_experts, C, expert_D,
+                            rs.CublasHandle, main_stream, host_offsets
+                        );
+                    } else {
+                        moe_grouped_gemm_gate_up(
+                            expert_gate_up.template get<float>(),
+                            permuted_input.template get<float>(),
+                            weights.experts.gate_up_proj.template get<float>(),
+                            expert_offsets.template get<int>(),
+                            num_experts, C, expert_D,
+                            rs.CublasHandle, main_stream, host_offsets
+                        );
+                    }
+
+                    // SwiGLU activation on all tokens at once
+                    swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, main_stream);
+
+                    // Grouped GEMM for down projection across all experts
+                    if (acts.ln2.DType == ETensorDType::BF16) {
+                        moe_grouped_gemm_down(
+                            expert_outputs.template get<nv_bfloat16>(),
+                            expert_swiglu.template get<nv_bfloat16>(),
+                            weights.experts.down_proj.template get<nv_bfloat16>(),
+                            expert_offsets.template get<int>(),
+                            num_experts, C, expert_D,
+                            rs.CublasHandle, main_stream, host_offsets
+                        );
+                    } else {
+                        moe_grouped_gemm_down(
+                            expert_outputs.template get<float>(),
+                            expert_swiglu.template get<float>(),
+                            weights.experts.down_proj.template get<float>(),
+                            expert_offsets.template get<int>(),
+                            num_experts, C, expert_D,
+                            rs.CublasHandle, main_stream, host_offsets
+                        );
+                    }
+                    rs.temp_free(expert_swiglu);
                 }
 
                 // Step 8: Unpermute and combine expert outputs
@@ -664,7 +676,6 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                 }
 
                 // Free temporaries in reverse order
-                rs.temp_free(expert_swiglu);
                 rs.temp_free(expert_gate_up);
                 rs.temp_free(expert_outputs);
                 rs.temp_free(permuted_input);

@@ -58,7 +58,7 @@ public:
         acts.input = input;
 
         // 1) Compute routing logits
-        compute_routing_logits(ctx, mConfig, w.gate, input, acts.logits);
+        compute_routing_logits(ctx, mConfig, w.gate, w.bias, input, acts.logits);
 
         // 2) Apply softmax
         apply_softmax(ctx, mConfig, acts.logits, acts.softmax_probs);

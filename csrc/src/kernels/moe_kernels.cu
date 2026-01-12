@@ -22,6 +22,7 @@
 #include <cublas_v2.h>
 #include <cfloat>
 
+#include "kernels/kernels.h"
 #include "kernel_utils.cuh"
 #include "utilities/utils.h"
 
@@ -1021,6 +1022,277 @@ __global__ void build_gemm_pointers_down_kernel(
 }
 
 template<typename T>
+void moe_grouped_gemm_impl(
+    T* output,
+    const T* input,
+    const T* weights,
+    const int* expert_offsets,
+    int num_experts,
+    int M,
+    int K,
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets,
+    float alpha,
+    float beta,
+    EMMTranspose mode
+) {
+    std::vector<int> local_offsets;
+    const int* h_offsets;
+
+    if (host_offsets) {
+        h_offsets = host_offsets;
+    } else {
+        local_offsets.resize(num_experts + 1);
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+                                   (num_experts + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_offsets = local_offsets.data();
+    }
+
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+
+    cublasOperation_t transa = (mode == EMMTranspose::TN || mode == EMMTranspose::TT) ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t transb = (mode == EMMTranspose::NT || mode == EMMTranspose::TT) ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    std::vector<int> m_vec, n_vec, k_vec;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<const T*> A_vec, B_vec;
+    std::vector<T*> C_vec;
+
+    m_vec.reserve(num_experts);
+    n_vec.reserve(num_experts);
+    k_vec.reserve(num_experts);
+    lda_vec.reserve(num_experts);
+    ldb_vec.reserve(num_experts);
+    ldc_vec.reserve(num_experts);
+    A_vec.reserve(num_experts);
+    B_vec.reserve(num_experts);
+    C_vec.reserve(num_experts);
+
+    for (int e = 0; e < num_experts; ++e) {
+        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+        if (tokens_e == 0) continue;
+
+        m_vec.push_back(M);
+        n_vec.push_back(tokens_e);
+        k_vec.push_back(K);
+
+        // Row-major A(M, K) @ B(K, N) = C(M, N)
+        // In column-major: C(M, N) = A(M, K) @ B(K, N)
+        // transa on A, transb on B
+        lda_vec.push_back((transa == CUBLAS_OP_N) ? M : K);
+        ldb_vec.push_back((transb == CUBLAS_OP_N) ? K : tokens_e);
+        ldc_vec.push_back(M);
+
+        A_vec.push_back(weights + e * M * K);
+        B_vec.push_back(input + h_offsets[e] * K);
+        C_vec.push_back(output + h_offsets[e] * M);
+    }
+
+    if (m_vec.empty()) return;
+
+    const int gemm_count = static_cast<int>(m_vec.size());
+
+    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
+    const T** d_A_array = nullptr;
+    const T** d_B_array = nullptr;
+    T** d_C_array = nullptr;
+
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+
+    std::vector<cublasOperation_t> transa_vec(gemm_count, transa);
+    std::vector<cublasOperation_t> transb_vec(gemm_count, transb);
+    std::vector<int> group_size_vec(gemm_count, 1);
+    std::vector<float> alpha_vec(gemm_count, alpha);
+    std::vector<float> beta_vec(gemm_count, beta);
+
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
+        cublas_handle,
+        transa_vec.data(), transb_vec.data(),
+        m_vec.data(), n_vec.data(), k_vec.data(),
+        alpha_vec.data(),
+        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
+        beta_vec.data(),
+        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
+        gemm_count,
+        group_size_vec.data(),
+        CUBLAS_COMPUTE_32F
+    ));
+
+    // Free device pointer arrays
+    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
+}
+
+void moe_grouped_gemm(float* output, const float* input, const float* weights,
+                      const int* expert_offsets, int num_experts,
+                      int M, int K,
+                      cublasHandle_t cublas_handle, cudaStream_t stream,
+                      const int* host_offsets,
+                      float alpha, float beta, EMMTranspose mode) {
+    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode);
+}
+
+void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
+                      const int* expert_offsets, int num_experts,
+                      int M, int K,
+                      cublasHandle_t cublas_handle, cudaStream_t stream,
+                      const int* host_offsets,
+                      float alpha, float beta, EMMTranspose mode) {
+    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode);
+}
+
+template<typename T>
+void moe_grouped_gemm_weight_grad_impl(
+    T* d_weight,
+    const T* grad_output,
+    const T* input,
+    const int* expert_offsets,
+    int num_experts,
+    int M,
+    int N,
+    cublasHandle_t cublas_handle,
+    cudaStream_t stream,
+    const int* host_offsets,
+    float alpha,
+    float beta
+) {
+    std::vector<int> local_offsets;
+    const int* h_offsets;
+
+    if (host_offsets) {
+        h_offsets = host_offsets;
+    } else {
+        local_offsets.resize(num_experts + 1);
+        CUDA_CHECK(cudaMemcpyAsync(local_offsets.data(), expert_offsets,
+                                   (num_experts + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_offsets = local_offsets.data();
+    }
+
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+
+    // dW(M, N) = grad_output^T(M, K) @ input(K, N)  where K = tokens_e
+    // In column-major: dW(M, N) = A @ B
+    // A is grad_output treated as (K, M) col-major => A^T is (M, K)
+    // B is input treated as (K, N) col-major => B is (K, N)
+
+    std::vector<int> m_vec, n_vec, k_vec;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<const T*> A_vec, B_vec;
+    std::vector<T*> C_vec;
+
+    m_vec.reserve(num_experts);
+    n_vec.reserve(num_experts);
+    k_vec.reserve(num_experts);
+    lda_vec.reserve(num_experts);
+    ldb_vec.reserve(num_experts);
+    ldc_vec.reserve(num_experts);
+    A_vec.reserve(num_experts);
+    B_vec.reserve(num_experts);
+    C_vec.reserve(num_experts);
+
+    for (int e = 0; e < num_experts; ++e) {
+        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+        if (tokens_e == 0) continue;
+
+        m_vec.push_back(M);
+        n_vec.push_back(N);
+        k_vec.push_back(tokens_e);
+
+        lda_vec.push_back(M);
+        ldb_vec.push_back(N);
+        ldc_vec.push_back(M);
+
+        // Row-major grad_output is (tokens, M). Treated as col-major it's (M, tokens).
+        // Transpose A (CUBLAS_OP_T) gives (M, tokens)? NO.
+        // If row-major (tokens, M) is treated as col-major (M, tokens),
+        // we want result (M, N).
+        // C(M, N) = A(M, K) @ B(K, N)
+        // A is grad_output(M, K) col-major. OP_N.
+        // B is input(K, N) col-major. OP_T?
+        // Row-major input is (K, N). Treated as col-major it's (N, K).
+        // OP_T on B gives (K, N).
+        // So: C(M, N) = A(M, K) @ B^T(K, N)
+
+        A_vec.push_back(grad_output + h_offsets[e] * M);
+        B_vec.push_back(input + h_offsets[e] * N);
+        C_vec.push_back(d_weight + e * M * N);
+    }
+
+    if (m_vec.empty()) return;
+
+    const int gemm_count = static_cast<int>(m_vec.size());
+
+    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
+    const T** d_A_array = nullptr;
+    const T** d_B_array = nullptr;
+    T** d_C_array = nullptr;
+
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+
+    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_T);
+    std::vector<int> group_size_vec(gemm_count, 1);
+    std::vector<float> alpha_vec(gemm_count, alpha);
+    std::vector<float> beta_vec(gemm_count, beta);
+
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
+        cublas_handle,
+        transa_vec.data(), transb_vec.data(),
+        m_vec.data(), n_vec.data(), k_vec.data(),
+        alpha_vec.data(),
+        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
+        beta_vec.data(),
+        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
+        gemm_count,
+        group_size_vec.data(),
+        CUBLAS_COMPUTE_32F
+    ));
+
+    // Free device pointer arrays
+    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
+}
+
+void moe_grouped_gemm_weight_grad(float* d_weight, const float* grad_output, const float* input,
+                                  const int* expert_offsets, int num_experts,
+                                  int M, int N,
+                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets,
+                                  float alpha, float beta) {
+    moe_grouped_gemm_weight_grad_impl(d_weight, grad_output, input, expert_offsets, num_experts, M, N, cublas_handle, stream, host_offsets, alpha, beta);
+}
+
+void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight, const nv_bfloat16* grad_output, const nv_bfloat16* input,
+                                  const int* expert_offsets, int num_experts,
+                                  int M, int N,
+                                  cublasHandle_t cublas_handle, cudaStream_t stream,
+                                  const int* host_offsets,
+                                  float alpha, float beta) {
+    moe_grouped_gemm_weight_grad_impl(d_weight, grad_output, input, expert_offsets, num_experts, M, N, cublas_handle, stream, host_offsets, alpha, beta);
+}
+
+template<typename T>
 void moe_grouped_gemm_gate_up_impl(
     T* output,                        // (total_tokens, 2*D) - gate+up output
     const T* input,                   // (total_tokens, C) - permuted tokens
@@ -1056,28 +1328,85 @@ void moe_grouped_gemm_gate_up_impl(
     const float beta = 0.0f;
     const int out_dim = 2 * intermediate_size;
 
-    // Submit all GEMMs - cuBLAS batches them internally when on same stream
+    // Use Grouped GEMM to submit all expert computations in a single call.
+    // This significantly reduces CPU overhead and kernel launch latency compared to a loop.
+    std::vector<int> m_vec, n_vec, k_vec;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<const T*> A_vec, B_vec;
+    std::vector<T*> C_vec;
+
+    m_vec.reserve(num_experts);
+    n_vec.reserve(num_experts);
+    k_vec.reserve(num_experts);
+    lda_vec.reserve(num_experts);
+    ldb_vec.reserve(num_experts);
+    ldc_vec.reserve(num_experts);
+    A_vec.reserve(num_experts);
+    B_vec.reserve(num_experts);
+    C_vec.reserve(num_experts);
+
     for (int e = 0; e < num_experts; ++e) {
         int tokens_e = h_offsets[e + 1] - h_offsets[e];
         if (tokens_e == 0) continue;
 
-        const T* input_e = input + h_offsets[e] * hidden_size;
-        const T* weight_e = weights + e * out_dim * hidden_size;
-        T* output_e = output + h_offsets[e] * out_dim;
+        const T* A_ptr = weights + e * out_dim * hidden_size;
+        const T* B_ptr = input + h_offsets[e] * hidden_size;
+        T* C_ptr = output + h_offsets[e] * out_dim;
 
-        CUBLAS_CHECK(cublasGemmEx(
-            cublas_handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            out_dim, tokens_e, hidden_size,
-            &alpha,
-            weight_e, cublas_dtype<T>(), hidden_size,
-            input_e, cublas_dtype<T>(), hidden_size,
-            &beta,
-            output_e, cublas_dtype<T>(), out_dim,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT
-        ));
+        m_vec.push_back(out_dim);
+        n_vec.push_back(tokens_e);
+        k_vec.push_back(hidden_size);
+
+        lda_vec.push_back(hidden_size);
+        ldb_vec.push_back(hidden_size);
+        ldc_vec.push_back(out_dim);
+
+        A_vec.push_back(A_ptr);
+        B_vec.push_back(B_ptr);
+        C_vec.push_back(C_ptr);
     }
+
+    if (m_vec.empty()) return;
+
+    const int gemm_count = static_cast<int>(m_vec.size());
+
+    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
+    const T** d_A_array = nullptr;
+    const T** d_B_array = nullptr;
+    T** d_C_array = nullptr;
+
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+
+    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_T);
+    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<int> group_size_vec(gemm_count, 1);
+    std::vector<float> alpha_vec(gemm_count, alpha);
+    std::vector<float> beta_vec(gemm_count, beta);
+
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
+        cublas_handle,
+        transa_vec.data(), transb_vec.data(),
+        m_vec.data(), n_vec.data(), k_vec.data(),
+        alpha_vec.data(),
+        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
+        beta_vec.data(),
+        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
+        gemm_count,
+        group_size_vec.data(),
+        CUBLAS_COMPUTE_32F
+    ));
+
+    // Free device pointer arrays
+    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
 template<typename T>
@@ -1113,27 +1442,80 @@ void moe_grouped_gemm_down_impl(
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
+    // Use Grouped GEMM to submit all expert computations in a single call.
+    std::vector<int> m_vec, n_vec, k_vec;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<const T*> A_vec, B_vec;
+    std::vector<T*> C_vec;
+
+    m_vec.reserve(num_experts);
+    n_vec.reserve(num_experts);
+    k_vec.reserve(num_experts);
+    lda_vec.reserve(num_experts);
+    ldb_vec.reserve(num_experts);
+    ldc_vec.reserve(num_experts);
+    A_vec.reserve(num_experts);
+    B_vec.reserve(num_experts);
+    C_vec.reserve(num_experts);
+
     for (int e = 0; e < num_experts; ++e) {
         int tokens_e = h_offsets[e + 1] - h_offsets[e];
         if (tokens_e == 0) continue;
 
-        const T* input_e = input + h_offsets[e] * intermediate_size;
-        const T* weight_e = weights + e * hidden_size * intermediate_size;
-        T* output_e = output + h_offsets[e] * hidden_size;
+        m_vec.push_back(hidden_size);
+        n_vec.push_back(tokens_e);
+        k_vec.push_back(intermediate_size);
 
-        CUBLAS_CHECK(cublasGemmEx(
-            cublas_handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            hidden_size, tokens_e, intermediate_size,
-            &alpha,
-            weight_e, cublas_dtype<T>(), intermediate_size,
-            input_e, cublas_dtype<T>(), intermediate_size,
-            &beta,
-            output_e, cublas_dtype<T>(), hidden_size,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT
-        ));
+        lda_vec.push_back(intermediate_size);
+        ldb_vec.push_back(intermediate_size);
+        ldc_vec.push_back(hidden_size);
+
+        A_vec.push_back(weights + e * hidden_size * intermediate_size);
+        B_vec.push_back(input + h_offsets[e] * intermediate_size);
+        C_vec.push_back(output + h_offsets[e] * hidden_size);
     }
+
+    if (m_vec.empty()) return;
+
+    const int gemm_count = static_cast<int>(m_vec.size());
+
+    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
+    const T** d_A_array = nullptr;
+    const T** d_B_array = nullptr;
+    T** d_C_array = nullptr;
+
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+
+    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_T);
+    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<int> group_size_vec(gemm_count, 1);
+    std::vector<float> alpha_vec(gemm_count, alpha);
+    std::vector<float> beta_vec(gemm_count, beta);
+
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
+        cublas_handle,
+        transa_vec.data(), transb_vec.data(),
+        m_vec.data(), n_vec.data(), k_vec.data(),
+        alpha_vec.data(),
+        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
+        beta_vec.data(),
+        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
+        gemm_count,
+        group_size_vec.data(),
+        CUBLAS_COMPUTE_32F
+    ));
+
+    // Free device pointer arrays
+    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
 void moe_grouped_gemm_gate_up(
@@ -1349,27 +1731,80 @@ void moe_grouped_gemm_down_backward_impl(
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
+    // Use Grouped GEMM to submit all expert computations in a single call.
+    std::vector<int> m_vec, n_vec, k_vec;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<const T*> A_vec, B_vec;
+    std::vector<T*> C_vec;
+
+    m_vec.reserve(num_experts);
+    n_vec.reserve(num_experts);
+    k_vec.reserve(num_experts);
+    lda_vec.reserve(num_experts);
+    ldb_vec.reserve(num_experts);
+    ldc_vec.reserve(num_experts);
+    A_vec.reserve(num_experts);
+    B_vec.reserve(num_experts);
+    C_vec.reserve(num_experts);
+
     for (int e = 0; e < num_experts; ++e) {
         int tokens_e = h_offsets[e + 1] - h_offsets[e];
         if (tokens_e == 0) continue;
 
-        const T* d_output_e = d_output + h_offsets[e] * hidden_size;
-        const T* weight_e = weights + e * hidden_size * intermediate_size;
-        T* d_input_e = d_input + h_offsets[e] * intermediate_size;
+        m_vec.push_back(intermediate_size);
+        n_vec.push_back(tokens_e);
+        k_vec.push_back(hidden_size);
 
-        CUBLAS_CHECK(cublasGemmEx(
-            cublas_handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            intermediate_size, tokens_e, hidden_size,
-            &alpha,
-            weight_e, cublas_dtype<T>(), intermediate_size,
-            d_output_e, cublas_dtype<T>(), hidden_size,
-            &beta,
-            d_input_e, cublas_dtype<T>(), intermediate_size,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT
-        ));
+        lda_vec.push_back(intermediate_size);
+        ldb_vec.push_back(hidden_size);
+        ldc_vec.push_back(intermediate_size);
+
+        A_vec.push_back(weights + e * hidden_size * intermediate_size);
+        B_vec.push_back(d_output + h_offsets[e] * hidden_size);
+        C_vec.push_back(d_input + h_offsets[e] * intermediate_size);
     }
+
+    if (m_vec.empty()) return;
+
+    const int gemm_count = static_cast<int>(m_vec.size());
+
+    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
+    const T** d_A_array = nullptr;
+    const T** d_B_array = nullptr;
+    T** d_C_array = nullptr;
+
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+
+    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<int> group_size_vec(gemm_count, 1);
+    std::vector<float> alpha_vec(gemm_count, alpha);
+    std::vector<float> beta_vec(gemm_count, beta);
+
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
+        cublas_handle,
+        transa_vec.data(), transb_vec.data(),
+        m_vec.data(), n_vec.data(), k_vec.data(),
+        alpha_vec.data(),
+        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
+        beta_vec.data(),
+        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
+        gemm_count,
+        group_size_vec.data(),
+        CUBLAS_COMPUTE_32F
+    ));
+
+    // Free device pointer arrays
+    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
 template<typename T>
@@ -1405,27 +1840,80 @@ void moe_grouped_gemm_gate_up_backward_impl(
     const float beta = 0.0f;
     const int gate_up_dim = 2 * intermediate_size;
 
+    // Use Grouped GEMM to submit all expert computations in a single call.
+    std::vector<int> m_vec, n_vec, k_vec;
+    std::vector<int> lda_vec, ldb_vec, ldc_vec;
+    std::vector<const T*> A_vec, B_vec;
+    std::vector<T*> C_vec;
+
+    m_vec.reserve(num_experts);
+    n_vec.reserve(num_experts);
+    k_vec.reserve(num_experts);
+    lda_vec.reserve(num_experts);
+    ldb_vec.reserve(num_experts);
+    ldc_vec.reserve(num_experts);
+    A_vec.reserve(num_experts);
+    B_vec.reserve(num_experts);
+    C_vec.reserve(num_experts);
+
     for (int e = 0; e < num_experts; ++e) {
         int tokens_e = h_offsets[e + 1] - h_offsets[e];
         if (tokens_e == 0) continue;
 
-        const T* d_gate_up_e = d_gate_up + h_offsets[e] * gate_up_dim;
-        const T* weight_e = weights + e * gate_up_dim * hidden_size;
-        T* d_input_e = d_input + h_offsets[e] * hidden_size;
+        m_vec.push_back(hidden_size);
+        n_vec.push_back(tokens_e);
+        k_vec.push_back(gate_up_dim);
 
-        CUBLAS_CHECK(cublasGemmEx(
-            cublas_handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            hidden_size, tokens_e, gate_up_dim,
-            &alpha,
-            weight_e, cublas_dtype<T>(), hidden_size,
-            d_gate_up_e, cublas_dtype<T>(), gate_up_dim,
-            &beta,
-            d_input_e, cublas_dtype<T>(), hidden_size,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT
-        ));
+        lda_vec.push_back(hidden_size);
+        ldb_vec.push_back(gate_up_dim);
+        ldc_vec.push_back(hidden_size);
+
+        A_vec.push_back(weights + e * gate_up_dim * hidden_size);
+        B_vec.push_back(d_gate_up + h_offsets[e] * gate_up_dim);
+        C_vec.push_back(d_input + h_offsets[e] * hidden_size);
     }
+
+    if (m_vec.empty()) return;
+
+    const int gemm_count = static_cast<int>(m_vec.size());
+
+    // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
+    const T** d_A_array = nullptr;
+    const T** d_B_array = nullptr;
+    T** d_C_array = nullptr;
+
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+
+    std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
+    std::vector<int> group_size_vec(gemm_count, 1);
+    std::vector<float> alpha_vec(gemm_count, alpha);
+    std::vector<float> beta_vec(gemm_count, beta);
+
+    CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
+        cublas_handle,
+        transa_vec.data(), transb_vec.data(),
+        m_vec.data(), n_vec.data(), k_vec.data(),
+        alpha_vec.data(),
+        reinterpret_cast<const void**>(d_A_array), cublas_dtype<T>(), lda_vec.data(),
+        reinterpret_cast<const void**>(d_B_array), cublas_dtype<T>(), ldb_vec.data(),
+        beta_vec.data(),
+        reinterpret_cast<void**>(d_C_array), cublas_dtype<T>(), ldc_vec.data(),
+        gemm_count,
+        group_size_vec.data(),
+        CUBLAS_COMPUTE_32F
+    ));
+
+    // Free device pointer arrays
+    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
 // Host wrappers for grouped GEMM backward

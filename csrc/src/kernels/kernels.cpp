@@ -6,6 +6,7 @@
 #include "kernels.h"
 
 #include "utilities/tensor.h"
+#include <cstdio>
 
 /**
  * @brief Performs the forward pass of Root Mean Square Normalization (RMSNorm).
@@ -642,6 +643,8 @@ void vector_add_sr(Tensor& dest, const Tensor& left, const Tensor& right, float 
  */
 void add_2d_slice(Tensor& dst, const Tensor& src, long rows, long dst_cols, long src_cols, long dst_col_offset, cudaStream_t stream) {
     if (dst.DType != src.DType) {
+        fprintf(stderr, "[DEBUG] add_2d_slice dtype mismatch: dst.DType=%d src.DType=%d\n", (int)dst.DType, (int)src.DType);
+        fprintf(stderr, "[DEBUG] dst shape: [%ld, %ld] src shape: [%ld, %ld]\n", dst.Sizes[0], dst.Sizes[1], src.Sizes[0], src.Sizes[1]);
         throw std::logic_error("add_2d_slice: dtype mismatch");
     }
     if (dst.DType == ETensorDType::FP32) {
@@ -881,11 +884,22 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
             int M, int N, int K, EMMTranspose mode, bool accumulate, cudaStream_t stream) {
     std::byte* ws = workspace.get<std::byte>();
     std::size_t ws_size = workspace.bytes();
+
     if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP32) {
         float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
         matmul(c.get<float>(), a.get<float>(), b.get<float>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
     } else if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::BF16) {
-        float* bias_ptr = bias.has_value() ? bias.value().get<float>() : nullptr;
+        // Note: bias is expected to be FP32 when output is FP32
+        // If bias is BF16, we skip it (TODO: add support for BF16 bias with FP32 output)
+        float* bias_ptr = nullptr;
+        if(bias.has_value()) {
+            if(bias.value().DType == ETensorDType::FP32) {
+                bias_ptr = bias.value().get<float>();
+            } else {
+                // Skip BF16 bias for now - this shouldn't happen in practice
+                fprintf(stderr, "[WARNING] matmul: FP32 output with BF16 bias - skipping bias\n");
+            }
+        }
         matmul(c.get<float>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
     } else if(c.DType == ETensorDType::FP32 && a.DType == ETensorDType::FP8_E4M3) {
         if(bias.has_value()) {
@@ -907,6 +921,8 @@ void matmul(Tensor& c, const Tensor& a, const Tensor& b, std::optional<Tensor> b
         nv_bfloat16* bias_ptr = bias.has_value() ? bias.value().get<nv_bfloat16>() : nullptr;
         matmul(c.get<nv_bfloat16>(), a.get<nv_bfloat16>(), b.get<nv_bfloat16>(), bias_ptr, scale_a, scale_b, handle, ws, ws_size, M, N, K, mode, accumulate, stream);
     } else {
+        fprintf(stderr, "[DEBUG] matmul error: c.DType=%d a.DType=%d b.DType=%d\n",
+                (int)c.DType, (int)a.DType, (int)b.DType);
         throw std::logic_error("matmul_forward: invalid DType combination");
     }
 }

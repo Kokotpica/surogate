@@ -8,6 +8,8 @@
 #include "lora_model_core.h"
 #include "lora_model_utils.h"
 #include "lora_utils.h"
+#include "modules/lora/fast_expert_lora.h"
+#include "modules/moe/moe_types.h"
 
 namespace modules {
 
@@ -26,7 +28,7 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
         if (mBnBWeightProvider) mBnBWeightProvider->invalidate_cache();
     }
 
-    auto hook = [this](int layer_idx, cudaStream_t stream, ForwardHookPoint point) {
+    auto hook = [this](int layer_idx, cudaStream_t stream, ForwardHookPoint point, void* context) {
         const auto& cfg = mBaseModel->config();
         auto& rs = mBaseModel->run_state();
         const int B = (int)rs.B;
@@ -43,6 +45,37 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
         auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
 
         switch (point) {
+            case ForwardHookPoint::MoEExpertGroupManual: {
+               if (lora_block.moe.use_grouped && lora_block.moe.has_any() && context) {
+                    auto* moe_ctx = static_cast<MoEGroupedContext*>(context);
+                    auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
+
+                    using WeightsType = std::remove_reference_t<decltype(base_weights)>;
+                    if constexpr (has_experts<WeightsType>::value) {
+                        if (base_weights.experts.use_batched) {
+                            detail::grouped_fast_expert_lora_forward(
+                                const_cast<Tensor&>(*moe_ctx->expert_outputs),
+                                *moe_ctx->permuted_input,
+                                base_weights.experts.gate_up_proj,
+                                base_weights.experts.down_proj,
+                                lora_block.moe.grouped,
+                                mLoRARunState->moe_lora_gate,   // contiguous buffer for gate output
+                                mLoRARunState->moe_lora_up,     // contiguous buffer for up output
+                                *moe_ctx->expert_offsets,
+                                scaling,
+                                moe_ctx->num_experts, C, D, rank,
+                                mLoRARunState->moe_lora_intermediate1,
+                                mLoRARunState->moe_lora_intermediate2,
+                                mLoRARunState->moe_lora_gate_up,
+                                rs.CublasHandle,
+                                stream,
+                                moe_ctx->host_offsets
+                            );
+                            moe_ctx->handled = true;
+                        }
+                    }
+                }
+            } break;
             case ForwardHookPoint::AfterQKVProjection: {
                 if (lora_block.attention.q.has_value()) {
                     detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
@@ -107,7 +140,7 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
 
     ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
 
-    auto full_hook = [this](int layer_idx, cudaStream_t stream, ForwardHookPoint point) {
+    auto full_hook = [this](int layer_idx, cudaStream_t stream, ForwardHookPoint point, void* context) {
         const auto& cfg = mBaseModel->config();
         auto& rs = mBaseModel->run_state();
         const int B = (int)rs.B;
@@ -124,6 +157,37 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
         auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
 
         switch (point) {
+            case ForwardHookPoint::MoEExpertGroupManual: {
+                if (lora_block.moe.use_grouped && lora_block.moe.has_any() && context) {
+                    auto* moe_ctx = static_cast<MoEGroupedContext*>(context);
+                    auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
+
+                    using WeightsType = std::remove_reference_t<decltype(base_weights)>;
+                    if constexpr (has_experts<WeightsType>::value) {
+                        if (base_weights.experts.use_batched) {
+                            detail::grouped_fast_expert_lora_forward(
+                                const_cast<Tensor&>(*moe_ctx->expert_outputs),
+                                *moe_ctx->permuted_input,
+                                base_weights.experts.gate_up_proj,
+                                base_weights.experts.down_proj,
+                                lora_block.moe.grouped,
+                                mLoRARunState->moe_lora_gate,   // contiguous buffer for gate output
+                                mLoRARunState->moe_lora_up,     // contiguous buffer for up output
+                                *moe_ctx->expert_offsets,
+                                scaling,
+                                moe_ctx->num_experts, C, D, rank,
+                                mLoRARunState->moe_lora_intermediate1,
+                                mLoRARunState->moe_lora_intermediate2,
+                                mLoRARunState->moe_lora_gate_up,
+                                rs.CublasHandle,
+                                stream,
+                                moe_ctx->host_offsets
+                            );
+                            moe_ctx->handled = true;
+                        }
+                    }
+                }
+            } break;
             case ForwardHookPoint::AfterQKVProjection: {
                 if (lora_block.attention.q.has_value()) {
                     detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),

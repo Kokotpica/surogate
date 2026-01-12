@@ -29,14 +29,14 @@ public:
     /**
      * @brief Backward hook callback type
      */
-    using BackwardBlockHook = std::function<void(int layer_idx, bool accumulate, cudaStream_t stream, BackwardHookPoint point)>;
+    using BackwardBlockHook = std::function<void(int layer_idx, bool accumulate, cudaStream_t stream, BackwardHookPoint point, void* context)>;
 
     /**
      * @brief Forward hook callback type
      *
      * Hook implementations may modify intermediate activations in-place (e.g., add LoRA deltas).
      */
-    using ForwardBlockHook = std::function<void(int layer_idx, cudaStream_t stream, ForwardHookPoint point)>;
+    using ForwardBlockHook = std::function<void(int layer_idx, cudaStream_t stream, ForwardHookPoint point, void* context)>;
 
     /**
      * @brief Construct a modular transformer model
