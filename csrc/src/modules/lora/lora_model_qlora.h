@@ -134,6 +134,8 @@ void ModularLoRAModel<Block>::import_weights_bnb_qlora(const std::string& file_n
     bnb_config.tied_embeddings = cfg.TiedWordEmbeddings;
     bnb_config.shard_idx = comm.rank();
     bnb_config.num_shards = comm.world_size();
+    bnb_config.selective_expert_dequant = mOptions.SelectiveExpertDequant;
+    bnb_config.offload_experts = mOptions.OffloadExperts;
 
     mBnBWeightProvider = std::make_unique<BnBWeightProvider<Block>>(bnb_config, *mAllocator, device_props);
     mBnBWeightProvider->import_and_quantize(file_name, comm, quant_stream);

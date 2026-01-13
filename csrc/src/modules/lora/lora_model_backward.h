@@ -40,9 +40,23 @@ void ModularLoRAModel<Block>::backward(Tensor inputs, Tensor targets, NCCLCommun
                     auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
                     lora_accum = lora_accum || accumulate;
 
+                    // Selective expert dequantization: use the cached selection info from forward
+                    // The BnB weight provider caches the selection info used in dequantize_selected_experts
+                    // We use the same selection in backward to match the compact buffer layout
+                    const SelectiveExpertInfo* selection_info_ptr = nullptr;
+                    if (mBnBWeightProvider && mBnBWeightProvider->use_selective_dequant()) {
+                        const auto& cached_selection = mBnBWeightProvider->get_current_selection();
+                        if (cached_selection.enabled) {
+                            selection_info_ptr = &cached_selection;
+                        }
+                    }
+
                     auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
-                    const int C = (int)mBaseModel->config().HiddenSize;
-                    const int D = (int)mBaseModel->config().IntermediateSize;
+                    const auto& cfg = mBaseModel->config();
+                    const int C = (int)cfg.HiddenSize;
+                    const int D = (int)cfg.IntermediateSize;
+                    // For MoE models, experts have a different intermediate size
+                    const int moe_D = (cfg.moe_config && cfg.moe_config->moe_intermediate_size > 0) ? cfg.moe_config->moe_intermediate_size : D;
                     const int rank = mLoRAConfig.rank;
 
                     using WeightsType = std::remove_reference_t<decltype(base_weights)>;
@@ -60,14 +74,15 @@ void ModularLoRAModel<Block>::backward(Tensor inputs, Tensor targets, NCCLCommun
                                 *moe_ctx->permuted_input,
                                 *moe_ctx->expert_offsets,
                                 mLoRAConfig.scaling(),
-                                moe_ctx->num_experts, C, D, rank,
+                                moe_ctx->num_experts, C, moe_D, rank,
                                 lora_accum,
                                 mLoRARunState->moe_lora_intermediate1,
                                 mLoRARunState->moe_lora_intermediate2,
                                 mLoRARunState->moe_lora_gate_up,
                                 mBaseModel->run_state().CublasHandle,
                                 stream,
-                                moe_ctx->host_offsets
+                                moe_ctx->host_offsets,
+                                selection_info_ptr
                             );
                             moe_ctx->handled = true;
                         }

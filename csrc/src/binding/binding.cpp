@@ -417,6 +417,8 @@ NB_MODULE(_surogate, m) {
         .def_rw("offload_quants", &RuntimeOptions::OffloadQuants, "Offload quantized weights (if applicable).")
         .def_rw("offload_optimizer", &RuntimeOptions::OffloadOptimizer, "Offload optimizer state (momentum and variance buffers).")
         .def_rw("offload_grads", &RuntimeOptions::OffloadGrads, "Offload gradients.")
+        .def_rw("offload_experts", &RuntimeOptions::OffloadExperts, "Offload MoE expert NF4 weights to CPU, stream on-demand.")
+        .def_rw("selective_expert_dequant", &RuntimeOptions::SelectiveExpertDequant, "Only dequantize router-selected experts (reduces memory).")
         .def_rw("use_zero_copy", &RuntimeOptions::UseZeroCopy, "Use zero-copy buffers where supported.")
         .def_rw("use_write_combined", &RuntimeOptions::UseWriteCombined, "Use write-combined host memory (pinned).")
         .def_rw("shard_weights", &RuntimeOptions::ShardWeights, "Shard model weights across GPUs.")

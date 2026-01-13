@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
+#include <mutex>
 
 #include <fmt/format.h>
 
@@ -56,6 +58,12 @@ BnBWeightsManager::BnBWeightsManager(const Config& config, TensorAllocator& allo
 
 void BnBWeightsManager::allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int M, int K,
                                             const std::string& name_prefix) {
+    // Default to ON_DEVICE allocation
+    allocate_bnb_weight(weight, M, K, name_prefix, EAllocationType::ON_DEVICE);
+}
+
+void BnBWeightsManager::allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int M, int K,
+                                            const std::string& name_prefix, EAllocationType alloc_type) {
     const int block_size = mScaleConfig.block_size;
     const bool double_quant = mScaleConfig.double_quant;
     const int dq_group_size = mScaleConfig.double_quant_group_size;
@@ -73,7 +81,7 @@ void BnBWeightsManager::allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int
     // Allocate packed NF4 data (BYTE storage for packed 4-bit values)
     std::string data_name = name_prefix + "_nf4";
     weight.data = mAllocator->allocate(ETensorDType::BYTE, data_name.c_str(),
-                                       EAllocationType::ON_DEVICE, {packed_bytes});
+                                       alloc_type, {packed_bytes});
 
     // Calculate number of absmax blocks
     const long num_blocks = (num_elements + block_size - 1) / block_size;
@@ -82,26 +90,29 @@ void BnBWeightsManager::allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int
         // Double quantization: absmax stored as BYTE (uint8) with per-group scale/offset
         std::string absmax_name = name_prefix + "_absmax_q";
         weight.absmax = mAllocator->allocate(ETensorDType::BYTE, absmax_name.c_str(),
-                                             EAllocationType::ON_DEVICE, {num_blocks});
+                                             alloc_type, {num_blocks});
 
         // Number of groups for double quantization
         const long num_groups = (num_blocks + dq_group_size - 1) / dq_group_size;
         std::string scale_name = name_prefix + "_absmax_scale";
         weight.absmax_scale = mAllocator->allocate(ETensorDType::FP32, scale_name.c_str(),
-                                                   EAllocationType::ON_DEVICE, {num_groups});
+                                                   alloc_type, {num_groups});
         std::string offset_name = name_prefix + "_absmax_offset";
         weight.absmax_offset = mAllocator->allocate(ETensorDType::FP32, offset_name.c_str(),
-                                                    EAllocationType::ON_DEVICE, {num_groups});
+                                                    alloc_type, {num_groups});
     } else {
         // No double quantization: absmax stored as FP32
         std::string absmax_name = name_prefix + "_absmax";
         weight.absmax = mAllocator->allocate(ETensorDType::FP32, absmax_name.c_str(),
-                                             EAllocationType::ON_DEVICE, {num_blocks});
+                                             alloc_type, {num_blocks});
     }
 }
 
 void BnBWeightsManager::allocate_single_block(int layer_idx) {
     auto ctx = mAllocator->with_context("BnB_Weights");
+
+    // Show progress bar
+    show_progress_bar(layer_idx, mConfig.num_layers, "[BnB] Quantizing");
 
     const int hidden = mConfig.hidden_size;
     const int intermediate = mConfig.intermediate_size;
@@ -142,17 +153,6 @@ void BnBWeightsManager::allocate_single_block(int layer_idx) {
 void BnBWeightsManager::import_and_quantize(const std::string& file_name,
                                             NCCLCommunicator& comm,
                                             cudaStream_t stream) {
-    // Debug: Check CUDA memory and print allocation breakdown before any allocations
-    {
-        size_t free_mem = 0, total_mem = 0;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[BnB] BEFORE import - CUDA memory: "
-                  << (total_mem - free_mem) / 1024 / 1024 << " MB used, "
-                  << free_mem / 1024 / 1024 << " MB free\n";
-        std::cerr << "[BnB] Pre-import allocation breakdown:\n";
-        mAllocator->print_stats();
-    }
-
     std::cerr << "[BnB] importing and quantizing weights from " << file_name << "\n";
     std::cerr << "[BnB] block_size=" << mScaleConfig.block_size
               << ", double_quant=" << (mScaleConfig.double_quant ? "true" : "false") << "\n";
@@ -165,13 +165,6 @@ void BnBWeightsManager::import_and_quantize(const std::string& file_name,
                   << ", moe_intermediate_size=" << mConfig.qlora_config.moe_intermediate_size
                   << ", using moe_inter=" << moe_inter
                   << ", hidden=" << mConfig.hidden_size << "\n";
-        // Calculate expected NF4 memory for experts
-        long expert_gate_up_bytes = (2L * moe_inter * mConfig.hidden_size) / 2;  // NF4 packed
-        long expert_down_bytes = (long(mConfig.hidden_size) * moe_inter) / 2;
-        long per_layer_bytes = mConfig.qlora_config.num_experts * (expert_gate_up_bytes + expert_down_bytes);
-        long total_expert_bytes = per_layer_bytes * mConfig.num_layers;
-        std::cerr << "[BnB] Expected expert NF4 memory: " << (total_expert_bytes / 1024 / 1024) << " MB ("
-                  << (per_layer_bytes / 1024 / 1024) << " MB/layer)\n";
     }
 
     SafeTensorsReader reader(file_name);
@@ -228,20 +221,101 @@ void BnBWeightsManager::import_and_quantize(const std::string& file_name,
     // Load embeddings (not quantized)
     load_embeddings(reader, stream);
 
-    // Load and quantize each transformer block
-    if (is_moe()) {
-        // MoE path: load experts + router
-        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-            load_and_quantize_moe_block(layer, reader, stream);
-        }
-    } else {
-        // Dense path
-        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-            load_and_quantize_block(layer, reader, stream);
+    // Load and quantize each transformer block using double-buffering for I/O overlap
+    // Allocate a second load buffer for ping-pong to allow CPU file I/O while GPU quantizes
+    Tensor load_buffer_2;
+    Tensor absmax_buffer_2;
+    {
+        void* ptr = nullptr;
+        CUDA_CHECK(cudaMalloc(&ptr, mLoadBufferBytes));
+        load_buffer_2.Data = static_cast<std::byte*>(ptr);
+        load_buffer_2.DType = ETensorDType::BF16;
+        load_buffer_2.Rank = 1;
+        load_buffer_2.Sizes[0] = mLoadBuffer.Sizes[0];
+        std::fill(load_buffer_2.Sizes.begin() + 1, load_buffer_2.Sizes.end(), 1);
+
+        if (mScaleConfig.double_quant) {
+            void* absmax_ptr = nullptr;
+            CUDA_CHECK(cudaMalloc(&absmax_ptr, mAbsmaxBuffer.Sizes[0] * sizeof(float)));
+            absmax_buffer_2.Data = static_cast<std::byte*>(absmax_ptr);
+            absmax_buffer_2.DType = ETensorDType::FP32;
+            absmax_buffer_2.Rank = 1;
+            absmax_buffer_2.Sizes[0] = mAbsmaxBuffer.Sizes[0];
         }
     }
 
-    // Sync before freeing load buffer
+    // Create two non-blocking streams for double-buffering
+    cudaStream_t stream_0, stream_1;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_0, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_1, cudaStreamNonBlocking));
+
+    std::cerr << "[BnB] using double-buffered I/O for parallel quantization\n";
+
+    if (is_moe()) {
+        // MoE path: load experts + router with double-buffering
+        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+            const bool use_buffer_0 = (layer % 2 == 0);
+            cudaStream_t curr_stream = use_buffer_0 ? stream_0 : stream_1;
+
+            // Swap buffers
+            Tensor saved_load = mLoadBuffer;
+            Tensor saved_absmax = mAbsmaxBuffer;
+
+            if (!use_buffer_0) {
+                mLoadBuffer = load_buffer_2;
+                if (mScaleConfig.double_quant) {
+                    mAbsmaxBuffer = absmax_buffer_2;
+                }
+            }
+
+            // Load and quantize on current stream (GPU work is async)
+            load_and_quantize_moe_block(layer, reader, curr_stream);
+
+            // Restore buffers
+            mLoadBuffer = saved_load;
+            mAbsmaxBuffer = saved_absmax;
+        }
+    } else {
+        // Dense path with double-buffering
+        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+            const bool use_buffer_0 = (layer % 2 == 0);
+            cudaStream_t curr_stream = use_buffer_0 ? stream_0 : stream_1;
+
+            // Swap buffers
+            Tensor saved_load = mLoadBuffer;
+            Tensor saved_absmax = mAbsmaxBuffer;
+
+            if (!use_buffer_0) {
+                mLoadBuffer = load_buffer_2;
+                if (mScaleConfig.double_quant) {
+                    mAbsmaxBuffer = absmax_buffer_2;
+                }
+            }
+
+            // Load and quantize on current stream (GPU work is async)
+            load_and_quantize_block(layer, reader, curr_stream);
+
+            // Restore buffers
+            mLoadBuffer = saved_load;
+            mAbsmaxBuffer = saved_absmax;
+        }
+    }
+
+    // Sync both streams
+    CUDA_CHECK(cudaStreamSynchronize(stream_0));
+    CUDA_CHECK(cudaStreamSynchronize(stream_1));
+    CUDA_CHECK(cudaStreamDestroy(stream_0));
+    CUDA_CHECK(cudaStreamDestroy(stream_1));
+
+    // Free second buffer
+    if (load_buffer_2.Data) {
+        CUDA_CHECK(cudaFree(load_buffer_2.Data));
+    }
+    if (absmax_buffer_2.Data) {
+        CUDA_CHECK(cudaFree(absmax_buffer_2.Data));
+    }
+
+    // Sync original stream
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Free load buffer (allocated directly, not via allocator)
@@ -492,7 +566,7 @@ void BnBWeightsManager::quantize_and_store(BnBBlockQuantizedWeight& dest, const 
             stream);
 
         // Step 2: Apply double quantization to absmax values
-        apply_double_quantization(dest, stream);
+        apply_double_quantization(dest, stream);        
     } else {
         // Single-step quantization: NF4 with FP32 absmax directly
         quantize_bnb_nf4(
@@ -572,15 +646,8 @@ float BnBWeightsManager::memory_savings_ratio() const {
 void BnBWeightsManager::allocate_moe_block(int layer_idx) {
     auto ctx = mAllocator->with_context("BnB_MoE_Weights");
 
-    // Debug: print CUDA memory info at start of each layer
-    if (layer_idx % 10 == 0) {
-        size_t free_mem = 0, total_mem = 0;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[BnB] Layer " << layer_idx << " - CUDA memory: "
-                  << (total_mem - free_mem) / 1024 / 1024 << " MB used, "
-                  << free_mem / 1024 / 1024 << " MB free, "
-                  << total_mem / 1024 / 1024 << " MB total\n";
-    }
+    // Show progress bar
+    show_progress_bar(layer_idx, mConfig.num_layers, "[BnB] Quantizing");
 
     const int hidden = mConfig.hidden_size;
     const int num_q_heads = mConfig.num_query_heads;
@@ -590,22 +657,30 @@ void BnBWeightsManager::allocate_moe_block(int layer_idx) {
     const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
                           mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
 
+    // Determine allocation type for expert weights
+    // When offload_experts is enabled, store experts in pinned CPU memory
+    const EAllocationType exp_alloc = expert_alloc_type();
+
+    if (layer_idx == 0 && mConfig.offload_experts) {
+        std::cerr << "[BnB] Expert offloading ENABLED - allocating expert NF4 weights in pinned CPU memory\n";
+    }
+
     auto& block = mMoEBlocks[layer_idx];
 
-    // QKV projection (same as dense)
+    // QKV projection (same as dense) - always on GPU
     const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
     allocate_bnb_weight(block.qkv_proj, qkv_out, hidden, "qkv");
 
-    // Output projection (same as dense)
+    // Output projection (same as dense) - always on GPU
     allocate_bnb_weight(block.out_proj, hidden, num_q_heads * head_size, "out");
 
-    // Layer norm weights (BF16, not quantized)
+    // Layer norm weights (BF16, not quantized) - always on GPU
     block.ln1_weight = mAllocator->allocate(ETensorDType::BF16, "ln1",
                                             EAllocationType::ON_DEVICE, {(long)hidden});
     block.ln2_weight = mAllocator->allocate(ETensorDType::BF16, "ln2",
                                             EAllocationType::ON_DEVICE, {(long)hidden});
 
-    // QK-norm weights (for Qwen3)
+    // QK-norm weights (for Qwen3) - always on GPU
     if (mConfig.use_qk_norm) {
         block.q_norm_weight = mAllocator->allocate(ETensorDType::BF16, "q_norm",
                                                    EAllocationType::ON_DEVICE, {(long)head_size});
@@ -613,19 +688,20 @@ void BnBWeightsManager::allocate_moe_block(int layer_idx) {
                                                    EAllocationType::ON_DEVICE, {(long)head_size});
     }
 
-    // Router gate (BF16, not quantized - small tensor)
-    // NOTE: Allocated as (hidden_size, num_experts) for matmul with TN transpose
+    // Router gate (BF16, not quantized - small tensor) - always on GPU
+    // NOTE: Shape matches HuggingFace (num_experts, hidden). `model_forward.hpp` uses matmul(TN)
+    //       and expects router_gate as (num_experts, hidden) like other linear weights.
     block.router_gate = mAllocator->allocate(ETensorDType::BF16, "router_gate",
-                                              EAllocationType::ON_DEVICE,
-                                              {(long)hidden, (long)n_experts});
+                                             EAllocationType::ON_DEVICE,
+                                             {(long)n_experts, (long)hidden});
 
-    // Allocate expert weights
+    // Allocate expert weights - on GPU or CPU depending on offload setting
     block.experts.resize(n_experts);
     for (int e = 0; e < n_experts; ++e) {
         auto& expert = block.experts[e];
         std::string prefix = fmt::format("expert_{}", e);
-        allocate_bnb_weight(expert.gate_up_proj, 2 * moe_inter, hidden, prefix + "_gate_up");
-        allocate_bnb_weight(expert.down_proj, hidden, moe_inter, prefix + "_down");
+        allocate_bnb_weight(expert.gate_up_proj, 2 * moe_inter, hidden, prefix + "_gate_up", exp_alloc);
+        allocate_bnb_weight(expert.down_proj, hidden, moe_inter, prefix + "_down", exp_alloc);
     }
 }
 
@@ -723,18 +799,9 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     }
 
     // Router gate (BF16, not quantized)
-    // Model stores as (num_experts, hidden), we need (hidden, num_experts) for TN matmul
+    // Model stores as (num_experts, hidden) and our matmul(TN) expects the same layout.
     if (const auto* entry = find_entry_opt(reader, prefix + ".mlp.gate.weight")) {
-        // Load into temporary buffer with correct shape
-        mLoadBuffer.Sizes[0] = n_experts;
-        mLoadBuffer.Sizes[1] = hidden;
-        mLoadBuffer.Rank = 2;
-        entry->read_tensor(mLoadBuffer, true);
-
-        // Transpose: (n_experts, hidden) -> (hidden, n_experts)
-        transpose(block.router_gate.get<nv_bfloat16>(),
-                  mLoadBuffer.get<nv_bfloat16>(),
-                  n_experts, hidden, stream);
+        entry->read_tensor(block.router_gate, /*allow_cast=*/true);
     } else {
         std::cerr << "[BnB WARN] layer " << layer_idx << " router gate not found: "
                   << prefix << ".mlp.gate.weight - this will cause NaN!\n";

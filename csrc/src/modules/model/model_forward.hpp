@@ -478,6 +478,12 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
 
                 // Step 1: Compute routing logits via matmul
                 // router_logits = flat_ln2 @ router.gate^T -> (BT, num_experts)
+                if (weights.router.gate.Rank != 2 || weights.router.gate.Sizes[0] != num_experts || weights.router.gate.Sizes[1] != C) {
+                    std::fprintf(stderr,
+                                 "[MoE ERROR] router.gate shape mismatch: got (%ld, %ld), expected (%d, %ld)\n",
+                                 weights.router.gate.Sizes[0], weights.router.gate.Sizes[1], num_experts, C);
+                    throw std::runtime_error("MoE router gate has wrong shape");
+                }
                 matmul(
                     router_logits, weights.router.gate, flat_ln2, std::nullopt,
                     nullptr, nullptr,
@@ -585,6 +591,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     moe_ctx.permuted_input = &permuted_input;
                     moe_ctx.expert_gate_up = &expert_gate_up;
                     moe_ctx.expert_outputs = &expert_outputs;
+                    moe_ctx.expert_indices = &expert_indices;
                     moe_ctx.host_offsets = rs.MoeHostExpertOffsets.data();
                     moe_ctx.num_experts = num_experts;
                     moe_ctx.top_k = top_k;
@@ -621,8 +628,25 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                         );
                     }
 
-                    // SwiGLU activation on all tokens at once
-                    swiglu_forward(expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, main_stream);
+                    // SwiGLU activation: h = silu(gate) * up
+                    // BnB weight loading stores MoE expert weights as [up | gate] per row:
+                    //   - up_proj in first half (rows 0 to D-1)
+                    //   - gate_proj in second half (rows D to 2D-1)
+                    // split_gate_up outputs: first param gets cols [0,D), second gets cols [D,2D)
+                    // silu_mul_forward(h, e, g) computes h = silu(e) * g
+                    // So we need: silu_mul_forward(h, gate, up) where gate=second half, up=first half
+                    Tensor expert_up{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                    Tensor expert_gate{acts.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                    rs.temp_acquire(expert_up);
+                    rs.temp_acquire(expert_gate);
+
+                    // expert_up = first half = up weights, expert_gate = second half = gate weights
+                    split_gate_up(expert_gate_up, expert_up, expert_gate, total_expert_tokens, expert_D, main_stream);
+                    // h = silu(gate) * up
+                    silu_mul_forward(expert_swiglu, expert_gate, expert_up, total_expert_tokens, expert_D, main_stream);
+
+                    rs.temp_free(expert_up);
+                    rs.temp_free(expert_gate);
 
                     // Grouped GEMM for down projection across all experts
                     if (acts.ln2.DType == ETensorDType::BF16) {
@@ -657,6 +681,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     convert_dtype(routing_weights_bf16.get<nv_bfloat16>(),
                                   routing_weights_fp32.get<float>(),
                                   BT * top_k, main_stream);
+               
                     moe_unpermute_and_combine(
                         mlp_down_out.get<nv_bfloat16>(),
                         expert_outputs.get<nv_bfloat16>(),
@@ -664,6 +689,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                         scatter_indices.get<int>(),
                         BT, total_expert_tokens, C, top_k, main_stream
                     );
+
                     rs.temp_free(routing_weights_bf16);
                 } else {
                     moe_unpermute_and_combine(
@@ -835,4 +861,3 @@ float ModularTransformerModel<Block>::validate_with_hook(Tensor inputs, Tensor p
 
     return *rs.LossHost;
 }
-

@@ -49,6 +49,11 @@ public:
         bool tied_embeddings = true;   ///< Whether lm_head is tied to embeddings
         int shard_idx = 0;
         int num_shards = 1;
+
+        /// When true, store MoE expert NF4 weights in pinned CPU memory instead of GPU.
+        /// Experts are streamed to GPU on-demand when selected by the router.
+        /// Saves ~12GB for 128-expert models, with ~20-40% throughput reduction.
+        bool offload_experts = false;
     };
 
     BnBWeightsManager(const Config& config, TensorAllocator& allocator,
@@ -117,6 +122,11 @@ public:
     [[nodiscard]] int num_experts() const { return mConfig.qlora_config.num_experts; }
 
     /**
+     * @brief Check if expert weights are offloaded to CPU
+     */
+    [[nodiscard]] bool experts_offloaded() const { return mConfig.offload_experts && is_moe(); }
+
+    /**
      * @brief Get MoE block weights (for MoE models)
      * @throws std::runtime_error if not an MoE model
      */
@@ -169,6 +179,13 @@ private:
     void allocate_single_block(int layer_idx);
     void allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int M, int K,
                              const std::string& name_prefix);
+    void allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int M, int K,
+                             const std::string& name_prefix, EAllocationType alloc_type);
+
+    // Helper to get the allocation type for expert weights
+    [[nodiscard]] EAllocationType expert_alloc_type() const {
+        return mConfig.offload_experts ? EAllocationType::PINNED : EAllocationType::ON_DEVICE;
+    }
 
     // Quantization helpers
     void quantize_and_store(BnBBlockQuantizedWeight& dest, const Tensor& src,

@@ -1177,6 +1177,19 @@ void moe_build_indices(int* gather_indices, int* scatter_indices,
                        int* expert_positions, int num_tokens, int top_k,
                        int num_experts, cudaStream_t stream);
 
+/// @brief Remap expert indices from global to compact indices for selective dequantization.
+/// Transforms expert_indices from global range [0, num_total_experts) to compact range
+/// [0, num_active_experts) using the provided mapping table.
+/// @param remapped_indices Output remapped indices (num_tokens, top_k).
+/// @param expert_indices Input global expert indices (num_tokens, top_k).
+/// @param expert_to_compact Mapping table: global_idx -> compact_idx, -1 if not active (num_total_experts).
+/// @param num_tokens Number of tokens (B*T).
+/// @param top_k Number of experts per token.
+/// @param stream CUDA stream.
+void moe_remap_expert_indices(int* remapped_indices, const int* expert_indices,
+                              const int* expert_to_compact, int num_tokens, int top_k,
+                              cudaStream_t stream);
+
 /// @brief Permute tokens from natural order to expert-grouped order.
 /// @param out Output permuted hidden states (total_tokens, hidden_size).
 /// @param inp Input hidden states (num_tokens, hidden_size).
@@ -1313,20 +1326,29 @@ void moe_router_z_loss_backward(nv_bfloat16* d_logits, const nv_bfloat16* router
 /// @param cublas_handle cuBLAS handle.
 /// @param stream CUDA stream.
 /// @param host_offsets Optional: pre-cached host offsets.
+/// @param active_expert_indices Optional host pointer (CPU) to a list of active global expert indices.
+/// @param weight_is_compact If true, `weights` is indexed by compact active-expert order; otherwise by global expert id.
+/// @param num_active_experts Number of entries in @p active_expert_indices (<= num_experts). If <= 0, uses num_experts.
 void moe_grouped_gemm(float* output, const float* input, const float* weights,
                       const int* expert_offsets, int num_experts,
                       int M, int K,
                       cublasHandle_t cublas_handle, cudaStream_t stream,
                       const int* host_offsets = nullptr,
                       float alpha = 1.0f, float beta = 0.0f,
-                      EMMTranspose mode = EMMTranspose::TN);
+                      EMMTranspose mode = EMMTranspose::TN,
+                      const int* active_expert_indices = nullptr,
+                      bool weight_is_compact = true,
+                      int num_active_experts = -1);
 void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
                       const int* expert_offsets, int num_experts,
                       int M, int K,
                       cublasHandle_t cublas_handle, cudaStream_t stream,
                       const int* host_offsets = nullptr,
                       float alpha = 1.0f, float beta = 0.0f,
-                      EMMTranspose mode = EMMTranspose::TN);
+                      EMMTranspose mode = EMMTranspose::TN,
+                      const int* active_expert_indices = nullptr,
+                      bool weight_is_compact = true,
+                      int num_active_experts = -1);
 
 /// @brief Computes weight gradients across all experts: dW = grad_output^T @ input
 /// @param d_weight Output gradient tensor (num_experts, M, N).
@@ -1341,18 +1363,27 @@ void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bf
 /// @param host_offsets Optional: pre-cached host offsets.
 /// @param alpha Scaling factor.
 /// @param beta Accumulation factor.
+/// @param active_expert_indices Optional host pointer (CPU) to a list of active global expert indices.
+/// @param weight_is_compact If true, `d_weight` is indexed by compact active-expert order; otherwise by global expert id.
+/// @param num_active_experts Number of entries in @p active_expert_indices (<= num_experts). If <= 0, uses num_experts.
 void moe_grouped_gemm_weight_grad(float* d_weight, const float* grad_output, const float* input,
                                   const int* expert_offsets, int num_experts,
                                   int M, int N,
                                   cublasHandle_t cublas_handle, cudaStream_t stream,
                                   const int* host_offsets = nullptr,
-                                  float alpha = 1.0f, float beta = 0.0f);
+                                  float alpha = 1.0f, float beta = 0.0f,
+                                  const int* active_expert_indices = nullptr,
+                                  bool weight_is_compact = true,
+                                  int num_active_experts = -1);
 void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight, const nv_bfloat16* grad_output, const nv_bfloat16* input,
                                   const int* expert_offsets, int num_experts,
                                   int M, int N,
                                   cublasHandle_t cublas_handle, cudaStream_t stream,
                                   const int* host_offsets = nullptr,
-                                  float alpha = 1.0f, float beta = 0.0f);
+                                  float alpha = 1.0f, float beta = 0.0f,
+                                  const int* active_expert_indices = nullptr,
+                                  bool weight_is_compact = true,
+                                  int num_active_experts = -1);
 
 /// @brief Grouped GEMM for MoE gate+up projection across all experts.
 /// Runs all expert GEMMs in parallel instead of sequentially.
@@ -1365,16 +1396,25 @@ void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight, const nv_bfloat16* grad
 /// @param intermediate_size Expert intermediate dimension (D, output is 2*D).
 /// @param cublas_handle cuBLAS handle.
 /// @param stream CUDA stream.
+/// @param active_expert_indices Optional host pointer (CPU) to a list of active global expert indices.
+/// @param weight_is_compact If true, `weights` is indexed by compact active-expert order; otherwise by global expert id.
+/// @param num_active_experts Number of entries in @p active_expert_indices (<= num_experts). If <= 0, uses num_experts.
 void moe_grouped_gemm_gate_up(float* output, const float* input, const float* weights,
                               const int* expert_offsets, int num_experts,
                               int hidden_size, int intermediate_size,
                               cublasHandle_t cublas_handle, cudaStream_t stream,
-                              const int* host_offsets = nullptr);
+                              const int* host_offsets = nullptr,
+                              const int* active_expert_indices = nullptr,
+                              bool weight_is_compact = true,
+                              int num_active_experts = -1);
 void moe_grouped_gemm_gate_up(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
                               const int* expert_offsets, int num_experts,
                               int hidden_size, int intermediate_size,
                               cublasHandle_t cublas_handle, cudaStream_t stream,
-                              const int* host_offsets = nullptr);
+                              const int* host_offsets = nullptr,
+                              const int* active_expert_indices = nullptr,
+                              bool weight_is_compact = true,
+                              int num_active_experts = -1);
 
 /// @brief Grouped GEMM for MoE down projection across all experts.
 /// Runs all expert GEMMs in parallel instead of sequentially.
@@ -1387,16 +1427,25 @@ void moe_grouped_gemm_gate_up(nv_bfloat16* output, const nv_bfloat16* input, con
 /// @param intermediate_size Expert intermediate dimension (D).
 /// @param cublas_handle cuBLAS handle.
 /// @param stream CUDA stream.
+/// @param active_expert_indices Optional host pointer (CPU) to a list of active global expert indices.
+/// @param weight_is_compact If true, `weights` is indexed by compact active-expert order; otherwise by global expert id.
+/// @param num_active_experts Number of entries in @p active_expert_indices (<= num_experts). If <= 0, uses num_experts.
 void moe_grouped_gemm_down(float* output, const float* input, const float* weights,
                            const int* expert_offsets, int num_experts,
                            int hidden_size, int intermediate_size,
                            cublasHandle_t cublas_handle, cudaStream_t stream,
-                           const int* host_offsets = nullptr);
+                           const int* host_offsets = nullptr,
+                           const int* active_expert_indices = nullptr,
+                           bool weight_is_compact = true,
+                           int num_active_experts = -1);
 void moe_grouped_gemm_down(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
                            const int* expert_offsets, int num_experts,
                            int hidden_size, int intermediate_size,
                            cublasHandle_t cublas_handle, cudaStream_t stream,
-                           const int* host_offsets = nullptr);
+                           const int* host_offsets = nullptr,
+                           const int* active_expert_indices = nullptr,
+                           bool weight_is_compact = true,
+                           int num_active_experts = -1);
 
 /// @brief Grouped GEMM backward through down projection for all MoE experts.
 /// Computes d_swiglu = d_output @ down_proj (no transpose on weight).
@@ -1413,12 +1462,18 @@ void moe_grouped_gemm_down_backward(float* d_input, const float* d_output, const
                                      const int* expert_offsets, int num_experts,
                                      int hidden_size, int intermediate_size,
                                      cublasHandle_t cublas_handle, cudaStream_t stream,
-                                     const int* host_offsets = nullptr);
+                                     const int* host_offsets = nullptr,
+                                     const int* active_expert_indices = nullptr,
+                                     bool weight_is_compact = true,
+                                     int num_active_experts = -1);
 void moe_grouped_gemm_down_backward(nv_bfloat16* d_input, const nv_bfloat16* d_output, const nv_bfloat16* weights,
                                      const int* expert_offsets, int num_experts,
                                      int hidden_size, int intermediate_size,
                                      cublasHandle_t cublas_handle, cudaStream_t stream,
-                                     const int* host_offsets = nullptr);
+                                     const int* host_offsets = nullptr,
+                                     const int* active_expert_indices = nullptr,
+                                     bool weight_is_compact = true,
+                                     int num_active_experts = -1);
 
 /// @brief Grouped GEMM backward through gate+up projection for all MoE experts.
 /// Computes d_input = d_gate_up @ gate_up_proj (no transpose on weight).
@@ -1435,11 +1490,17 @@ void moe_grouped_gemm_gate_up_backward(float* d_input, const float* d_gate_up, c
                                         const int* expert_offsets, int num_experts,
                                         int hidden_size, int intermediate_size,
                                         cublasHandle_t cublas_handle, cudaStream_t stream,
-                                        const int* host_offsets = nullptr);
+                                        const int* host_offsets = nullptr,
+                                        const int* active_expert_indices = nullptr,
+                                        bool weight_is_compact = true,
+                                        int num_active_experts = -1);
 void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input, const nv_bfloat16* d_gate_up, const nv_bfloat16* weights,
                                         const int* expert_offsets, int num_experts,
                                         int hidden_size, int intermediate_size,
                                         cublasHandle_t cublas_handle, cudaStream_t stream,
-                                        const int* host_offsets = nullptr);
+                                        const int* host_offsets = nullptr,
+                                        const int* active_expert_indices = nullptr,
+                                        bool weight_is_compact = true,
+                                        int num_active_experts = -1);
 
 #endif //SUROGATE_SRC_KERNELS_KERNELS_H

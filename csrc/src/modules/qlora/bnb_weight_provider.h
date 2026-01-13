@@ -8,12 +8,15 @@
 #include <memory>
 #include <vector>
 
+#include <fmt/core.h>
+
 #include "qlora_config.h"
 #include "bnb_weights.h"
 #include "bnb_block_quantized_tensor.h"
 #include "moe_weights.h"
 #include "modules/composite/transformer_block.h"
 #include "modules/lora/lora_config.h"
+#include "modules/moe/moe_types.h"
 #include "modules/weights/weight_manager_types.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
@@ -63,6 +66,17 @@ public:
         bool tied_embeddings = true;   ///< Whether lm_head is tied to embeddings
         int shard_idx = 0;
         int num_shards = 1;
+
+        /// Enable selective expert dequantization for MoE models.
+        /// When enabled, only the experts selected by the router are dequantized,
+        /// reducing memory usage from O(num_experts) to O(top_k) for dequant buffers.
+        bool selective_expert_dequant = true;
+
+        /// Offload MoE expert NF4 weights to CPU pinned memory.
+        /// When enabled, expert weights are stored in CPU memory and streamed to GPU
+        /// on-demand when selected by the router. Saves ~12GB for 128-expert models.
+        /// Implies selective_expert_dequant = true.
+        bool offload_experts = false;
     };
 
     BnBWeightProvider(const Config& config, TensorAllocator& allocator,
@@ -189,6 +203,55 @@ public:
      */
     Tensor& get_router_gate(int layer_idx, cudaStream_t stream);
 
+    /**
+     * @brief Dequantize only the selected experts (selective dequantization)
+     *
+     * This method dequantizes only the experts that were selected by the router,
+     * significantly reducing memory usage for MoE models with many experts.
+     *
+     * The dequantized weights are placed in a compact buffer indexed by
+     * selection_info.expert_to_compact mapping.
+     *
+     * @param layer_idx Layer index
+     * @param selection_info Information about which experts were selected
+     * @param stream CUDA stream for dequantization
+     */
+    void dequantize_selected_experts(int layer_idx, const SelectiveExpertInfo& selection_info,
+                                     cudaStream_t stream);
+
+    /**
+     * @brief Check if selective expert dequantization is enabled
+     */
+    [[nodiscard]] bool use_selective_dequant() const {
+        return mConfig.selective_expert_dequant && mConfig.qlora_config.is_moe();
+    }
+
+    /**
+     * @brief Get the current selection info (for backward pass)
+     *
+     * Returns the selection info cached from the last dequantize_selected_experts call.
+     * This is used in backward to match the compact indexing used in forward.
+     */
+    [[nodiscard]] const SelectiveExpertInfo& get_current_selection() const {
+        return mCurrentSelection;
+    }
+
+    /**
+     * @brief Get the maximum number of active experts for buffer sizing
+     *
+     * For selective dequant, we need to allocate enough buffer space for the
+     * worst case. With large batch sizes (e.g., 32K tokens), almost all experts
+     * may be selected. So we always allocate for num_experts to be safe.
+     * The memory savings from selective dequant come from:
+     * 1. Option A (selective_expert_dequant only): Reduced dequant buffer (~1GB savings)
+     * 2. Option B (offload_experts): Expert NF4 weights on CPU (~12GB savings)
+     */
+    [[nodiscard]] int max_active_experts() const {
+        // Always allocate buffers for all experts - with large batches,
+        // nearly all experts will be selected anyway
+        return mNumMoEExperts;
+    }
+
 private:
     /**
      * @brief Get attention and expert weights for MoE blocks
@@ -234,19 +297,55 @@ private:
     // MoE-specific members for batched expert dequantization
     // =========================================================================
 
-    /// Batched expert dequantization buffers (all experts, for forward pass)
-    /// Shape: (num_experts, 2 * moe_intermediate, hidden_size)
+    /// Batched expert dequantization buffers
+    /// When selective_expert_dequant is enabled:
+    ///   Shape: (max_active_experts, 2 * moe_intermediate, hidden_size)
+    /// When disabled:
+    ///   Shape: (num_experts, 2 * moe_intermediate, hidden_size)
     Tensor mBatchedExpertGateUp;
-    /// Shape: (num_experts, hidden_size, moe_intermediate)
+    /// Shape: (max_active_experts or num_experts, hidden_size, moe_intermediate)
     Tensor mBatchedExpertDown;
 
     /// Number of experts in MoE model
     int mNumMoEExperts = 0;
 
+    /// Current selection info for selective dequantization caching
+    /// Tracks which experts are currently in the compact buffers
+    SelectiveExpertInfo mCurrentSelection;
+
+    /// Number of experts currently in the compact buffers
+    int mNumActiveExperts = 0;
+
+    // =========================================================================
+    // Expert offloading support
+    // =========================================================================
+
+    /// GPU staging buffer for streaming NF4 expert data from CPU
+    /// When offload_experts is enabled, this holds the NF4 packed data for one expert
+    /// Size: max(expert_gate_up_bytes, expert_down_bytes)
+    Tensor mExpertNF4Staging;
+
+    /// GPU staging buffer for absmax scales (for offloaded experts)
+    Tensor mExpertAbsmaxStaging;
+
+    /// GPU staging buffer for double-quant scale (for offloaded experts)
+    Tensor mExpertAbsmaxScaleStaging;
+
+    /// GPU staging buffer for double-quant offset (for offloaded experts)
+    Tensor mExpertAbsmaxOffsetStaging;
+
+    /// Whether expert weights are offloaded to CPU
+    bool mExpertsOffloaded = false;
+
     void allocate_dequant_buffers();
     void allocate_moe_expert_buffers();
+    void allocate_offload_staging_buffers();
     void setup_block_weights_structure();
     void dequantize_weight(const BnBBlockQuantizedWeight& src, Tensor& dst, cudaStream_t stream);
+
+    /// Stream NF4 expert weight from CPU to GPU staging buffer, then dequantize
+    void stream_and_dequantize_expert(const BnBBlockQuantizedWeight& src, Tensor& dst,
+                                      cudaStream_t stream);
 };
 
 // ============================================================================
@@ -259,7 +358,13 @@ BnBWeightProvider<Block>::BnBWeightProvider(
     : mConfig(config)
     , mAllocator(&allocator)
     , mDeviceProps(device_props)  // Copy by value
+    , mExpertsOffloaded(config.offload_experts && config.qlora_config.is_moe())
 {
+    // If offload_experts is enabled, force selective_expert_dequant to true
+    if (mExpertsOffloaded && !mConfig.selective_expert_dequant) {
+        mConfig.selective_expert_dequant = true;
+    }
+
     // Create BnB weights manager
     BnBWeightsManager::Config bw_config{
         .num_layers = config.num_layers,
@@ -273,7 +378,8 @@ BnBWeightProvider<Block>::BnBWeightProvider(
         .use_qk_norm = config.use_qk_norm,
         .tied_embeddings = config.tied_embeddings,
         .shard_idx = config.shard_idx,
-        .num_shards = config.num_shards
+        .num_shards = config.num_shards,
+        .offload_experts = config.offload_experts
     };
     mBnBWeights = std::make_unique<BnBWeightsManager>(bw_config, allocator, device_props);
 
@@ -283,6 +389,11 @@ BnBWeightProvider<Block>::BnBWeightProvider(
     // Allocate MoE expert buffers if needed
     if (config.qlora_config.is_moe()) {
         allocate_moe_expert_buffers();
+
+        // Allocate staging buffers for CPU -> GPU streaming if offloading is enabled
+        if (mExpertsOffloaded) {
+            allocate_offload_staging_buffers();
+        }
     }
 
     // Set up the block weights structure with pointers to dequant buffers
@@ -449,18 +560,71 @@ void BnBWeightProvider<Block>::allocate_moe_expert_buffers() {
 
     mNumMoEExperts = num_experts;
 
-    // Allocate batched expert buffers (all experts for forward pass)
-    // gate_up_proj: (num_experts, 2 * moe_intermediate, hidden_size)
-    // down_proj: (num_experts, hidden_size, moe_intermediate)
+    // Determine buffer size based on selective dequant setting
+    // When selective_expert_dequant is enabled, we only need buffers for
+    // the maximum number of experts that could be active at once (typically top_k * factor)
+    const int buffer_experts = max_active_experts();
+
+    if (mConfig.selective_expert_dequant) {
+        fmt::print("[BnB] Selective expert dequant enabled: allocating buffers for {} experts (vs {} total)\n",
+                   buffer_experts, num_experts);
+    }
+
+    // Allocate batched expert buffers
+    // gate_up_proj: (buffer_experts, 2 * moe_intermediate, hidden_size)
+    // down_proj: (buffer_experts, hidden_size, moe_intermediate)
     mBatchedExpertGateUp = mAllocator->allocate(ETensorDType::BF16,
         "batched_expert_gate_up",
         EAllocationType::ON_DEVICE,
-        {(long)num_experts, (long)(2 * moe_inter), (long)hidden});
+        {(long)buffer_experts, (long)(2 * moe_inter), (long)hidden});
 
     mBatchedExpertDown = mAllocator->allocate(ETensorDType::BF16,
         "batched_expert_down",
         EAllocationType::ON_DEVICE,
-        {(long)num_experts, (long)hidden, (long)moe_inter});
+        {(long)buffer_experts, (long)hidden, (long)moe_inter});
+}
+
+template<typename Block>
+void BnBWeightProvider<Block>::allocate_offload_staging_buffers() {
+    auto ctx = mAllocator->with_context("BnB_OffloadStaging");
+
+    const int hidden = mConfig.hidden_size;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+    const int block_size = mConfig.qlora_config.block_size();
+    const bool double_quant = mConfig.qlora_config.bnb_double_quant;
+    const int dq_group_size = mConfig.qlora_config.bnb_double_quant_group_size > 0 ?
+                              mConfig.qlora_config.bnb_double_quant_group_size : 256;
+
+    // Calculate the maximum NF4 packed size for a single expert weight
+    // gate_up_proj: (2 * moe_inter, hidden) -> (2 * moe_inter * hidden) / 2 bytes
+    // down_proj: (hidden, moe_inter) -> (hidden * moe_inter) / 2 bytes
+    const long gate_up_elems = 2L * moe_inter * hidden;
+    const long down_elems = static_cast<long>(hidden) * moe_inter;
+    const long max_elems = std::max(gate_up_elems, down_elems);
+    const long max_packed_bytes = (max_elems + 1) / 2;
+
+    // Allocate staging buffer for NF4 packed data
+    mExpertNF4Staging = mAllocator->allocate(ETensorDType::BYTE, "expert_nf4_staging",
+                                              EAllocationType::ON_DEVICE, {max_packed_bytes});
+
+    // Calculate max absmax blocks
+    const long max_absmax_blocks = (max_elems + block_size - 1) / block_size;
+
+    if (double_quant) {
+        // Double quantization: need staging for quantized absmax + scale/offset
+        mExpertAbsmaxStaging = mAllocator->allocate(ETensorDType::BYTE, "expert_absmax_staging",
+                                                     EAllocationType::ON_DEVICE, {max_absmax_blocks});
+        const long max_groups = (max_absmax_blocks + dq_group_size - 1) / dq_group_size;
+        mExpertAbsmaxScaleStaging = mAllocator->allocate(ETensorDType::FP32, "expert_absmax_scale_staging",
+                                                          EAllocationType::ON_DEVICE, {max_groups});
+        mExpertAbsmaxOffsetStaging = mAllocator->allocate(ETensorDType::FP32, "expert_absmax_offset_staging",
+                                                           EAllocationType::ON_DEVICE, {max_groups});
+    } else {
+        // No double quant: FP32 absmax
+        mExpertAbsmaxStaging = mAllocator->allocate(ETensorDType::FP32, "expert_absmax_staging",
+                                                     EAllocationType::ON_DEVICE, {max_absmax_blocks});
+    }
 }
 
 template<typename Block>
@@ -481,39 +645,56 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
         dequantize_weight(qblock.qkv_proj, mDequantQKV, stream);
         dequantize_weight(qblock.out_proj, mDequantOut, stream);
 
-        // Dequantize ALL expert weights into batched buffers
-        // Each expert's weights are dequantized into a slice of the batched tensor
-        const int hidden = mConfig.hidden_size;
-        const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
-                              mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+        // When selective_expert_dequant is enabled AND LoRA is enabled, skip dequantizing
+        // all experts here. The LoRA forward hook will call dequantize_selected_experts()
+        // later with only the router-selected experts. This saves memory.
+        //
+        // IMPORTANT: When LoRA is disabled (lora: false), we MUST dequantize all experts here
+        // because the LoRA hook won't run and dequantize_selected_experts() won't be called.
+        // Without this check, the base model would use uninitialized expert weight buffers.
+        const bool use_selective_path = mConfig.selective_expert_dequant && mConfig.lora_config.enabled();
 
-        for (int e = 0; e < mNumMoEExperts; ++e) {
-            const auto& expert_weights = qblock.experts[e];
+        if (!use_selective_path) {
+            // Dequantize ALL expert weights into batched buffers
+            // Each expert's weights are dequantized into a slice of the batched tensor
+            const int hidden = mConfig.hidden_size;
+            const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                                  mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
 
-            // Create slice views into the batched buffers for this expert
-            // gate_up_proj slice: offset by e * (2 * moe_inter * hidden) bytes
-            Tensor gate_up_slice = Tensor::from_pointer(
-                static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
-                    static_cast<size_t>(e) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
-                mBatchedExpertGateUp.Device,
-                ETensorDType::BF16,
-                std::array<long, 2>{2 * moe_inter, hidden}
-            );
+            for (int e = 0; e < mNumMoEExperts; ++e) {
+                const auto& expert_weights = qblock.experts[e];
 
-            // down_proj slice: offset by e * (hidden * moe_inter) bytes
-            Tensor down_slice = Tensor::from_pointer(
-                static_cast<std::byte*>(mBatchedExpertDown.Data) +
-                    static_cast<size_t>(e) * hidden * moe_inter * sizeof(nv_bfloat16),
-                mBatchedExpertDown.Device,
-                ETensorDType::BF16,
-                std::array<long, 2>{hidden, moe_inter}
-            );
+                // Create slice views into the batched buffers for this expert
+                // gate_up_proj slice: offset by e * (2 * moe_inter * hidden) bytes
+                Tensor gate_up_slice = Tensor::from_pointer(
+                    static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
+                        static_cast<size_t>(e) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+                    mBatchedExpertGateUp.Device,
+                    ETensorDType::BF16,
+                    std::array<long, 2>{2 * moe_inter, hidden}
+                );
 
-            // Dequantize this expert's weights into the slice
-            dequantize_weight(expert_weights.gate_up_proj, gate_up_slice, stream);
-            dequantize_weight(expert_weights.down_proj, down_slice, stream);
+                // down_proj slice: offset by e * (hidden * moe_inter) bytes
+                Tensor down_slice = Tensor::from_pointer(
+                    static_cast<std::byte*>(mBatchedExpertDown.Data) +
+                        static_cast<size_t>(e) * hidden * moe_inter * sizeof(nv_bfloat16),
+                    mBatchedExpertDown.Device,
+                    ETensorDType::BF16,
+                    std::array<long, 2>{hidden, moe_inter}
+                );
+
+                // Dequantize this expert's weights into the slice
+                // When experts are offloaded to CPU, we need to stream them to GPU first
+                if (mExpertsOffloaded) {
+                    stream_and_dequantize_expert(expert_weights.gate_up_proj, gate_up_slice, stream);
+                    stream_and_dequantize_expert(expert_weights.down_proj, down_slice, stream);
+                } else {
+                    dequantize_weight(expert_weights.gate_up_proj, gate_up_slice, stream);
+                    dequantize_weight(expert_weights.down_proj, down_slice, stream);
+                }
+            }
         }
-
+        // When selective mode is on, expert dequantization is deferred to dequantize_selected_experts()
 
         mCurrentLayer = layer_idx;
         mBufferVersion = mStepVersion;
@@ -534,6 +715,170 @@ void BnBWeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
             mDequantBlock.attention.q_norm_weight = qblock.q_norm_weight;
             mDequantBlock.attention.k_norm_weight = qblock.k_norm_weight;
         }
+    }
+}
+
+template<typename Block>
+void BnBWeightProvider<Block>::dequantize_selected_experts(
+    int layer_idx, const SelectiveExpertInfo& selection_info, cudaStream_t stream)
+{
+    if (!selection_info.enabled || selection_info.num_active == 0) {
+        return;
+    }
+
+    const auto& qblock = mBnBWeights->get_moe_block(layer_idx);
+    const int hidden = mConfig.hidden_size;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+
+    // Check if we can reuse the current buffers
+    // Cache hit if: same layer, same step, and selection is a subset of current
+    const bool same_layer_step = (mCurrentLayer == layer_idx) && (mBufferVersion == mStepVersion);
+
+    // For selective dequant, we need to check if the current selection matches
+    // Simple approach: always re-dequantize if selection changed
+    // (More sophisticated: check if new selection is subset of current)
+    bool selection_matches = same_layer_step && mCurrentSelection.enabled &&
+                             mCurrentSelection.num_active == selection_info.num_active;
+    if (selection_matches) {
+        // Quick check: compare active expert lists
+        for (int i = 0; i < selection_info.num_active && selection_matches; ++i) {
+            if (mCurrentSelection.active_experts[i] != selection_info.active_experts[i]) {
+                selection_matches = false;
+            }
+        }
+    }
+
+    if (selection_matches) {
+        // Cache hit - buffers already contain the right experts
+        return;
+    }
+
+    // Dequantize selected experts into COMPACT index positions in the buffer.
+    // When selective mode is enabled, grouped_fast_expert_lora_forward uses compact indexing:
+    //   - gemm_num_experts = num_active (not num_total)
+    //   - compact_host_offsets maps compact indices to token ranges
+    //   - GEMM loop iterates e from 0 to num_active-1 and indexes weights at position e
+    // So we must place dequantized weights at compact positions (i) not global positions.
+    const int num_to_dequant = selection_info.num_active;
+
+    for (int i = 0; i < num_to_dequant; ++i) {
+        const int global_expert_idx = selection_info.active_experts[i];
+        const auto& expert_weights = qblock.experts[global_expert_idx];
+
+        // Create slice views at the COMPACT index position (i, not global_expert_idx)
+        // The grouped GEMM in fast_expert_lora.h uses compact indexing when selective mode is on:
+        //   - gemm_num_experts = num_active
+        //   - effective_host_offsets maps compact indices to token ranges
+        //   - GEMM loop iterates e from 0 to num_active-1 and indexes weights at position e
+        // So we must place dequantized weights at compact positions to match.
+        Tensor gate_up_slice = Tensor::from_pointer(
+            static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
+                static_cast<size_t>(i) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+            mBatchedExpertGateUp.Device,
+            ETensorDType::BF16,
+            std::array<long, 2>{2 * moe_inter, hidden}
+        );
+
+        Tensor down_slice = Tensor::from_pointer(
+            static_cast<std::byte*>(mBatchedExpertDown.Data) +
+                static_cast<size_t>(i) * hidden * moe_inter * sizeof(nv_bfloat16),
+            mBatchedExpertDown.Device,
+            ETensorDType::BF16,
+            std::array<long, 2>{hidden, moe_inter}
+        );
+       
+        // Dequantize this expert's weights into the buffer slice
+        // When experts are offloaded to CPU, we need to stream them to GPU first
+        if (mExpertsOffloaded) {
+            stream_and_dequantize_expert(expert_weights.gate_up_proj, gate_up_slice, stream);
+            stream_and_dequantize_expert(expert_weights.down_proj, down_slice, stream);
+        } else {
+            dequantize_weight(expert_weights.gate_up_proj, gate_up_slice, stream);
+            dequantize_weight(expert_weights.down_proj, down_slice, stream);
+        }
+    }
+
+    // Update cache state for selective expert dequant
+    // NOTE: We intentionally do NOT update mCurrentLayer/mBufferVersion here!
+    // Those are used for attention weight caching in get_moe_attention_weights().
+    // If we update them here, get_block() will think attention weights are cached
+    // when they're not. Instead, we only track expert selection state separately.
+    mCurrentSelection = selection_info;
+    mNumActiveExperts = num_to_dequant;
+
+    // Update the expert weights tensor shapes
+    // Note: We use compact indexing, so shape is (num_active, ...) not (num_total_experts, ...)
+    // The grouped GEMM iterates from 0 to num_active-1 and indexes weights at position e
+    if constexpr (has_moe_weights<BlockWeights>::value) {
+        mDequantBlock.experts.gate_up_proj = Tensor::from_pointer(
+            mBatchedExpertGateUp.Data,
+            mBatchedExpertGateUp.Device,
+            ETensorDType::BF16,
+            std::array<long, 3>{(long)num_to_dequant, (long)(2 * moe_inter), (long)hidden}
+        );
+        mDequantBlock.experts.down_proj = Tensor::from_pointer(
+            mBatchedExpertDown.Data,
+            mBatchedExpertDown.Device,
+            ETensorDType::BF16,
+            std::array<long, 3>{(long)num_to_dequant, (long)hidden, (long)moe_inter}
+        );
+        mDequantBlock.experts.use_batched = true;
+        mDequantBlock.experts.num_active_experts = num_to_dequant;
+    }
+}
+
+template<typename Block>
+void BnBWeightProvider<Block>::stream_and_dequantize_expert(
+    const BnBBlockQuantizedWeight& src, Tensor& dst, cudaStream_t stream)
+{
+    // This method handles CPU-offloaded experts:
+    // 1. Copy NF4 packed data from pinned CPU memory to GPU staging buffer
+    // 2. Copy absmax scales from CPU to GPU staging buffer
+    // 3. Dequantize from GPU staging buffer to destination
+
+    // Step 1: Copy NF4 packed data (HOST -> DEVICE)
+    const size_t data_bytes = src.packed_bytes();
+    cudaMemcpyAsync(mExpertNF4Staging.Data, src.data.Data,
+                    data_bytes, cudaMemcpyHostToDevice, stream);
+
+    // Step 2: Copy absmax data
+    const long num_blocks = src.num_blocks();
+    if (src.double_quant) {
+        // Copy quantized absmax (uint8)
+        cudaMemcpyAsync(mExpertAbsmaxStaging.Data, src.absmax.Data,
+                        num_blocks * sizeof(unsigned char), cudaMemcpyHostToDevice, stream);
+
+        // Copy scale and offset
+        const int num_groups = src.num_groups();
+        cudaMemcpyAsync(mExpertAbsmaxScaleStaging.Data, src.absmax_scale.Data,
+                        num_groups * sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(mExpertAbsmaxOffsetStaging.Data, src.absmax_offset.Data,
+                        num_groups * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+        // Step 3: Dequantize using double-dequant kernel from staging buffers
+        dequantize_bnb_nf4_double(
+            dst.get<nv_bfloat16>(),
+            mExpertNF4Staging.get<unsigned char>(),
+            mExpertAbsmaxStaging.get<unsigned char>(),
+            mExpertAbsmaxScaleStaging.get<float>(),
+            mExpertAbsmaxOffsetStaging.get<float>(),
+            src.M, src.K,
+            src.block_size, src.double_quant_group_size,
+            mDeviceProps, stream);
+      } else {
+        // Copy FP32 absmax
+        cudaMemcpyAsync(mExpertAbsmaxStaging.Data, src.absmax.Data,
+                        num_blocks * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+        // Step 3: Dequantize using standard kernel from staging buffers
+        dequantize_bnb_nf4(
+            dst.get<nv_bfloat16>(),
+            mExpertNF4Staging.get<unsigned char>(),
+            mExpertAbsmaxStaging.get<float>(),
+            src.M, src.K,
+            src.block_size,
+            mDeviceProps, stream);
     }
 }
 

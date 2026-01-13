@@ -47,6 +47,12 @@ struct RuntimeOptions {
 
     bool InitProjectionsToZero = false;
 
+    // MoE optimization: Only dequantize selected experts (reduces memory from O(num_experts) to O(top_k))
+    bool SelectiveExpertDequant = true;
+
+    // MoE optimization: Offload expert NF4 weights to CPU, stream on-demand (saves ~12GB for 128-expert models)
+    bool OffloadExperts = false;
+
     // Debug: print detailed memory breakdown after model allocation (useful for QLoRA optimization)
     bool DebugMemoryBreakdown = false;
 

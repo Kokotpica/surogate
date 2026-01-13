@@ -720,6 +720,41 @@ void moe_build_indices(
     );
 }
 
+// ============================================================================
+// Expert Index Remapping Kernel for Selective Dequantization
+// ============================================================================
+
+__global__ void moe_remap_expert_indices_kernel(
+    int* __restrict__ remapped_indices,
+    const int* __restrict__ expert_indices,
+    const int* __restrict__ expert_to_compact,
+    int total_elements
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    int global_expert = expert_indices[idx];
+    int compact_expert = expert_to_compact[global_expert];
+    remapped_indices[idx] = compact_expert;
+}
+
+void moe_remap_expert_indices(
+    int* remapped_indices,
+    const int* expert_indices,
+    const int* expert_to_compact,
+    int num_tokens,
+    int top_k,
+    cudaStream_t stream
+) {
+    int total = num_tokens * top_k;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+
+    moe_remap_expert_indices_kernel<<<grid_size, block_size, 0, stream>>>(
+        remapped_indices, expert_indices, expert_to_compact, total
+    );
+}
+
 void moe_permute_tokens(
     nv_bfloat16* out,
     const nv_bfloat16* inp,
@@ -1035,8 +1070,12 @@ void moe_grouped_gemm_impl(
     const int* host_offsets,
     float alpha,
     float beta,
-    EMMTranspose mode
+    EMMTranspose mode,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
+    int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
     const int* h_offsets;
 
@@ -1061,18 +1100,19 @@ void moe_grouped_gemm_impl(
     std::vector<const T*> A_vec, B_vec;
     std::vector<T*> C_vec;
 
-    m_vec.reserve(num_experts);
-    n_vec.reserve(num_experts);
-    k_vec.reserve(num_experts);
-    lda_vec.reserve(num_experts);
-    ldb_vec.reserve(num_experts);
-    ldc_vec.reserve(num_experts);
-    A_vec.reserve(num_experts);
-    B_vec.reserve(num_experts);
-    C_vec.reserve(num_experts);
+    m_vec.reserve(n_active);
+    n_vec.reserve(n_active);
+    k_vec.reserve(n_active);
+    lda_vec.reserve(n_active);
+    ldb_vec.reserve(n_active);
+    ldc_vec.reserve(n_active);
+    A_vec.reserve(n_active);
+    B_vec.reserve(n_active);
+    C_vec.reserve(n_active);
 
-    for (int e = 0; e < num_experts; ++e) {
-        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+    for (int e = 0; e < n_active; ++e) {
+        int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+        int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
         if (tokens_e == 0) continue;
 
         m_vec.push_back(M);
@@ -1086,9 +1126,9 @@ void moe_grouped_gemm_impl(
         ldb_vec.push_back((transb == CUBLAS_OP_N) ? K : tokens_e);
         ldc_vec.push_back(M);
 
-        A_vec.push_back(weights + e * M * K);
-        B_vec.push_back(input + h_offsets[e] * K);
-        C_vec.push_back(output + h_offsets[e] * M);
+        A_vec.push_back(weights + (weight_is_compact ? e : global_idx) * M * K);
+        B_vec.push_back(input + h_offsets[global_idx] * K);
+        C_vec.push_back(output + h_offsets[global_idx] * M);
     }
 
     if (m_vec.empty()) return;
@@ -1139,8 +1179,11 @@ void moe_grouped_gemm(float* output, const float* input, const float* weights,
                       int M, int K,
                       cublasHandle_t cublas_handle, cudaStream_t stream,
                       const int* host_offsets,
-                      float alpha, float beta, EMMTranspose mode) {
-    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode);
+                      float alpha, float beta, EMMTranspose mode,
+                      const int* active_expert_indices,
+                      bool weight_is_compact,
+                      int num_active_experts) {
+    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bfloat16* weights,
@@ -1148,8 +1191,11 @@ void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bf
                       int M, int K,
                       cublasHandle_t cublas_handle, cudaStream_t stream,
                       const int* host_offsets,
-                      float alpha, float beta, EMMTranspose mode) {
-    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode);
+                      float alpha, float beta, EMMTranspose mode,
+                      const int* active_expert_indices,
+                      bool weight_is_compact,
+                      int num_active_experts) {
+    moe_grouped_gemm_impl(output, input, weights, expert_offsets, num_experts, M, K, cublas_handle, stream, host_offsets, alpha, beta, mode, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 template<typename T>
@@ -1165,8 +1211,12 @@ void moe_grouped_gemm_weight_grad_impl(
     cudaStream_t stream,
     const int* host_offsets,
     float alpha,
-    float beta
+    float beta,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
+    int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
     const int* h_offsets;
 
@@ -1193,18 +1243,19 @@ void moe_grouped_gemm_weight_grad_impl(
     std::vector<const T*> A_vec, B_vec;
     std::vector<T*> C_vec;
 
-    m_vec.reserve(num_experts);
-    n_vec.reserve(num_experts);
-    k_vec.reserve(num_experts);
-    lda_vec.reserve(num_experts);
-    ldb_vec.reserve(num_experts);
-    ldc_vec.reserve(num_experts);
-    A_vec.reserve(num_experts);
-    B_vec.reserve(num_experts);
-    C_vec.reserve(num_experts);
+    m_vec.reserve(n_active);
+    n_vec.reserve(n_active);
+    k_vec.reserve(n_active);
+    lda_vec.reserve(n_active);
+    ldb_vec.reserve(n_active);
+    ldc_vec.reserve(n_active);
+    A_vec.reserve(n_active);
+    B_vec.reserve(n_active);
+    C_vec.reserve(n_active);
 
-    for (int e = 0; e < num_experts; ++e) {
-        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+    for (int e = 0; e < n_active; ++e) {
+        int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+        int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
         if (tokens_e == 0) continue;
 
         m_vec.push_back(M);
@@ -1226,9 +1277,9 @@ void moe_grouped_gemm_weight_grad_impl(
         // OP_T on B gives (K, N).
         // So: C(M, N) = A(M, K) @ B^T(K, N)
 
-        A_vec.push_back(grad_output + h_offsets[e] * M);
-        B_vec.push_back(input + h_offsets[e] * N);
-        C_vec.push_back(d_weight + e * M * N);
+        A_vec.push_back(grad_output + h_offsets[global_idx] * M);
+        B_vec.push_back(input + h_offsets[global_idx] * N);
+        C_vec.push_back(d_weight + (weight_is_compact ? e : global_idx) * M * N);
     }
 
     if (m_vec.empty()) return;
@@ -1279,8 +1330,11 @@ void moe_grouped_gemm_weight_grad(float* d_weight, const float* grad_output, con
                                   int M, int N,
                                   cublasHandle_t cublas_handle, cudaStream_t stream,
                                   const int* host_offsets,
-                                  float alpha, float beta) {
-    moe_grouped_gemm_weight_grad_impl(d_weight, grad_output, input, expert_offsets, num_experts, M, N, cublas_handle, stream, host_offsets, alpha, beta);
+                                  float alpha, float beta,
+                                  const int* active_expert_indices,
+                                  bool weight_is_compact,
+                                  int num_active_experts) {
+    moe_grouped_gemm_weight_grad_impl(d_weight, grad_output, input, expert_offsets, num_experts, M, N, cublas_handle, stream, host_offsets, alpha, beta, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight, const nv_bfloat16* grad_output, const nv_bfloat16* input,
@@ -1288,8 +1342,11 @@ void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight, const nv_bfloat16* grad
                                   int M, int N,
                                   cublasHandle_t cublas_handle, cudaStream_t stream,
                                   const int* host_offsets,
-                                  float alpha, float beta) {
-    moe_grouped_gemm_weight_grad_impl(d_weight, grad_output, input, expert_offsets, num_experts, M, N, cublas_handle, stream, host_offsets, alpha, beta);
+                                  float alpha, float beta,
+                                  const int* active_expert_indices,
+                                  bool weight_is_compact,
+                                  int num_active_experts) {
+    moe_grouped_gemm_weight_grad_impl(d_weight, grad_output, input, expert_offsets, num_experts, M, N, cublas_handle, stream, host_offsets, alpha, beta, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 template<typename T>
@@ -1303,8 +1360,12 @@ void moe_grouped_gemm_gate_up_impl(
     int intermediate_size,            // D (output is 2*D for gate+up)
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets           // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
+    int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     // Get host-side offsets - either use cached or copy from device
     std::vector<int> local_offsets;
     const int* h_offsets;
@@ -1335,23 +1396,24 @@ void moe_grouped_gemm_gate_up_impl(
     std::vector<const T*> A_vec, B_vec;
     std::vector<T*> C_vec;
 
-    m_vec.reserve(num_experts);
-    n_vec.reserve(num_experts);
-    k_vec.reserve(num_experts);
-    lda_vec.reserve(num_experts);
-    ldb_vec.reserve(num_experts);
-    ldc_vec.reserve(num_experts);
-    A_vec.reserve(num_experts);
-    B_vec.reserve(num_experts);
-    C_vec.reserve(num_experts);
+    m_vec.reserve(n_active);
+    n_vec.reserve(n_active);
+    k_vec.reserve(n_active);
+    lda_vec.reserve(n_active);
+    ldb_vec.reserve(n_active);
+    ldc_vec.reserve(n_active);
+    A_vec.reserve(n_active);
+    B_vec.reserve(n_active);
+    C_vec.reserve(n_active);
 
-    for (int e = 0; e < num_experts; ++e) {
-        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+    for (int e = 0; e < n_active; ++e) {
+        int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+        int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
         if (tokens_e == 0) continue;
 
-        const T* A_ptr = weights + e * out_dim * hidden_size;
-        const T* B_ptr = input + h_offsets[e] * hidden_size;
-        T* C_ptr = output + h_offsets[e] * out_dim;
+        const T* A_ptr = weights + (weight_is_compact ? e : global_idx) * out_dim * hidden_size;
+        const T* B_ptr = input + h_offsets[global_idx] * hidden_size;
+        T* C_ptr = output + h_offsets[global_idx] * out_dim;
 
         m_vec.push_back(out_dim);
         n_vec.push_back(tokens_e);
@@ -1420,8 +1482,12 @@ void moe_grouped_gemm_down_impl(
     int intermediate_size,            // D
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets           // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
+    int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     // Get host-side offsets - either use cached or copy from device
     std::vector<int> local_offsets;
     const int* h_offsets;
@@ -1448,18 +1514,19 @@ void moe_grouped_gemm_down_impl(
     std::vector<const T*> A_vec, B_vec;
     std::vector<T*> C_vec;
 
-    m_vec.reserve(num_experts);
-    n_vec.reserve(num_experts);
-    k_vec.reserve(num_experts);
-    lda_vec.reserve(num_experts);
-    ldb_vec.reserve(num_experts);
-    ldc_vec.reserve(num_experts);
-    A_vec.reserve(num_experts);
-    B_vec.reserve(num_experts);
-    C_vec.reserve(num_experts);
+    m_vec.reserve(n_active);
+    n_vec.reserve(n_active);
+    k_vec.reserve(n_active);
+    lda_vec.reserve(n_active);
+    ldb_vec.reserve(n_active);
+    ldc_vec.reserve(n_active);
+    A_vec.reserve(n_active);
+    B_vec.reserve(n_active);
+    C_vec.reserve(n_active);
 
-    for (int e = 0; e < num_experts; ++e) {
-        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+    for (int e = 0; e < n_active; ++e) {
+        int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+        int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
         if (tokens_e == 0) continue;
 
         m_vec.push_back(hidden_size);
@@ -1470,9 +1537,9 @@ void moe_grouped_gemm_down_impl(
         ldb_vec.push_back(intermediate_size);
         ldc_vec.push_back(hidden_size);
 
-        A_vec.push_back(weights + e * hidden_size * intermediate_size);
-        B_vec.push_back(input + h_offsets[e] * intermediate_size);
-        C_vec.push_back(output + h_offsets[e] * hidden_size);
+        A_vec.push_back(weights + (weight_is_compact ? e : global_idx) * hidden_size * intermediate_size);
+        B_vec.push_back(input + h_offsets[global_idx] * intermediate_size);
+        C_vec.push_back(output + h_offsets[global_idx] * hidden_size);
     }
 
     if (m_vec.empty()) return;
@@ -1528,11 +1595,14 @@ void moe_grouped_gemm_gate_up(
     int intermediate_size,
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
     moe_grouped_gemm_gate_up_impl(output, input, weights, expert_offsets,
                                    num_experts, hidden_size, intermediate_size,
-                                   cublas_handle, stream, host_offsets);
+                                   cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 void moe_grouped_gemm_gate_up(
@@ -1545,11 +1615,14 @@ void moe_grouped_gemm_gate_up(
     int intermediate_size,
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
     moe_grouped_gemm_gate_up_impl(output, input, weights, expert_offsets,
                                    num_experts, hidden_size, intermediate_size,
-                                   cublas_handle, stream, host_offsets);
+                                   cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 void moe_grouped_gemm_down(
@@ -1562,11 +1635,14 @@ void moe_grouped_gemm_down(
     int intermediate_size,
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
     moe_grouped_gemm_down_impl(output, input, weights, expert_offsets,
                                 num_experts, hidden_size, intermediate_size,
-                                cublas_handle, stream, host_offsets);
+                                cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 void moe_grouped_gemm_down(
@@ -1579,11 +1655,14 @@ void moe_grouped_gemm_down(
     int intermediate_size,
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
     moe_grouped_gemm_down_impl(output, input, weights, expert_offsets,
                                 num_experts, hidden_size, intermediate_size,
-                                cublas_handle, stream, host_offsets);
+                                cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 // ============================================================================
@@ -1710,8 +1789,12 @@ void moe_grouped_gemm_down_backward_impl(
     int intermediate_size,            // D
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets           // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
+    int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
     const int* h_offsets;
 
@@ -1737,18 +1820,19 @@ void moe_grouped_gemm_down_backward_impl(
     std::vector<const T*> A_vec, B_vec;
     std::vector<T*> C_vec;
 
-    m_vec.reserve(num_experts);
-    n_vec.reserve(num_experts);
-    k_vec.reserve(num_experts);
-    lda_vec.reserve(num_experts);
-    ldb_vec.reserve(num_experts);
-    ldc_vec.reserve(num_experts);
-    A_vec.reserve(num_experts);
-    B_vec.reserve(num_experts);
-    C_vec.reserve(num_experts);
+    m_vec.reserve(n_active);
+    n_vec.reserve(n_active);
+    k_vec.reserve(n_active);
+    lda_vec.reserve(n_active);
+    ldb_vec.reserve(n_active);
+    ldc_vec.reserve(n_active);
+    A_vec.reserve(n_active);
+    B_vec.reserve(n_active);
+    C_vec.reserve(n_active);
 
-    for (int e = 0; e < num_experts; ++e) {
-        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+    for (int e = 0; e < n_active; ++e) {
+        int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+        int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
         if (tokens_e == 0) continue;
 
         m_vec.push_back(intermediate_size);
@@ -1759,9 +1843,9 @@ void moe_grouped_gemm_down_backward_impl(
         ldb_vec.push_back(hidden_size);
         ldc_vec.push_back(intermediate_size);
 
-        A_vec.push_back(weights + e * hidden_size * intermediate_size);
-        B_vec.push_back(d_output + h_offsets[e] * hidden_size);
-        C_vec.push_back(d_input + h_offsets[e] * intermediate_size);
+        A_vec.push_back(weights + (weight_is_compact ? e : global_idx) * hidden_size * intermediate_size);
+        B_vec.push_back(d_output + h_offsets[global_idx] * hidden_size);
+        C_vec.push_back(d_input + h_offsets[global_idx] * intermediate_size);
     }
 
     if (m_vec.empty()) return;
@@ -1818,8 +1902,12 @@ void moe_grouped_gemm_gate_up_backward_impl(
     int intermediate_size,            // D (d_gate_up is 2*D)
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets           // Optional: pre-cached host offsets to avoid D2H sync
+    const int* host_offsets,          // Optional: pre-cached host offsets to avoid D2H sync
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
+    int n_active = (num_active_experts <= 0) ? num_experts : num_active_experts;
     std::vector<int> local_offsets;
     const int* h_offsets;
 
@@ -1846,18 +1934,19 @@ void moe_grouped_gemm_gate_up_backward_impl(
     std::vector<const T*> A_vec, B_vec;
     std::vector<T*> C_vec;
 
-    m_vec.reserve(num_experts);
-    n_vec.reserve(num_experts);
-    k_vec.reserve(num_experts);
-    lda_vec.reserve(num_experts);
-    ldb_vec.reserve(num_experts);
-    ldc_vec.reserve(num_experts);
-    A_vec.reserve(num_experts);
-    B_vec.reserve(num_experts);
-    C_vec.reserve(num_experts);
+    m_vec.reserve(n_active);
+    n_vec.reserve(n_active);
+    k_vec.reserve(n_active);
+    lda_vec.reserve(n_active);
+    ldb_vec.reserve(n_active);
+    ldc_vec.reserve(n_active);
+    A_vec.reserve(n_active);
+    B_vec.reserve(n_active);
+    C_vec.reserve(n_active);
 
-    for (int e = 0; e < num_experts; ++e) {
-        int tokens_e = h_offsets[e + 1] - h_offsets[e];
+    for (int e = 0; e < n_active; ++e) {
+        int global_idx = active_expert_indices ? active_expert_indices[e] : e;
+        int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
         if (tokens_e == 0) continue;
 
         m_vec.push_back(hidden_size);
@@ -1868,9 +1957,9 @@ void moe_grouped_gemm_gate_up_backward_impl(
         ldb_vec.push_back(gate_up_dim);
         ldc_vec.push_back(hidden_size);
 
-        A_vec.push_back(weights + e * gate_up_dim * hidden_size);
-        B_vec.push_back(d_gate_up + h_offsets[e] * gate_up_dim);
-        C_vec.push_back(d_input + h_offsets[e] * hidden_size);
+        A_vec.push_back(weights + (weight_is_compact ? e : global_idx) * gate_up_dim * hidden_size);
+        B_vec.push_back(d_gate_up + h_offsets[global_idx] * gate_up_dim);
+        C_vec.push_back(d_input + h_offsets[global_idx] * hidden_size);
     }
 
     if (m_vec.empty()) return;
@@ -1927,11 +2016,14 @@ void moe_grouped_gemm_down_backward(
     int intermediate_size,
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
     moe_grouped_gemm_down_backward_impl(d_input, d_output, weights, expert_offsets,
                                          num_experts, hidden_size, intermediate_size,
-                                         cublas_handle, stream, host_offsets);
+                                         cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 void moe_grouped_gemm_down_backward(
@@ -1944,11 +2036,14 @@ void moe_grouped_gemm_down_backward(
     int intermediate_size,
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
     moe_grouped_gemm_down_backward_impl(d_input, d_output, weights, expert_offsets,
                                          num_experts, hidden_size, intermediate_size,
-                                         cublas_handle, stream, host_offsets);
+                                         cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 void moe_grouped_gemm_gate_up_backward(
@@ -1961,11 +2056,14 @@ void moe_grouped_gemm_gate_up_backward(
     int intermediate_size,
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
     moe_grouped_gemm_gate_up_backward_impl(d_input, d_gate_up, weights, expert_offsets,
                                             num_experts, hidden_size, intermediate_size,
-                                            cublas_handle, stream, host_offsets);
+                                            cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 void moe_grouped_gemm_gate_up_backward(
@@ -1978,11 +2076,14 @@ void moe_grouped_gemm_gate_up_backward(
     int intermediate_size,
     cublasHandle_t cublas_handle,
     cudaStream_t stream,
-    const int* host_offsets
+    const int* host_offsets,
+    const int* active_expert_indices,
+    bool weight_is_compact,
+    int num_active_experts
 ) {
     moe_grouped_gemm_gate_up_backward_impl(d_input, d_gate_up, weights, expert_offsets,
                                             num_experts, hidden_size, intermediate_size,
-                                            cublas_handle, stream, host_offsets);
+                                            cublas_handle, stream, host_offsets, active_expert_indices, weight_is_compact, num_active_experts);
 }
 
 // ============================================================================

@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <iterator>
 #include <random>
