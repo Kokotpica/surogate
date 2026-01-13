@@ -51,6 +51,11 @@ public:
         bool tied_embeddings = true;
         int shard_idx = 0;
         int num_shards = 1;
+
+        /// When true, store MoE expert FP4 weights in pinned CPU memory instead of GPU.
+        /// Experts are streamed to GPU on-demand when selected by the router.
+        /// Saves ~10GB for 128-expert models, with ~20-40% throughput reduction.
+        bool offload_experts = false;
     };
 
     FP4WeightsManager(const Config& config, TensorAllocator& allocator,
@@ -99,6 +104,11 @@ public:
      * @brief Get number of experts (0 for dense models)
      */
     [[nodiscard]] int num_experts() const { return mConfig.qlora_config.num_experts; }
+
+    /**
+     * @brief Check if expert weights are offloaded to CPU
+     */
+    [[nodiscard]] bool experts_offloaded() const { return mConfig.offload_experts && is_moe(); }
 
     /**
      * @brief Get MoE block weights (for MoE models)
@@ -166,6 +176,13 @@ private:
     // Generic allocation helper for FP4 quantized weights
     void allocate_fp4_weight(FP4BlockQuantizedWeight& weight, int M, int K,
                              const std::string& name_prefix);
+    void allocate_fp4_weight(FP4BlockQuantizedWeight& weight, int M, int K,
+                             const std::string& name_prefix, EAllocationType alloc_type);
+
+    // Helper to get the allocation type for expert weights
+    [[nodiscard]] EAllocationType expert_alloc_type() const {
+        return mConfig.offload_experts ? EAllocationType::PINNED : EAllocationType::ON_DEVICE;
+    }
 };
 
 } // namespace modules

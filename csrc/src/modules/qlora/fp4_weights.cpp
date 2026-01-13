@@ -223,17 +223,59 @@ void FP4WeightsManager::import_and_quantize(const std::string& file_name,
     // Load embeddings (not quantized)
     load_embeddings(reader, stream);
 
-    // Load and quantize each transformer block
-    for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-        show_progress_bar(layer, mConfig.num_layers, "[FP4] Quantizing");
-        if (is_moe()) {
-            load_and_quantize_moe_block(layer, reader, stream);
-        } else {
-            load_and_quantize_block(layer, reader, stream);
-        }
+    // Load and quantize each transformer block using double-buffering for I/O overlap
+    // Allocate a second load buffer for ping-pong to allow CPU file I/O while GPU quantizes
+    Tensor load_buffer_2;
+    {
+        void* ptr = nullptr;
+        CUDA_CHECK(cudaMalloc(&ptr, mLoadBufferBytes));
+        load_buffer_2.Data = static_cast<std::byte*>(ptr);
+        load_buffer_2.DType = ETensorDType::BF16;
+        load_buffer_2.Rank = 1;
+        load_buffer_2.Sizes[0] = mLoadBuffer.Sizes[0];
+        std::fill(load_buffer_2.Sizes.begin() + 1, load_buffer_2.Sizes.end(), 1);
     }
 
-    // Sync before freeing load buffer
+    // Create two non-blocking streams for double-buffering
+    cudaStream_t stream_0, stream_1;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_0, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_1, cudaStreamNonBlocking));
+
+    for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+        show_progress_bar(layer, mConfig.num_layers, "[FP4] Quantizing");
+
+        const bool use_buffer_0 = (layer % 2 == 0);
+        cudaStream_t curr_stream = use_buffer_0 ? stream_0 : stream_1;
+
+        // Swap buffers for ping-pong
+        Tensor saved_load = mLoadBuffer;
+        if (!use_buffer_0) {
+            mLoadBuffer = load_buffer_2;
+        }
+
+        // Load and quantize on current stream (GPU work is async)
+        if (is_moe()) {
+            load_and_quantize_moe_block(layer, reader, curr_stream);
+        } else {
+            load_and_quantize_block(layer, reader, curr_stream);
+        }
+
+        // Restore buffer
+        mLoadBuffer = saved_load;
+    }
+
+    // Sync both streams
+    CUDA_CHECK(cudaStreamSynchronize(stream_0));
+    CUDA_CHECK(cudaStreamSynchronize(stream_1));
+    CUDA_CHECK(cudaStreamDestroy(stream_0));
+    CUDA_CHECK(cudaStreamDestroy(stream_1));
+
+    // Free second buffer
+    if (load_buffer_2.Data) {
+        CUDA_CHECK(cudaFree(load_buffer_2.Data));
+    }
+
+    // Sync original stream
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Free load buffer
@@ -521,21 +563,27 @@ float FP4WeightsManager::memory_savings_ratio() const {
 
 void FP4WeightsManager::allocate_fp4_weight(FP4BlockQuantizedWeight& weight, int M, int K,
                                              const std::string& name_prefix) {
+    // Default to ON_DEVICE allocation
+    allocate_fp4_weight(weight, M, K, name_prefix, EAllocationType::ON_DEVICE);
+}
+
+void FP4WeightsManager::allocate_fp4_weight(FP4BlockQuantizedWeight& weight, int M, int K,
+                                             const std::string& name_prefix, EAllocationType alloc_type) {
     weight.M = M;
     weight.K = K;
 
     // FP4 packed data: M * K / 2 bytes
     std::size_t packed_bytes = FP4BlockScaleConfig::packed_data_bytes(M, K);
     weight.data = mAllocator->allocate(ETensorDType::BYTE, (name_prefix + "_fp4").c_str(),
-                                       EAllocationType::ON_DEVICE, {(long)packed_bytes});
+                                       alloc_type, {(long)packed_bytes});
 
     // FP8 block scales with F8_128x4 alignment
     auto [scale_rows, scale_cols] = FP4BlockScaleConfig::scale_dims(M, K);
     weight.block_scales_rowwise = mAllocator->allocate(ETensorDType::FP8_E4M3, (name_prefix + "_scales").c_str(),
-                                                        EAllocationType::ON_DEVICE,
+                                                        alloc_type,
                                                         {(long)scale_rows, (long)scale_cols});
 
-    // Global amax
+    // Global amax - always on device (single float, not worth offloading)
     weight.global_amax_rowwise = allocate_global_amax();
 }
 
@@ -552,27 +600,31 @@ void FP4WeightsManager::allocate_moe_blocks() {
         ? mConfig.qlora_config.moe_intermediate_size
         : mConfig.intermediate_size;
 
+    // Determine allocation type for expert weights
+    // When offload_experts is enabled, store experts in pinned CPU memory
+    const EAllocationType exp_alloc = expert_alloc_type();
+
     mMoEBlocks.resize(num_layers);
 
     for (int layer = 0; layer < num_layers; ++layer) {
         auto& block = mMoEBlocks[layer];
 
-        // QKV projection
+        // QKV projection - always on GPU
         const int qkv_out = (num_q_heads + 2 * num_kv_heads) * head_size;
         allocate_fp4_weight(block.qkv_proj, qkv_out, hidden,
                             fmt::format("l{}_qkv", layer));
 
-        // Output projection
+        // Output projection - always on GPU
         allocate_fp4_weight(block.out_proj, hidden, num_q_heads * head_size,
                             fmt::format("l{}_out", layer));
 
-        // Layer norm weights (BF16, not quantized)
+        // Layer norm weights (BF16, not quantized) - always on GPU
         block.ln1_weight = mAllocator->allocate(ETensorDType::BF16, "ln1",
                                                  EAllocationType::ON_DEVICE, {(long)hidden});
         block.ln2_weight = mAllocator->allocate(ETensorDType::BF16, "ln2",
                                                  EAllocationType::ON_DEVICE, {(long)hidden});
 
-        // QK-norm weights (for models like Qwen3)
+        // QK-norm weights (for models like Qwen3) - always on GPU
         if (mConfig.use_qk_norm) {
             block.q_norm_weight = mAllocator->allocate(ETensorDType::BF16, "q_norm",
                                                         EAllocationType::ON_DEVICE, {(long)head_size});
@@ -580,30 +632,34 @@ void FP4WeightsManager::allocate_moe_blocks() {
                                                         EAllocationType::ON_DEVICE, {(long)head_size});
         }
 
-        // Router gate (BF16, not quantized - small tensor)
+        // Router gate (BF16, not quantized - small tensor) - always on GPU
         // NOTE: Shape matches HuggingFace (num_experts, hidden). `model_forward.hpp` uses matmul(TN)
         //       and expects router_gate as (num_experts, hidden) like other linear weights.
         block.router_gate = mAllocator->allocate(ETensorDType::BF16, "router_gate",
                                                  EAllocationType::ON_DEVICE,
                                                  {(long)n_experts, (long)hidden});
 
-        // Expert weights
+        // Expert weights - on GPU or CPU depending on offload setting
         block.experts.resize(n_experts);
         for (int e = 0; e < n_experts; ++e) {
             auto& expert = block.experts[e];
 
             // Gate+Up projection
             allocate_fp4_weight(expert.gate_up_proj, 2 * moe_intermediate, hidden,
-                                fmt::format("l{}_e{}_gate_up", layer, e));
+                                fmt::format("l{}_e{}_gate_up", layer, e), exp_alloc);
 
             // Down projection
             allocate_fp4_weight(expert.down_proj, hidden, moe_intermediate,
-                                fmt::format("l{}_e{}_down", layer, e));
+                                fmt::format("l{}_e{}_down", layer, e), exp_alloc);
         }
     }
 
     std::cerr << "[FP4-QLoRA] allocated " << num_layers << " MoE blocks with "
-              << n_experts << " experts each\n";
+              << n_experts << " experts each";
+    if (mConfig.offload_experts) {
+        std::cerr << " (experts offloaded to CPU)";
+    }
+    std::cerr << "\n";
 }
 
 void FP4WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsReader& reader,

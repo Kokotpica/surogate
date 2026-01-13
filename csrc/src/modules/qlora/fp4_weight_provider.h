@@ -16,6 +16,7 @@
 #include "kernels/kernels.h"
 #include "modules/composite/transformer_block.h"
 #include "modules/lora/lora_config.h"
+#include "modules/moe/moe_types.h"
 #include "modules/weights/weight_manager_types.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
@@ -62,6 +63,17 @@ public:
         bool tied_embeddings = true;
         int shard_idx = 0;
         int num_shards = 1;
+
+        /// Enable selective expert dequantization for MoE models.
+        /// When enabled, only the experts selected by the router are dequantized,
+        /// reducing memory usage from O(num_experts) to O(top_k) for dequant buffers.
+        bool selective_expert_dequant = true;
+
+        /// Offload MoE expert FP4 weights to CPU pinned memory.
+        /// When enabled, expert weights are stored in CPU memory and streamed to GPU
+        /// on-demand when selected by the router. Saves ~10GB for 128-expert models.
+        /// Implies selective_expert_dequant = true.
+        bool offload_experts = false;
     };
 
     FP4WeightProvider(const Config& config, TensorAllocator& allocator,
@@ -173,6 +185,46 @@ public:
     Tensor& get_router_gate(int layer_idx, cudaStream_t stream);
 
     /**
+     * @brief Dequantize only the selected experts (selective dequantization)
+     *
+     * This method dequantizes only the experts that were selected by the router,
+     * significantly reducing memory usage for MoE models with many experts.
+     *
+     * The dequantized weights are placed in a compact buffer indexed by
+     * selection_info.expert_to_compact mapping.
+     *
+     * @param layer_idx Layer index
+     * @param selection_info Information about which experts were selected
+     * @param stream CUDA stream for dequantization
+     */
+    void dequantize_selected_experts(int layer_idx, const SelectiveExpertInfo& selection_info,
+                                     cudaStream_t stream);
+
+    /**
+     * @brief Check if selective expert dequantization is enabled
+     */
+    [[nodiscard]] bool use_selective_dequant() const {
+        return mConfig.selective_expert_dequant && mConfig.qlora_config.is_moe();
+    }
+
+    /**
+     * @brief Get the current selection info (for backward pass)
+     *
+     * Returns the selection info cached from the last dequantize_selected_experts call.
+     * This is used in backward to match the compact indexing used in forward.
+     */
+    [[nodiscard]] const SelectiveExpertInfo& get_current_selection() const {
+        return mCurrentSelection;
+    }
+
+    /**
+     * @brief Get the maximum number of active experts for buffer sizing
+     */
+    [[nodiscard]] int max_active_experts() const {
+        return mNumMoEExperts;
+    }
+
+    /**
      * @brief Get memory stats
      */
     std::size_t quantized_weights_bytes() const {
@@ -232,9 +284,35 @@ private:
     /// Number of experts in MoE model
     int mNumMoEExperts = 0;
 
+    /// Current selection info for selective dequantization caching
+    SelectiveExpertInfo mCurrentSelection;
+
+    /// Number of experts currently in the compact buffers
+    int mNumActiveExperts = 0;
+
+    // =========================================================================
+    // Expert offloading support
+    // =========================================================================
+
+    /// GPU staging buffer for streaming FP4 expert data from CPU
+    /// Size: max(expert_gate_up_bytes, expert_down_bytes)
+    Tensor mExpertFP4Staging;
+
+    /// GPU staging buffer for FP8 block scales (for offloaded experts)
+    Tensor mExpertScalesStaging;
+
+    /// Whether expert weights are offloaded to CPU
+    bool mExpertsOffloaded = false;
+
     void allocate_dequant_buffers();
     void allocate_moe_expert_buffers();
+    void allocate_offload_staging_buffers();
     void setup_block_weights_structure();
+    void dequantize_fp4_weight(const FP4BlockQuantizedWeight& src, Tensor& dst, cudaStream_t stream);
+
+    /// Stream FP4 expert weight from CPU to GPU staging buffer, then dequantize
+    void stream_and_dequantize_expert(const FP4BlockQuantizedWeight& src, Tensor& dst,
+                                      cudaStream_t stream);
 };
 
 // ============================================================================
@@ -247,7 +325,13 @@ FP4WeightProvider<Block>::FP4WeightProvider(
     : mConfig(config)
     , mAllocator(&allocator)
     , mDeviceProps(device_props)  // Copy by value
+    , mExpertsOffloaded(config.offload_experts && config.qlora_config.is_moe())
 {
+    // If offload_experts is enabled, force selective_expert_dequant to true
+    if (mExpertsOffloaded && !mConfig.selective_expert_dequant) {
+        mConfig.selective_expert_dequant = true;
+    }
+
     // Create FP4 weights manager
     FP4WeightsManager::Config fp4_config{
         .num_layers = config.num_layers,
@@ -261,7 +345,8 @@ FP4WeightProvider<Block>::FP4WeightProvider(
         .use_qk_norm = config.use_qk_norm,
         .tied_embeddings = config.tied_embeddings,
         .shard_idx = config.shard_idx,
-        .num_shards = config.num_shards
+        .num_shards = config.num_shards,
+        .offload_experts = config.offload_experts
     };
     mFP4Weights = std::make_unique<FP4WeightsManager>(fp4_config, allocator, device_props);
 
@@ -271,6 +356,11 @@ FP4WeightProvider<Block>::FP4WeightProvider(
     // Allocate MoE expert buffers if needed
     if (mFP4Weights->is_moe()) {
         allocate_moe_expert_buffers();
+
+        // Allocate staging buffers for CPU -> GPU streaming if offloading is enabled
+        if (mExpertsOffloaded) {
+            allocate_offload_staging_buffers();
+        }
     }
 
     // Set up the block weights structure with pointers to dequant buffers
@@ -504,71 +594,55 @@ void FP4WeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
 
     if (!cache_hit) {
         // Dequantize attention weights
-        float qkv_scale = qblock.qkv_proj.global_decode_scale_rowwise();
-        dequantize_fp4_block(
-            mDequantQKV.get<nv_bfloat16>(),
-            qblock.qkv_proj.data.get<uint8_t>(),
-            qblock.qkv_proj.block_scales_rowwise.get<__nv_fp8_e4m3>(),
-            qkv_scale,
-            qblock.qkv_proj.M, qblock.qkv_proj.K,
-            mDeviceProps, stream);
+        dequantize_fp4_weight(qblock.qkv_proj, mDequantQKV, stream);
+        dequantize_fp4_weight(qblock.out_proj, mDequantOut, stream);
 
-        float out_scale = qblock.out_proj.global_decode_scale_rowwise();
-        dequantize_fp4_block(
-            mDequantOut.get<nv_bfloat16>(),
-            qblock.out_proj.data.get<uint8_t>(),
-            qblock.out_proj.block_scales_rowwise.get<__nv_fp8_e4m3>(),
-            out_scale,
-            qblock.out_proj.M, qblock.out_proj.K,
-            mDeviceProps, stream);
+        // When selective_expert_dequant is enabled AND LoRA is enabled, skip dequantizing
+        // all experts here. The LoRA forward hook will call dequantize_selected_experts()
+        // later with only the router-selected experts. This saves memory.
+        //
+        // IMPORTANT: When LoRA is disabled (lora: false), we MUST dequantize all experts here
+        // because the LoRA hook won't run and dequantize_selected_experts() won't be called.
+        const bool use_selective_path = mConfig.selective_expert_dequant && mConfig.lora_config.enabled();
 
-        // Dequantize ALL expert weights into batched buffers
-        // Each expert's weights are dequantized into a slice of the batched tensor
-        const int hidden = mConfig.hidden_size;
-        const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
-                              mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+        if (!use_selective_path) {
+            // Dequantize ALL expert weights into batched buffers
+            const int hidden = mConfig.hidden_size;
+            const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                                  mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
 
-        for (int e = 0; e < mNumMoEExperts; ++e) {
-            const auto& expert_weights = qblock.experts[e];
+            for (int e = 0; e < mNumMoEExperts; ++e) {
+                const auto& expert_weights = qblock.experts[e];
 
-            // Create slice views into the batched buffers for this expert
-            // gate_up_proj slice: offset by e * (2 * moe_inter * hidden) bytes
-            Tensor gate_up_slice = Tensor::from_pointer(
-                static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
-                    static_cast<size_t>(e) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
-                mBatchedExpertGateUp.Device,
-                ETensorDType::BF16,
-                std::array<long, 2>{2 * moe_inter, hidden}
-            );
+                // Create slice views into the batched buffers for this expert
+                Tensor gate_up_slice = Tensor::from_pointer(
+                    static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
+                        static_cast<size_t>(e) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+                    mBatchedExpertGateUp.Device,
+                    ETensorDType::BF16,
+                    std::array<long, 2>{2 * moe_inter, hidden}
+                );
 
-            // down_proj slice: offset by e * (hidden * moe_inter) bytes
-            Tensor down_slice = Tensor::from_pointer(
-                static_cast<std::byte*>(mBatchedExpertDown.Data) +
-                    static_cast<size_t>(e) * hidden * moe_inter * sizeof(nv_bfloat16),
-                mBatchedExpertDown.Device,
-                ETensorDType::BF16,
-                std::array<long, 2>{hidden, moe_inter}
-            );
+                Tensor down_slice = Tensor::from_pointer(
+                    static_cast<std::byte*>(mBatchedExpertDown.Data) +
+                        static_cast<size_t>(e) * hidden * moe_inter * sizeof(nv_bfloat16),
+                    mBatchedExpertDown.Device,
+                    ETensorDType::BF16,
+                    std::array<long, 2>{hidden, moe_inter}
+                );
 
-            // Dequantize this expert's weights into the slice
-            float gate_up_scale = expert_weights.gate_up_proj.global_decode_scale_rowwise();
-            dequantize_fp4_block(
-                gate_up_slice.get<nv_bfloat16>(),
-                expert_weights.gate_up_proj.data.get<uint8_t>(),
-                expert_weights.gate_up_proj.block_scales_rowwise.get<__nv_fp8_e4m3>(),
-                gate_up_scale,
-                expert_weights.gate_up_proj.M, expert_weights.gate_up_proj.K,
-                mDeviceProps, stream);
-
-            float down_scale = expert_weights.down_proj.global_decode_scale_rowwise();
-            dequantize_fp4_block(
-                down_slice.get<nv_bfloat16>(),
-                expert_weights.down_proj.data.get<uint8_t>(),
-                expert_weights.down_proj.block_scales_rowwise.get<__nv_fp8_e4m3>(),
-                down_scale,
-                expert_weights.down_proj.M, expert_weights.down_proj.K,
-                mDeviceProps, stream);
+                // Dequantize this expert's weights into the slice
+                // When experts are offloaded to CPU, we need to stream them to GPU first
+                if (mExpertsOffloaded) {
+                    stream_and_dequantize_expert(expert_weights.gate_up_proj, gate_up_slice, stream);
+                    stream_and_dequantize_expert(expert_weights.down_proj, down_slice, stream);
+                } else {
+                    dequantize_fp4_weight(expert_weights.gate_up_proj, gate_up_slice, stream);
+                    dequantize_fp4_weight(expert_weights.down_proj, down_slice, stream);
+                }
+            }
         }
+        // When selective mode is on, expert dequantization is deferred to dequantize_selected_experts()
 
         mCurrentLayer = layer_idx;
         mBufferVersion = mStepVersion;
@@ -589,6 +663,176 @@ void FP4WeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
             mDequantBlock.attention.q_norm_weight = qblock.q_norm_weight;
             mDequantBlock.attention.k_norm_weight = qblock.k_norm_weight;
         }
+    }
+}
+
+// ============================================================================
+// FP4-specific helper functions
+// ============================================================================
+
+template<typename Block>
+void FP4WeightProvider<Block>::dequantize_fp4_weight(const FP4BlockQuantizedWeight& src,
+                                                      Tensor& dst, cudaStream_t stream) {
+    float global_scale = src.global_decode_scale_rowwise();
+    dequantize_fp4_block(
+        dst.get<nv_bfloat16>(),
+        src.data.get<uint8_t>(),
+        src.block_scales_rowwise.get<__nv_fp8_e4m3>(),
+        global_scale,
+        src.M, src.K,
+        mDeviceProps, stream);
+}
+
+template<typename Block>
+void FP4WeightProvider<Block>::allocate_offload_staging_buffers() {
+    auto ctx = mAllocator->with_context("FP4_OffloadStaging");
+
+    const int hidden = mConfig.hidden_size;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+
+    // Calculate the maximum FP4 packed size for a single expert weight
+    // gate_up_proj: (2 * moe_inter, hidden) -> (2 * moe_inter * hidden) / 2 bytes
+    // down_proj: (hidden, moe_inter) -> (hidden * moe_inter) / 2 bytes
+    const long gate_up_elems = 2L * moe_inter * hidden;
+    const long down_elems = static_cast<long>(hidden) * moe_inter;
+    const long max_elems = std::max(gate_up_elems, down_elems);
+    const long max_packed_bytes = FP4BlockScaleConfig::packed_data_bytes(
+        std::max(2 * moe_inter, hidden),
+        std::max(hidden, moe_inter));
+
+    // Allocate staging buffer for FP4 packed data
+    mExpertFP4Staging = mAllocator->allocate(ETensorDType::BYTE, "expert_fp4_staging",
+                                              EAllocationType::ON_DEVICE, {max_packed_bytes});
+
+    // Calculate max scale tensor size
+    // FP4 uses FP8 E4M3 block scales with F8_128x4 alignment
+    auto [gate_up_scale_rows, gate_up_scale_cols] = FP4BlockScaleConfig::scale_dims(2 * moe_inter, hidden);
+    auto [down_scale_rows, down_scale_cols] = FP4BlockScaleConfig::scale_dims(hidden, moe_inter);
+    const long max_scale_elems = std::max(
+        static_cast<long>(gate_up_scale_rows) * gate_up_scale_cols,
+        static_cast<long>(down_scale_rows) * down_scale_cols);
+
+    mExpertScalesStaging = mAllocator->allocate(ETensorDType::FP8_E4M3, "expert_scales_staging",
+                                                 EAllocationType::ON_DEVICE, {max_scale_elems});
+}
+
+template<typename Block>
+void FP4WeightProvider<Block>::stream_and_dequantize_expert(
+    const FP4BlockQuantizedWeight& src, Tensor& dst, cudaStream_t stream)
+{
+    // This method handles CPU-offloaded FP4 experts:
+    // 1. Copy FP4 packed data from pinned CPU memory to GPU staging buffer
+    // 2. Copy FP8 block scales from CPU to GPU staging buffer
+    // 3. Dequantize from GPU staging buffer to destination
+
+    // Step 1: Copy FP4 packed data (HOST -> DEVICE)
+    const size_t data_bytes = FP4BlockScaleConfig::packed_data_bytes(src.M, src.K);
+    cudaMemcpyAsync(mExpertFP4Staging.Data, src.data.Data,
+                    data_bytes, cudaMemcpyHostToDevice, stream);
+
+    // Step 2: Copy FP8 block scales
+    auto [scale_rows, scale_cols] = FP4BlockScaleConfig::scale_dims(src.M, src.K);
+    const size_t scale_bytes = static_cast<size_t>(scale_rows) * scale_cols * sizeof(__nv_fp8_e4m3);
+    cudaMemcpyAsync(mExpertScalesStaging.Data, src.block_scales_rowwise.Data,
+                    scale_bytes, cudaMemcpyHostToDevice, stream);
+
+    // Step 3: Dequantize from staging buffers to destination
+    float global_scale = src.global_decode_scale_rowwise();
+    dequantize_fp4_block(
+        dst.get<nv_bfloat16>(),
+        mExpertFP4Staging.get<uint8_t>(),
+        mExpertScalesStaging.get<__nv_fp8_e4m3>(),
+        global_scale,
+        src.M, src.K,
+        mDeviceProps, stream);
+}
+
+template<typename Block>
+void FP4WeightProvider<Block>::dequantize_selected_experts(
+    int layer_idx, const SelectiveExpertInfo& selection_info, cudaStream_t stream)
+{
+    if (!selection_info.enabled || selection_info.num_active == 0) {
+        return;
+    }
+
+    const auto& qblock = mFP4Weights->get_moe_block(layer_idx);
+    const int hidden = mConfig.hidden_size;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+
+    // Check if we can reuse the current buffers
+    const bool same_layer_step = (mCurrentLayer == layer_idx) && (mBufferVersion == mStepVersion);
+
+    bool selection_matches = same_layer_step && mCurrentSelection.enabled &&
+                             mCurrentSelection.num_active == selection_info.num_active;
+    if (selection_matches) {
+        for (int i = 0; i < selection_info.num_active && selection_matches; ++i) {
+            if (mCurrentSelection.active_experts[i] != selection_info.active_experts[i]) {
+                selection_matches = false;
+            }
+        }
+    }
+
+    if (selection_matches) {
+        // Cache hit - buffers already contain the right experts
+        return;
+    }
+
+    // Dequantize selected experts into COMPACT index positions in the buffer
+    const int num_to_dequant = selection_info.num_active;
+
+    for (int i = 0; i < num_to_dequant; ++i) {
+        const int global_expert_idx = selection_info.active_experts[i];
+        const auto& expert_weights = qblock.experts[global_expert_idx];
+
+        // Create slice views at the COMPACT index position (i, not global_expert_idx)
+        Tensor gate_up_slice = Tensor::from_pointer(
+            static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
+                static_cast<size_t>(i) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+            mBatchedExpertGateUp.Device,
+            ETensorDType::BF16,
+            std::array<long, 2>{2 * moe_inter, hidden}
+        );
+
+        Tensor down_slice = Tensor::from_pointer(
+            static_cast<std::byte*>(mBatchedExpertDown.Data) +
+                static_cast<size_t>(i) * hidden * moe_inter * sizeof(nv_bfloat16),
+            mBatchedExpertDown.Device,
+            ETensorDType::BF16,
+            std::array<long, 2>{hidden, moe_inter}
+        );
+
+        // Dequantize this expert's weights into the buffer slice
+        if (mExpertsOffloaded) {
+            stream_and_dequantize_expert(expert_weights.gate_up_proj, gate_up_slice, stream);
+            stream_and_dequantize_expert(expert_weights.down_proj, down_slice, stream);
+        } else {
+            dequantize_fp4_weight(expert_weights.gate_up_proj, gate_up_slice, stream);
+            dequantize_fp4_weight(expert_weights.down_proj, down_slice, stream);
+        }
+    }
+
+    // Update cache state
+    mCurrentSelection = selection_info;
+    mNumActiveExperts = num_to_dequant;
+
+    // Update the expert weights tensor shapes (compact indexing)
+    if constexpr (has_moe_weights<BlockWeights>::value) {
+        mDequantBlock.experts.gate_up_proj = Tensor::from_pointer(
+            mBatchedExpertGateUp.Data,
+            mBatchedExpertGateUp.Device,
+            ETensorDType::BF16,
+            std::array<long, 3>{(long)num_to_dequant, (long)(2 * moe_inter), (long)hidden}
+        );
+        mDequantBlock.experts.down_proj = Tensor::from_pointer(
+            mBatchedExpertDown.Data,
+            mBatchedExpertDown.Device,
+            ETensorDType::BF16,
+            std::array<long, 3>{(long)num_to_dequant, (long)hidden, (long)moe_inter}
+        );
+        mDequantBlock.experts.use_batched = true;
+        mDequantBlock.experts.num_active_experts = num_to_dequant;
     }
 }
 

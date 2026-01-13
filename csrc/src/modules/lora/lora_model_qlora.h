@@ -92,6 +92,8 @@ void ModularLoRAModel<Block>::import_weights_fp4_qlora(const std::string& file_n
     fp4_config.tied_embeddings = cfg.TiedWordEmbeddings;
     fp4_config.shard_idx = comm.rank();
     fp4_config.num_shards = comm.world_size();
+    fp4_config.selective_expert_dequant = mOptions.SelectiveExpertDequant;
+    fp4_config.offload_experts = mOptions.OffloadExperts;
 
     mFP4WeightProvider = std::make_unique<FP4WeightProvider<Block>>(fp4_config, *mAllocator, device_props);
     mFP4WeightProvider->import_and_quantize(file_name, comm, quant_stream);
