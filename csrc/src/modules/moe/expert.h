@@ -364,6 +364,11 @@ public:
         Tensor down_proj;     ///< (num_experts, intermediate_size, hidden_size)
 
         bool use_batched = false;  ///< Which layout to use
+
+        /// Number of active experts in the batched tensors (for selective dequantization)
+        /// When selective_expert_dequant is enabled, this may be less than num_experts.
+        /// The expert_to_compact mapping in SelectiveExpertInfo provides the index translation.
+        int num_active_experts = 0;
     };
 
     /**

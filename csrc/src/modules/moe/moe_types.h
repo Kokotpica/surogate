@@ -7,7 +7,15 @@
 
 #include "utilities/tensor.h"
 
+#include <algorithm>
+#include <set>
+#include <vector>
+#include <cuda_runtime.h>
+
 namespace modules {
+
+// Forward declaration for MoEGroupedContext
+struct SelectiveExpertInfo;
 
 /**
  * @brief Context for MoE expert group computation
@@ -21,6 +29,7 @@ struct MoEGroupedContext {
     const Tensor* permuted_input;    ///< (total_tokens, C)
     const Tensor* expert_gate_up;    ///< (total_tokens, 2*D) output of base projection (Saved for backward)
     const Tensor* expert_outputs;    ///< (total_tokens, C) output of base down projection
+    const Tensor* expert_indices;    ///< (BT, top_k) int - router-selected expert indices for each token
 
     // Gradient tensors (during backward)
     const Tensor* d_expert_outputs;  ///< (total_tokens, C) gradient w.r.t expert outputs
@@ -32,9 +41,116 @@ struct MoEGroupedContext {
     int top_k;
     int total_tokens;
 
+    // For selective expert dequantization - hook can populate this
+    SelectiveExpertInfo* selection_info = nullptr;  ///< Filled by hook for index remapping
+
     // Optional: flag to indicate if the hook handled the computation
     bool handled = false;
 };
+
+/**
+ * @brief Selection info for selective expert dequantization
+ *
+ * When using selective expert dequantization, only the experts that are
+ * actually selected by the router are dequantized. This struct holds the
+ * information needed to map between global expert indices and compact
+ * buffer indices.
+ */
+struct SelectiveExpertInfo {
+    /// Unique expert indices that were selected across all tokens (sorted, deduplicated)
+    /// Size: num_active_experts (typically much smaller than total experts)
+    std::vector<int> active_experts;
+
+    /// Maps global expert index -> compact buffer index (-1 if not active)
+    /// Size: num_total_experts
+    std::vector<int> expert_to_compact;
+
+    /// Number of unique experts selected (active_experts.size())
+    int num_active = 0;
+
+    /// Total number of experts in the model
+    int num_total = 0;
+
+    /// Whether selective dequantization is enabled
+    bool enabled = false;
+
+    /**
+     * @brief Build the selection info from router output
+     *
+     * @param expert_indices Device tensor (BT, top_k) of selected expert indices
+     * @param num_experts Total number of experts in the model
+     * @param stream CUDA stream for D2H copy
+     */
+    void build_from_router_output(const Tensor& expert_indices, int num_experts, cudaStream_t stream);
+
+    /**
+     * @brief Get the compact index for a global expert index
+     * @return Compact index, or -1 if expert is not active
+     */
+    int get_compact_index(int global_expert_idx) const {
+        if (!enabled || global_expert_idx < 0 || global_expert_idx >= num_total) {
+            return -1;
+        }
+        return expert_to_compact[global_expert_idx];
+    }
+
+    /**
+     * @brief Check if an expert is active (selected by router)
+     */
+    bool is_active(int global_expert_idx) const {
+        return get_compact_index(global_expert_idx) >= 0;
+    }
+
+    /**
+     * @brief Reset to disabled state
+     */
+    void reset() {
+        active_experts.clear();
+        expert_to_compact.clear();
+        num_active = 0;
+        num_total = 0;
+        enabled = false;
+    }
+};
+
+// ============================================================================
+// Inline Implementation
+// ============================================================================
+
+inline void SelectiveExpertInfo::build_from_router_output(
+    const Tensor& expert_indices, int num_experts, cudaStream_t stream)
+{
+    // Get dimensions
+    const int BT = expert_indices.Sizes[0];
+    const int top_k = expert_indices.Sizes[1];
+    const int total_selections = BT * top_k;
+
+    // Copy expert indices from device to host
+    std::vector<int> host_indices(total_selections);
+    cudaMemcpyAsync(host_indices.data(), expert_indices.get<int>(),
+                    total_selections * sizeof(int),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    // Find unique experts using a set
+    std::set<int> unique_set(host_indices.begin(), host_indices.end());
+
+    // Build the active experts list (sorted)
+    active_experts.assign(unique_set.begin(), unique_set.end());
+    num_active = static_cast<int>(active_experts.size());
+    num_total = num_experts;
+
+    // Build the reverse mapping: global expert index -> compact index
+    expert_to_compact.assign(num_experts, -1);
+    for (int compact_idx = 0; compact_idx < num_active; ++compact_idx) {
+        int global_idx = active_experts[compact_idx];
+        if (global_idx >= 0 && global_idx < num_experts) {
+            expert_to_compact[global_idx] = compact_idx;
+        }
+    }
+
+    enabled = true;
+}
 
 } // namespace modules
 

@@ -163,13 +163,8 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
         // Permuted tokens: B * T * top_k * hidden_size * 2 bytes (x2 for input and output)
         long permuted_tokens = 2L * B * T * mConfig.NumExpertsPerTok * mConfig.HiddenSize * 2;
         moe_extra = expert_gate_up_tp + expert_down_tp + permuted_tokens;
-        fprintf(stderr, "[RunState] MoE stack extra: gate_up_tp=%ld MB, down_tp=%ld MB, permuted=%ld MB, total=%ld MB\n",
-                expert_gate_up_tp / (1024*1024), expert_down_tp / (1024*1024),
-                permuted_tokens / (1024*1024), moe_extra / (1024*1024));
     }
     long required_size = std::max(1024L * 1024, base_size + base_size / 2 + moe_extra);
-    fprintf(stderr, "[RunState] Stack: base=%ld MB, moe_extra=%ld MB, required=%ld MB\n",
-            base_size / (1024*1024), moe_extra / (1024*1024), required_size / (1024*1024));
     auto high_mark = mRunState->Stack.get_high_mark();
 
     // Allocate real stack and replace the dummy.

@@ -35,6 +35,8 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
         const int T = (int)rs.T;
         const int C = (int)cfg.HiddenSize;
         const int D = (int)cfg.IntermediateSize;
+        // For MoE models, experts have a different intermediate size
+        const int moe_D = (cfg.moe_config && cfg.moe_config->moe_intermediate_size > 0) ? cfg.moe_config->moe_intermediate_size : D;
         const int Hq = (int)cfg.NumQueryHeads;
         const int Hkv = (int)cfg.NumKeyValHeads;
         const int Hs = (int)cfg.head_size();
@@ -48,11 +50,32 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
             case ForwardHookPoint::MoEExpertGroupManual: {
                if (lora_block.moe.use_grouped && lora_block.moe.has_any() && context) {
                     auto* moe_ctx = static_cast<MoEGroupedContext*>(context);
+
+                    // Selective expert dequantization: only dequantize router-selected experts
+                    // This saves ~1.1GB of dequant buffer memory for 128-expert MoE models
+                    SelectiveExpertInfo selection_info;
+                    if (mBnBWeightProvider && mBnBWeightProvider->use_selective_dequant() && moe_ctx->expert_indices) {
+                        selection_info.build_from_router_output(*moe_ctx->expert_indices, moe_ctx->num_experts, stream);
+                        mBnBWeightProvider->dequantize_selected_experts(layer_idx, selection_info, stream);
+                        moe_ctx->selection_info = &selection_info;
+                    }
+
                     auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
 
                     using WeightsType = std::remove_reference_t<decltype(base_weights)>;
                     if constexpr (has_experts<WeightsType>::value) {
                         if (base_weights.experts.use_batched) {
+                            // When using selective dequant with global indexing, we must still
+                            // iterate over ALL experts. The GEMM will skip experts with 0 tokens,
+                            // but we need to use global expert indices to match the weight buffer layout.
+                            // The weights are dequantized at global positions, so num_experts must
+                            // always be the full count (not the active count).
+                            const int gemm_num_experts = moe_ctx->num_experts;
+
+                            // DEBUG: Disabled for now
+                            // static int fwd_hook_calls = 0;
+                            // if (fwd_hook_calls < 3) { ... }
+
                             detail::grouped_fast_expert_lora_forward(
                                 const_cast<Tensor&>(*moe_ctx->expert_outputs),
                                 *moe_ctx->permuted_input,
@@ -63,13 +86,14 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                                 mLoRARunState->moe_lora_up,     // contiguous buffer for up output
                                 *moe_ctx->expert_offsets,
                                 scaling,
-                                moe_ctx->num_experts, C, D, rank,
+                                gemm_num_experts, C, moe_D, rank,
                                 mLoRARunState->moe_lora_intermediate1,
                                 mLoRARunState->moe_lora_intermediate2,
                                 mLoRARunState->moe_lora_gate_up,
                                 rs.CublasHandle,
                                 stream,
-                                moe_ctx->host_offsets
+                                moe_ctx->host_offsets,
+                                selection_info.enabled ? &selection_info : nullptr
                             );
                             moe_ctx->handled = true;
                         }
@@ -147,6 +171,8 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
         const int T = (int)rs.T;
         const int C = (int)cfg.HiddenSize;
         const int D = (int)cfg.IntermediateSize;
+        // For MoE models, experts have a different intermediate size
+        const int moe_D = (cfg.moe_config && cfg.moe_config->moe_intermediate_size > 0) ? cfg.moe_config->moe_intermediate_size : D;
         const int Hq = (int)cfg.NumQueryHeads;
         const int Hkv = (int)cfg.NumKeyValHeads;
         const int Hs = (int)cfg.head_size();
@@ -160,11 +186,24 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
             case ForwardHookPoint::MoEExpertGroupManual: {
                 if (lora_block.moe.use_grouped && lora_block.moe.has_any() && context) {
                     auto* moe_ctx = static_cast<MoEGroupedContext*>(context);
+
+                    // Selective expert dequantization: only dequantize router-selected experts
+                    SelectiveExpertInfo selection_info;
+                    if (mBnBWeightProvider && mBnBWeightProvider->use_selective_dequant() && moe_ctx->expert_indices) {
+                        selection_info.build_from_router_output(*moe_ctx->expert_indices, moe_ctx->num_experts, stream);
+                        mBnBWeightProvider->dequantize_selected_experts(layer_idx, selection_info, stream);
+                        moe_ctx->selection_info = &selection_info;
+                    }
+
                     auto& base_weights = mBaseModel->weights_manager().get_block(layer_idx, stream);
 
                     using WeightsType = std::remove_reference_t<decltype(base_weights)>;
                     if constexpr (has_experts<WeightsType>::value) {
                         if (base_weights.experts.use_batched) {
+                            // When using selective dequant with global indexing, we must still
+                            // iterate over ALL experts. The GEMM will skip experts with 0 tokens.
+                            const int gemm_num_experts = moe_ctx->num_experts;
+
                             detail::grouped_fast_expert_lora_forward(
                                 const_cast<Tensor&>(*moe_ctx->expert_outputs),
                                 *moe_ctx->permuted_input,
@@ -175,13 +214,14 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
                                 mLoRARunState->moe_lora_up,     // contiguous buffer for up output
                                 *moe_ctx->expert_offsets,
                                 scaling,
-                                moe_ctx->num_experts, C, D, rank,
+                                gemm_num_experts, C, moe_D, rank,
                                 mLoRARunState->moe_lora_intermediate1,
                                 mLoRARunState->moe_lora_intermediate2,
                                 mLoRARunState->moe_lora_gate_up,
                                 rs.CublasHandle,
                                 stream,
-                                moe_ctx->host_offsets
+                                moe_ctx->host_offsets,
+                                selection_info.enabled ? &selection_info : nullptr
                             );
                             moe_ctx->handled = true;
                         }

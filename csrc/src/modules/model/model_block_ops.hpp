@@ -1008,9 +1008,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
                 const int* host_offsets = rs.MoeHostOffsetsValid ? rs.MoeHostExpertOffsets.data() : nullptr;
 
                 Tensor d_expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
-                Tensor expert_swiglu{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
                 rs.temp_acquire(d_expert_swiglu);
-                rs.temp_acquire(expert_swiglu);
 
                 // Backward through down projection for all experts
                 // d_expert_swiglu = d_expert_outputs @ down_proj (no transpose)
@@ -1034,10 +1032,37 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
                     );
                 }
 
-                // Backward through SwiGLU activation for all tokens
-                swiglu_backward(d_expert_gate_up, d_expert_swiglu, expert_gate_up, nullptr, 1, total_expert_tokens, expert_D, stream);
+                // Backward through SwiGLU activation
+                // BnB weight loading stores MoE expert weights as [up | gate] per row:
+                //   - up_proj in first half (rows 0 to D-1)
+                //   - gate_proj in second half (rows D to 2D-1)
+                // Forward was: h = silu(gate) * up
+                // split_gate_up: first output gets cols [0,D), second gets cols [D,2D)
+                // So: expert_up = first half = up, expert_gate = second half = gate
+                Tensor expert_up{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                Tensor expert_gate{a.ln2.DType, {total_expert_tokens, expert_D}, nullptr, nullptr, 2, dev};
+                rs.temp_acquire(expert_up);
+                rs.temp_acquire(expert_gate);
 
-                rs.temp_free(expert_swiglu);
+                // expert_up = first half = up weights, expert_gate = second half = gate weights
+                split_gate_up(expert_gate_up, expert_up, expert_gate, total_expert_tokens, expert_D, stream);
+
+                // silu_mul_backward_inplace: forward was h = silu(gate) * up
+                // silu_mul_backward_inplace(e, g, dh, h) expects e=what silu was applied to (gate), g=what was multiplied (up)
+                // After this: expert_gate = d_gate, expert_up = d_up
+                Tensor expert_h;
+                expert_h.Data = d_expert_gate_up.Data;  // Reuse d_expert_gate_up buffer for h
+                expert_h.DType = a.ln2.DType;
+                expert_h.Sizes = {total_expert_tokens, expert_D};
+                silu_mul_backward_inplace(expert_gate, expert_up, d_expert_swiglu, &expert_h, total_expert_tokens, expert_D, stream);
+
+                // Concatenate gradients: need [d_up | d_gate] to match BnB layout [up | gate]
+                // concat_d_gate_up puts first arg at cols [0,D), second at cols [D,2D)
+                // So: first = d_up (expert_up), second = d_gate (expert_gate)
+                concat_d_gate_up(expert_up, expert_gate, d_expert_gate_up, total_expert_tokens, expert_D, stream);
+
+                rs.temp_free(expert_up);
+                rs.temp_free(expert_gate);
                 rs.temp_free(d_expert_swiglu);
 
                 // Backward through gate+up projection for all experts

@@ -33,18 +33,6 @@ ModularLoRAModel<Block>::ModularLoRAModel(std::unique_ptr<ModularTransformerMode
     // Check if this is an MoE model - per-expert LoRA is used instead of MLP LoRA
     mIsMoEModel = (cfg.architecture == ArchitectureType::MoE);
 
-    // DEBUG: Print MoE detection info
-    fprintf(stderr, "[LoRA DEBUG] Architecture type: %d (Dense=0, MoE=1, Hybrid=2)\n",
-            static_cast<int>(cfg.architecture));
-    fprintf(stderr, "[LoRA DEBUG] mIsMoEModel: %s\n", mIsMoEModel ? "true" : "false");
-    fprintf(stderr, "[LoRA DEBUG] moe_config.has_value(): %s\n",
-            cfg.moe_config.has_value() ? "true" : "false");
-    if (cfg.moe_config.has_value()) {
-        fprintf(stderr, "[LoRA DEBUG] moe_config.num_experts: %d\n", cfg.moe_config->num_experts);
-        fprintf(stderr, "[LoRA DEBUG] moe_config.top_k: %d\n", cfg.moe_config->top_k);
-        fprintf(stderr, "[LoRA DEBUG] moe_config.moe_intermediate_size: %d\n", cfg.moe_config->moe_intermediate_size);
-    }
-
     ModularLoRAWeightsManager::Config wm{};
     wm.num_layers = cfg.NumLayers;
     wm.hidden_size = cfg.HiddenSize;
@@ -65,14 +53,6 @@ ModularLoRAModel<Block>::ModularLoRAModel(std::unique_ptr<ModularTransformerMode
     }
     mLoRAWeights = std::make_unique<ModularLoRAWeightsManager>(wm, *mAllocator);
 
-    // Debug: print memory after LoRA weights allocation
-    {
-        size_t free_mem = 0, total_mem = 0;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        fprintf(stderr, "[LoRA] After weights alloc - CUDA memory: %zu MB used, %zu MB free\n",
-                (total_mem - free_mem) / 1024 / 1024, free_mem / 1024 / 1024);
-    }
-
     ModularLoRAGradsManager::Config gm{};
     gm.num_layers = cfg.NumLayers;
     gm.hidden_size = cfg.HiddenSize;
@@ -92,14 +72,6 @@ ModularLoRAModel<Block>::ModularLoRAModel(std::unique_ptr<ModularTransformerMode
                                     : cfg.IntermediateSize;
     }
     mLoRAGrads = std::make_unique<ModularLoRAGradsManager>(gm, mAllocator);
-
-    // Debug: print memory after LoRA grads allocation
-    {
-        size_t free_mem = 0, total_mem = 0;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        fprintf(stderr, "[LoRA] After grads alloc - CUDA memory: %zu MB used, %zu MB free\n",
-                (total_mem - free_mem) / 1024 / 1024, free_mem / 1024 / 1024);
-    }
 }
 
 template<typename Block>
@@ -126,25 +98,7 @@ void ModularLoRAModel<Block>::allocate_run_state(const RuntimeOptions& options, 
     // Use the ModelOptions overload to apply LoRA-specific flags
     mBaseModel->allocate_run_state(model_opts, comm, B, T, /*allocate_optimizer=*/false);
 
-    // Debug: print memory after base model run state allocation
-    {
-        size_t free_mem = 0, total_mem = 0;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        fprintf(stderr, "[LoRA] After base run_state alloc - CUDA memory: %zu MB used, %zu MB free\n",
-                (total_mem - free_mem) / 1024 / 1024, free_mem / 1024 / 1024);
-        fprintf(stderr, "[LoRA] Allocator stats after base run_state:\n");
-        mAllocator->print_stats();
-    }
-
     allocate_lora_run_state(comm, B, T);
-
-    // Debug: print memory after LoRA run state allocation
-    {
-        size_t free_mem = 0, total_mem = 0;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        fprintf(stderr, "[LoRA] After lora run_state alloc - CUDA memory: %zu MB used, %zu MB free\n",
-                (total_mem - free_mem) / 1024 / 1024, free_mem / 1024 / 1024);
-    }
 
     // Allocate 8-bit AdamW optimizer state for LoRA
     if (lora_enabled() && !mLoRAAdamW8BitState) {
@@ -224,10 +178,6 @@ void ModularLoRAModel<Block>::allocate_lora_run_state(NCCLCommunicator& comm, in
         const int total_tokens = BT * top_k;
         const int expert_D = moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : (int)cfg.IntermediateSize;
 
-        // DEBUG: Print MoE buffer allocation info
-        fprintf(stderr, "[LoRA DEBUG] Allocating MoE buffers: top_k=%d, total_tokens=%d, expert_D=%d, rank=%d\n",
-                top_k, total_tokens, expert_D, rank);
-
         mLoRARunState->moe_lora_intermediate1 = mAllocator->allocate(
             moe_work_dtype, "moe_lora_intermediate1", EAllocationType::ON_DEVICE, {total_tokens, rank});
         mLoRARunState->moe_lora_intermediate2 = mAllocator->allocate(
@@ -239,20 +189,6 @@ void ModularLoRAModel<Block>::allocate_lora_run_state(NCCLCommunicator& comm, in
             moe_work_dtype, "moe_lora_up", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
         mLoRARunState->moe_lora_gate_up = mAllocator->allocate(
             moe_work_dtype, "moe_lora_gate_up", EAllocationType::ON_DEVICE, {total_tokens, 2 * expert_D});
-
-        // DEBUG: Verify buffer allocation
-        fprintf(stderr, "[LoRA DEBUG] MoE buffers allocated:\n");
-        fprintf(stderr, "  moe_lora_gate: ptr=%p, size=[%ld, %ld]\n",
-                mLoRARunState->moe_lora_gate.Data,
-                mLoRARunState->moe_lora_gate.Sizes[0], mLoRARunState->moe_lora_gate.Sizes[1]);
-        fprintf(stderr, "  moe_lora_up: ptr=%p, size=[%ld, %ld]\n",
-                mLoRARunState->moe_lora_up.Data,
-                mLoRARunState->moe_lora_up.Sizes[0], mLoRARunState->moe_lora_up.Sizes[1]);
-        fprintf(stderr, "  moe_lora_gate_up: ptr=%p, size=[%ld, %ld]\n",
-                mLoRARunState->moe_lora_gate_up.Data,
-                mLoRARunState->moe_lora_gate_up.Sizes[0], mLoRARunState->moe_lora_gate_up.Sizes[1]);
-    } else {
-        fprintf(stderr, "[LoRA DEBUG] NOT allocating MoE buffers (mIsMoEModel=false)\n");
     }
 }
 

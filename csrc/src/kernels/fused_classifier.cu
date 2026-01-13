@@ -267,7 +267,9 @@ __global__ void __launch_bounds__(1024, 1)
 
     // calculate the probability needed for the loss and update (single-threaded)
     if(threadIdx.x == 0) {
-        float prob = expf((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
+        float logit_val = (float)logits[idx * P + ix];
+        float prob = expf(logit_val - sp.Offset) * sp.Scale;
+        float loss_contrib = -logf(prob);
         losses[idx] -= logf(prob);
     }
 

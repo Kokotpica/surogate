@@ -523,10 +523,11 @@ void FP8WeightsManager::allocate_moe_block(int layer_idx) {
     }
 
     // Router gate (BF16, not quantized - small tensor)
-    // NOTE: Allocated as (hidden_size, num_experts) for matmul with TN transpose
+    // NOTE: Shape matches HuggingFace (num_experts, hidden). `model_forward.hpp` uses matmul(TN)
+    //       and expects router_gate as (num_experts, hidden) like other linear weights.
     block.router_gate = mAllocator->allocate(ETensorDType::BF16, "router_gate",
-                                              EAllocationType::ON_DEVICE,
-                                              {(long)hidden, (long)n_experts});
+                                             EAllocationType::ON_DEVICE,
+                                             {(long)n_experts, (long)hidden});
 
     // Expert weights
     block.experts.resize(n_experts);
@@ -639,18 +640,9 @@ void FP8WeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     // =========================================================================
     // Router gate (BF16, not quantized)
     // =========================================================================
-    // Model stores as (num_experts, hidden), we need (hidden, num_experts) for TN matmul
+    // Model stores as (num_experts, hidden) and our matmul(TN) expects the same layout.
     if (const auto* entry = find_entry_opt(reader, prefix + ".mlp.gate.weight")) {
-        // Load into temporary buffer with correct shape
-        mLoadBuffer.Sizes[0] = n_experts;
-        mLoadBuffer.Sizes[1] = hidden;
-        mLoadBuffer.Rank = 2;
-        entry->read_tensor(mLoadBuffer, true);
-
-        // Transpose: (n_experts, hidden) -> (hidden, n_experts)
-        transpose(block.router_gate.get<nv_bfloat16>(),
-                  mLoadBuffer.get<nv_bfloat16>(),
-                  n_experts, hidden, stream);
+        entry->read_tensor(block.router_gate, /*allow_cast=*/true);
     } else {
         std::cerr << "[FP8 WARN] layer " << layer_idx << " router gate not found: "
                   << prefix << ".mlp.gate.weight - this will cause NaN!\n";

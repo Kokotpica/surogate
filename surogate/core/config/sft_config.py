@@ -234,6 +234,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         qlora_four_over_six: (Optional[bool], defaults to True):
             Enable Four Over Six (4/6) adaptive block scaling for NVFP4 QLoRA quantization.
             Evaluates both max=4 and max=6 scaling per block and selects lower error option.
+        qlora_selective_expert_dequant: (Optional[bool], defaults to True):
+            Enable selective expert dequantization for MoE models. When enabled, only the experts
+            selected by the router are dequantized, reducing memory usage from O(num_experts)
+            to O(top_k) for dequantization buffers. Significant memory savings for models with
+            many experts (e.g., 128 experts with top_k=8 saves ~93% of dequant buffer memory).
 
         use_chat_template (Optional[bool], defaults to True):
             Whether to use chat template for training.
@@ -341,6 +346,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     qlora_bnb_block_size: Optional[int] = 64
     qlora_bnb_double_quant: Optional[bool] = True
     qlora_four_over_six: Optional[bool] = True
+    qlora_selective_expert_dequant: Optional[bool] = False
+    qlora_offload_experts: Optional[bool] = False
 
     merge_adapter: Optional[bool] = False
     use_chat_template: Optional[bool] = True
@@ -440,6 +447,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.qlora_bnb_block_size = cfg.get('qlora_bnb_block_size', self.qlora_bnb_block_size)
         self.qlora_bnb_double_quant = cfg.get('qlora_bnb_double_quant', self.qlora_bnb_double_quant)
         self.qlora_four_over_six = cfg.get('qlora_four_over_six', self.qlora_four_over_six)
+        self.qlora_selective_expert_dequant = cfg.get('qlora_selective_expert_dequant', self.qlora_selective_expert_dequant)
+        self.qlora_offload_experts = cfg.get('qlora_offload_experts', self.qlora_offload_experts)
 
         self.merge_adapter = cfg.get('merge_adapter', self.merge_adapter)
         self.use_chat_template = cfg.get('use_chat_template', self.use_chat_template)
@@ -626,6 +635,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         )
         self.runtime_config.use_zero_copy = self.use_zero_copy
         self.runtime_config.use_write_combined = self.use_write_combined
+        self.runtime_config.selective_expert_dequant = self.qlora_selective_expert_dequant
+        self.runtime_config.offload_experts = self.qlora_offload_experts
 
     def create_lora_config(self):
         # Only create LoRA config when lora is enabled

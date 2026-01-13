@@ -503,23 +503,26 @@ void ModularWeightManager<Block>::allocate_block_weights(
         long D = cfg.intermediate_size;
 
         // Router gate: (num_experts, hidden_size)
-        block.router.gate = alloc(matmul_dtype, "router_gate_w", {num_experts, C});
+        // Keep router weights in the model dtype (BF16). The router matmul is executed via the
+        // generic BF16->FP32 matmul path (and MoE kernels don't support FP8/FP4 weights).
+        block.router.gate = alloc(other_dtype, "router_gate_w", {num_experts, C});
 
         // Use batched layout for grouped GEMM efficiency
         block.experts.use_batched = true;
 
         // Batched expert weights
-        block.experts.gate_up_proj = alloc(matmul_dtype, "experts_gate_up_w", {num_experts, 2 * D, C});
-        block.experts.down_proj = alloc(matmul_dtype, "experts_down_w", {num_experts, C, D});
+        // Keep expert weights in BF16 as well (grouped GEMM kernels are BF16/FP32 only).
+        block.experts.gate_up_proj = alloc(other_dtype, "experts_gate_up_w", {num_experts, 2 * D, C});
+        block.experts.down_proj = alloc(other_dtype, "experts_down_w", {num_experts, C, D});
 
         // Shared expert (if configured)
         if (cfg.use_shared_expert) {
             int shared_D = cfg.shared_expert_intermediate > 0 ?
                            cfg.shared_expert_intermediate : static_cast<int>(D);
             block.shared_expert.emplace();
-            block.shared_expert->gate_proj = alloc(matmul_dtype, "shared_expert_gate_w", {shared_D, C});
-            block.shared_expert->up_proj = alloc(matmul_dtype, "shared_expert_up_w", {shared_D, C});
-            block.shared_expert->down_proj = alloc(matmul_dtype, "shared_expert_down_w", {C, shared_D});
+            block.shared_expert->gate_proj = alloc(other_dtype, "shared_expert_gate_w", {shared_D, C});
+            block.shared_expert->up_proj = alloc(other_dtype, "shared_expert_up_w", {shared_D, C});
+            block.shared_expert->down_proj = alloc(other_dtype, "shared_expert_down_w", {C, shared_D});
         }
     }
 }
