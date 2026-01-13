@@ -35,21 +35,21 @@ See reproducible comparisons in [`./benchmarks`](./benchmarks/speed.md).
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
-- [**🖥️...🖥️ Native multi-GPU**](./docs/guides/multi-gpu.md) training with multi-threaded backend
-- [**🖥️...🖥️ Native multi-Node**](./docs/guides/multi-node.md) DDP training with Ray
+- [**🖥️...🖥️ Native multi-GPU**](https://docs.surogate.ai/guides/multi-gpu) training with multi-threaded backend
+- [**🖥️...🖥️ Native multi-Node**](https://docs.surogate.ai/guides/multi-node) DDP training with Ray
 - **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
-- [**🗲 CUDA Kernel Fusions**](./docs/guides/transformer.md#kernel-fusions) for maximum throughput  
-- [**⚖️ Smart CPU Offloading**](./docs/guides/offloading.md) for weights, gradients, activations, quants
+- [**🗲 CUDA Kernel Fusions**](https://docs.surogate.ai/about/transformer#kernel-fusions) for maximum throughput  
+- [**⚖️ Smart CPU Offloading**](https://docs.surogate.ai/guides/offloading) for weights, gradients, activations, quants
 - **📜 Pre-built training recipes**: 
-  - [**💎 BF16**](./docs/guides/precision-and-recipes.md#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
-  - [**🔥 FP8**](./docs/guides/precision-and-recipes.md#fp8-hybrid): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
-  - [**🔥 NVFP4**](./docs/guides/precision-and-recipes.md#fp4-nvfp4): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
-- [**⚡ BnB/FP8/NVFP4 QLoRA**](./docs/guides/qlora.md) to maximize SOL on Hopper/Blackwell GPUs
-- [**👌 Optimizers**](./docs/guides/optimizers.md): AdamW 8bit, !! NorMuon !!
+  - [**💎 BF16**](https://docs.surogate.ai/guides/precision-and-recipes#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
+  - [**🔥 FP8**](https://docs.surogate.ai/guides/precision-and-recipes#fp8-hybrid): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
+  - [**🔥 NVFP4**](https://docs.surogate.ai/guides/precision-and-recipes#fp4-nvfp4): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
+- [**⚡ BnB/FP8/NVFP4 QLoRA**](https://docs.surogate.ai/guides/qlora) to maximize SOL on Hopper/Blackwell GPUs
+- [**👌 Optimizers**](https://docs.surogate.ai/guides/optimizers): AdamW 8bit, !! NorMuon !!
 - **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
-- [**🧪 Mixed-precision training**](./docs/guides/precision-and-recipes.md#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
+- [**🧪 Mixed-precision training**](https://docs.surogate.ai/guides/precision-and-recipes#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
 - **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
-- **🧠 Supported models**: Qwen2.5, Qwen3 Dense, LLama 3.2, more to come shortly
+- **🧠 Supported models**: Text Dense & MoE
 
 ---
 
@@ -128,7 +128,6 @@ surogate sft config.yaml
 
 - Docs: https://docs.surogate.ai
 - Examples: https://github.com/invergent-ai/surogate/tree/master/examples
-- Benchmarks: [`./benchmarks/unsloth.md`](./benchmarks/unsloth.md)
 
 ---
 
