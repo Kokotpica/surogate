@@ -225,6 +225,7 @@ void FP4WeightsManager::import_and_quantize(const std::string& file_name,
 
     // Load and quantize each transformer block
     for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+        show_progress_bar(layer, mConfig.num_layers, "[FP4] Quantizing");
         if (is_moe()) {
             load_and_quantize_moe_block(layer, reader, stream);
         } else {

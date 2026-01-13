@@ -160,4 +160,13 @@ cudaEvent_t create_named_event(const char* name, bool timing=false);
 // ----------------------------------------------------------------------------
 bool iequals(std::string_view lhs, std::string_view rhs);
 
+/**
+ * @brief Displays a simple progress bar on stderr.
+ *
+ * @param current Current item index (0-based).
+ * @param total Total number of items.
+ * @param label Prefix label for the progress bar.
+ */
+void show_progress_bar(int current, int total, const std::string& label = "Quantizing");
+
 #endif //SUROGATE_SRC_UTILS_UTILS_H

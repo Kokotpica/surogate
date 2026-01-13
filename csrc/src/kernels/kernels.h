@@ -1326,6 +1326,9 @@ void moe_router_z_loss_backward(nv_bfloat16* d_logits, const nv_bfloat16* router
 /// @param cublas_handle cuBLAS handle.
 /// @param stream CUDA stream.
 /// @param host_offsets Optional: pre-cached host offsets.
+/// @param active_expert_indices Optional host pointer (CPU) to a list of active global expert indices.
+/// @param weight_is_compact If true, `weights` is indexed by compact active-expert order; otherwise by global expert id.
+/// @param num_active_experts Number of entries in @p active_expert_indices (<= num_experts). If <= 0, uses num_experts.
 void moe_grouped_gemm(float* output, const float* input, const float* weights,
                       const int* expert_offsets, int num_experts,
                       int M, int K,
@@ -1360,6 +1363,9 @@ void moe_grouped_gemm(nv_bfloat16* output, const nv_bfloat16* input, const nv_bf
 /// @param host_offsets Optional: pre-cached host offsets.
 /// @param alpha Scaling factor.
 /// @param beta Accumulation factor.
+/// @param active_expert_indices Optional host pointer (CPU) to a list of active global expert indices.
+/// @param weight_is_compact If true, `d_weight` is indexed by compact active-expert order; otherwise by global expert id.
+/// @param num_active_experts Number of entries in @p active_expert_indices (<= num_experts). If <= 0, uses num_experts.
 void moe_grouped_gemm_weight_grad(float* d_weight, const float* grad_output, const float* input,
                                   const int* expert_offsets, int num_experts,
                                   int M, int N,
@@ -1390,6 +1396,9 @@ void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight, const nv_bfloat16* grad
 /// @param intermediate_size Expert intermediate dimension (D, output is 2*D).
 /// @param cublas_handle cuBLAS handle.
 /// @param stream CUDA stream.
+/// @param active_expert_indices Optional host pointer (CPU) to a list of active global expert indices.
+/// @param weight_is_compact If true, `weights` is indexed by compact active-expert order; otherwise by global expert id.
+/// @param num_active_experts Number of entries in @p active_expert_indices (<= num_experts). If <= 0, uses num_experts.
 void moe_grouped_gemm_gate_up(float* output, const float* input, const float* weights,
                               const int* expert_offsets, int num_experts,
                               int hidden_size, int intermediate_size,
@@ -1418,6 +1427,9 @@ void moe_grouped_gemm_gate_up(nv_bfloat16* output, const nv_bfloat16* input, con
 /// @param intermediate_size Expert intermediate dimension (D).
 /// @param cublas_handle cuBLAS handle.
 /// @param stream CUDA stream.
+/// @param active_expert_indices Optional host pointer (CPU) to a list of active global expert indices.
+/// @param weight_is_compact If true, `weights` is indexed by compact active-expert order; otherwise by global expert id.
+/// @param num_active_experts Number of entries in @p active_expert_indices (<= num_experts). If <= 0, uses num_experts.
 void moe_grouped_gemm_down(float* output, const float* input, const float* weights,
                            const int* expert_offsets, int num_experts,
                            int hidden_size, int intermediate_size,

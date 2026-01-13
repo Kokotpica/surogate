@@ -10,6 +10,8 @@
  * @brief Fast LoRA fusion for MoE experts.
  */
 
+#include <fmt/core.h>
+
 #include "lora_types.h"
 #include "kernels/kernels.h"
 #include "modules/moe/moe_types.h"

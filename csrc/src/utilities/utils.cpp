@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <iostream>
 
 #include <cuda_runtime.h>
 #include <fmt/format.h>
@@ -139,4 +140,23 @@ bool iequals(std::string_view lhs, std::string_view rhs) {
  */
 [[noreturn]] void throw_not_divisible(long long dividend, long long divisor) {
     throw std::runtime_error(fmt::format("Cannot divide {} by {}", dividend, divisor));
+}
+
+void show_progress_bar(int current, int total, const std::string& label) {
+    const int bar_width = 40;
+    float progress = static_cast<float>(current + 1) / total;
+    int pos = static_cast<int>(bar_width * progress);
+
+    std::cerr << "\r" << label << ": [";
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < pos) std::cerr << "=";
+        else if (i == pos) std::cerr << ">";
+        else std::cerr << " ";
+    }
+    std::cerr << "] " << static_cast<int>(progress * 100.0) << "% (" 
+              << (current + 1) << "/" << total << ")" << std::flush;
+    
+    if (current + 1 == total) {
+        std::cerr << std::endl;
+    }
 }

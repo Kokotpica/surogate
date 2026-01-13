@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
+#include <mutex>
 
 #include <fmt/format.h>
 
@@ -108,6 +110,9 @@ void BnBWeightsManager::allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int
 
 void BnBWeightsManager::allocate_single_block(int layer_idx) {
     auto ctx = mAllocator->with_context("BnB_Weights");
+
+    // Show progress bar
+    show_progress_bar(layer_idx, mConfig.num_layers, "[BnB] Quantizing");
 
     const int hidden = mConfig.hidden_size;
     const int intermediate = mConfig.intermediate_size;
@@ -216,20 +221,101 @@ void BnBWeightsManager::import_and_quantize(const std::string& file_name,
     // Load embeddings (not quantized)
     load_embeddings(reader, stream);
 
-    // Load and quantize each transformer block
-    if (is_moe()) {
-        // MoE path: load experts + router
-        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-            load_and_quantize_moe_block(layer, reader, stream);
-        }
-    } else {
-        // Dense path
-        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
-            load_and_quantize_block(layer, reader, stream);
+    // Load and quantize each transformer block using double-buffering for I/O overlap
+    // Allocate a second load buffer for ping-pong to allow CPU file I/O while GPU quantizes
+    Tensor load_buffer_2;
+    Tensor absmax_buffer_2;
+    {
+        void* ptr = nullptr;
+        CUDA_CHECK(cudaMalloc(&ptr, mLoadBufferBytes));
+        load_buffer_2.Data = static_cast<std::byte*>(ptr);
+        load_buffer_2.DType = ETensorDType::BF16;
+        load_buffer_2.Rank = 1;
+        load_buffer_2.Sizes[0] = mLoadBuffer.Sizes[0];
+        std::fill(load_buffer_2.Sizes.begin() + 1, load_buffer_2.Sizes.end(), 1);
+
+        if (mScaleConfig.double_quant) {
+            void* absmax_ptr = nullptr;
+            CUDA_CHECK(cudaMalloc(&absmax_ptr, mAbsmaxBuffer.Sizes[0] * sizeof(float)));
+            absmax_buffer_2.Data = static_cast<std::byte*>(absmax_ptr);
+            absmax_buffer_2.DType = ETensorDType::FP32;
+            absmax_buffer_2.Rank = 1;
+            absmax_buffer_2.Sizes[0] = mAbsmaxBuffer.Sizes[0];
         }
     }
 
-    // Sync before freeing load buffer
+    // Create two non-blocking streams for double-buffering
+    cudaStream_t stream_0, stream_1;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_0, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_1, cudaStreamNonBlocking));
+
+    std::cerr << "[BnB] using double-buffered I/O for parallel quantization\n";
+
+    if (is_moe()) {
+        // MoE path: load experts + router with double-buffering
+        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+            const bool use_buffer_0 = (layer % 2 == 0);
+            cudaStream_t curr_stream = use_buffer_0 ? stream_0 : stream_1;
+
+            // Swap buffers
+            Tensor saved_load = mLoadBuffer;
+            Tensor saved_absmax = mAbsmaxBuffer;
+
+            if (!use_buffer_0) {
+                mLoadBuffer = load_buffer_2;
+                if (mScaleConfig.double_quant) {
+                    mAbsmaxBuffer = absmax_buffer_2;
+                }
+            }
+
+            // Load and quantize on current stream (GPU work is async)
+            load_and_quantize_moe_block(layer, reader, curr_stream);
+
+            // Restore buffers
+            mLoadBuffer = saved_load;
+            mAbsmaxBuffer = saved_absmax;
+        }
+    } else {
+        // Dense path with double-buffering
+        for (int layer = 0; layer < mConfig.num_layers; ++layer) {
+            const bool use_buffer_0 = (layer % 2 == 0);
+            cudaStream_t curr_stream = use_buffer_0 ? stream_0 : stream_1;
+
+            // Swap buffers
+            Tensor saved_load = mLoadBuffer;
+            Tensor saved_absmax = mAbsmaxBuffer;
+
+            if (!use_buffer_0) {
+                mLoadBuffer = load_buffer_2;
+                if (mScaleConfig.double_quant) {
+                    mAbsmaxBuffer = absmax_buffer_2;
+                }
+            }
+
+            // Load and quantize on current stream (GPU work is async)
+            load_and_quantize_block(layer, reader, curr_stream);
+
+            // Restore buffers
+            mLoadBuffer = saved_load;
+            mAbsmaxBuffer = saved_absmax;
+        }
+    }
+
+    // Sync both streams
+    CUDA_CHECK(cudaStreamSynchronize(stream_0));
+    CUDA_CHECK(cudaStreamSynchronize(stream_1));
+    CUDA_CHECK(cudaStreamDestroy(stream_0));
+    CUDA_CHECK(cudaStreamDestroy(stream_1));
+
+    // Free second buffer
+    if (load_buffer_2.Data) {
+        CUDA_CHECK(cudaFree(load_buffer_2.Data));
+    }
+    if (absmax_buffer_2.Data) {
+        CUDA_CHECK(cudaFree(absmax_buffer_2.Data));
+    }
+
+    // Sync original stream
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Free load buffer (allocated directly, not via allocator)
@@ -560,15 +646,8 @@ float BnBWeightsManager::memory_savings_ratio() const {
 void BnBWeightsManager::allocate_moe_block(int layer_idx) {
     auto ctx = mAllocator->with_context("BnB_MoE_Weights");
 
-    // Debug: print CUDA memory info at start of each layer
-    if (layer_idx % 5 == 0) {
-        size_t free_mem = 0, total_mem = 0;
-        cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[BnB] Layer " << layer_idx << " - CUDA memory: "
-                  << (total_mem - free_mem) / 1024 / 1024 << " MB used, "
-                  << free_mem / 1024 / 1024 << " MB free, "
-                  << total_mem / 1024 / 1024 << " MB total\n";
-    }
+    // Show progress bar
+    show_progress_bar(layer_idx, mConfig.num_layers, "[BnB] Quantizing");
 
     const int hidden = mConfig.hidden_size;
     const int num_q_heads = mConfig.num_query_heads;

@@ -73,7 +73,6 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     fprintf(stderr, "[RunState] NumExperts=%d, MoeIntermediateSize=%d, IntermediateSize=%d -> using intermediate_size=%d\n",
             mConfig.NumExperts, mConfig.MoeIntermediateSize, mConfig.IntermediateSize,
             rs_config.block_config.intermediate_size);
-    fprintf(stderr, "[RunState] UseQKNorm=%d, UseQKVBias=%d\n", mConfig.UseQKNorm, mConfig.UseQKVBias);
     rs_config.block_config.num_query_heads = mConfig.NumQueryHeads;
     rs_config.block_config.num_kv_heads = mConfig.NumKeyValHeads;
     rs_config.block_config.head_size = mConfig.head_size();
