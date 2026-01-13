@@ -386,32 +386,6 @@ void ModularLoRAModel<Block>::calculate_lora_gradient_norm(NCCLCommunicator& com
                        * static_cast<float>(std::max(1, rs.GradAccumSteps))
                        * static_cast<float>(std::max(1, comm.world_size()));
 
-    // Optional debug print to diagnose extreme gradient norms without tracing the full code path.
-    // Enabled via: SUROGATE_DEBUG_LORA_NORM=1
-    static std::atomic<long> s_norm_calls{0};
-    const long norm_call_idx = s_norm_calls.fetch_add(1, std::memory_order_relaxed);
-    const bool debug_norm = std::getenv("SUROGATE_DEBUG_LORA_NORM") != nullptr;
-    if (debug_norm && comm.rank() == 0 && norm_call_idx < 8) {
-        int valid_tokens = 0;
-        float norm_sq = 0.0f;
-        CUDA_CHECK(cudaMemcpy(&valid_tokens, rs.ValidTokenCount.Data, sizeof(valid_tokens), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&norm_sq, buf.template get<float>(), sizeof(norm_sq), cudaMemcpyDeviceToHost));
-        float raw_norm = std::sqrt(std::max(0.0f, norm_sq));
-        float token_scale = (valid_tokens > 0 && total_tokens > 0.0f) ? (total_tokens / static_cast<float>(valid_tokens)) : 0.0f;
-        float scaled_norm = raw_norm * token_scale;
-        std::cerr << "[LoRA NORM DEBUG] call=" << norm_call_idx
-                  << " B=" << rs.B << " T=" << rs.T
-                  << " grad_accum=" << rs.GradAccumSteps
-                  << " world=" << comm.world_size()
-                  << " valid=" << valid_tokens
-                  << " total=" << total_tokens
-                  << " token_scale=" << token_scale
-                  << " raw_norm=" << raw_norm
-                  << " scaled_norm=" << scaled_norm
-                  << " grad_clip=" << grad_clip
-                  << "\n";
-    }
-
     global_norm_sqrt(buf.template get<float>(), rs.NormHost, grad_clip,
                      rs.ValidTokenCount.template get<int>(), total_tokens,
                      rs.DeviceProp, stream);
