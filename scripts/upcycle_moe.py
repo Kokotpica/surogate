@@ -7,7 +7,7 @@ import json
 import math
 import os
 from collections import Counter
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
 """
 Upcycle a dense Hugging Face transformer model into a Sparse Mixture of Experts (MoE) model (https://openreview.net/pdf?id=HDZ2GBwrWo).
@@ -29,7 +29,7 @@ IMPORTANT: Upcycled MoE training requires careful hyperparameter tuning:
 - Watch for router collapse: sudden loss increases after initial decrease indicate instability
 
 python upcycle_script.py \
-    --model_id "Qwen/Qwen3-0.6B-Instruct" \
+    --model_id "Qwen/Qwen3-0.6B" \
     --num_experts 8 \
     --top_k 2
 """
@@ -621,6 +621,11 @@ def main():
     print(f"Saving upcycled model to {args.save_path} (max_shard_size={args.max_shard_size})...")
     model.save_pretrained(args.save_path, max_shard_size=args.max_shard_size)
     _patch_saved_config_dtype_bf16(args.save_path)
+
+    # Copy tokenizer and vocab files from the original model
+    print(f"Copying tokenizer from {args.model_id}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+    tokenizer.save_pretrained(args.save_path)
 
     if args.make_reloadable:
         print("Writing reloadable Hugging Face wrapper (trust_remote_code=True)...")
