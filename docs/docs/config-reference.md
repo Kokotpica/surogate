@@ -128,8 +128,8 @@ distributed:
 
 | Option                    | Type | Default | Description                                                                           |
 | ------------------------- | ---- | ------- | ------------------------------------------------------------------------------------- |
-| `skip_quant_first_layers` | int  | `0`     | Skip quantization for the first N transformer layers (embedding layers kept in BF16). |
-| `skip_quant_last_layers`  | int  | `0`     | Skip quantization for the last N transformer layers (lm_head layers kept in BF16).    |
+| `skip_quant_first_layers` | int  | `0`     | Skip quantization for the first N transformer decoder layers. (embedding layers are always kept in BF16). |
+| `skip_quant_last_layers`  | int  | `0`     | Skip quantization for the last N transformer decoder layers (lm_head layers are always kept in BF16).    |
 
 ## Optimizer Settings
 

@@ -39,11 +39,11 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
     auto& a = rs.simplified_acts(layer_idx);
     auto& q = rs.simplified_quant_acts(layer_idx);
 
-    // Determine if this layer should use FP4 quantization
+    // Determine if this layer should use quantization (FP4/FP8)
     const int skip_first = std::max(0, mOptions.skip_quant_first_layers);
     const int skip_last = std::max(0, mOptions.skip_quant_last_layers);
     const bool in_skip_range = (layer_idx < skip_first) || (layer_idx >= mConfig.NumLayers - skip_last);
-    const bool allow_fp4_layer = !in_skip_range;
+    const bool allow_quant_layer = !in_skip_range;
 
     // recompute dependency rules
     const bool recompute_ln1 = mOptions.recompute_rmsnorm || mOptions.recompute_attention || mOptions.recompute_block;
@@ -98,7 +98,7 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
             rs, B, T, C, qkv_channels,
             layer_idx, modules::MatmulOp::QKV,
             inp_quant, cached_qkv, /*delayed_quantizer_idx=*/-1, stream,
-            fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+            fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
 
         using AttentionWeightsType = std::decay_t<decltype(weights.attention)>;
         if constexpr (has_qk_norm_weights<AttentionWeightsType>::value) {
@@ -169,7 +169,7 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
                 rs, B, T, Hq * Hs, C,
                 layer_idx, modules::MatmulOp::AttnOut,
                 inp_quant, cached_o, /*delayed_quantizer_idx=*/-1, stream,
-                fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+                fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
         }
     }
 
@@ -230,7 +230,7 @@ void ModularTransformerModel<Block>::recompute_block(int layer_idx, BlockWeights
                 rs, B, T, C, 2 * D,
                 layer_idx, modules::MatmulOp::MLPUp,
                 inp_quant, cached_mlp_up, /*delayed_quantizer_idx=*/-1, stream,
-                fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+                fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
         }
     }
 
@@ -273,11 +273,11 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
     const int Hkv = (int)mConfig.NumKeyValHeads;
     const int Hs = (int)mConfig.head_size();
     const int qkv_channels = (int)mConfig.qkv_channels();
-    // Determine if this layer should use FP4 quantization
+    // Determine if this layer should use quantization (FP4/FP8)
     const int skip_first = std::max(0, mOptions.skip_quant_first_layers);
     const int skip_last = std::max(0, mOptions.skip_quant_last_layers);
     const bool in_skip_range = (layer_idx < skip_first) || (layer_idx >= mConfig.NumLayers - skip_last);
-    const bool allow_fp4_layer = !in_skip_range;
+    const bool allow_quant_layer = !in_skip_range;
 
     // Use the simplified activation/gradient buffers (the full modular per-module
     // activation capture is still being wired up).
@@ -380,11 +380,11 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             ctx.accumulate = accumulate;
             ctx.skip_weight_grad = lora_only;
             ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-            ctx.allow_fp4 = allow_fp4_layer;
-            ctx.allow_fp8 = allow_fp4_layer;
+            ctx.allow_fp4 = allow_quant_layer;
+            ctx.allow_fp8 = allow_quant_layer;
 
             // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-            if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+            if (mWeights->has_fp4_dgrad_cache() && allow_quant_layer) {
                 auto& fp4_t = mWeights->fp4_weight_cache_transposed();
                 ctx.cached_fp4_data = &fp4_t.mlp_down_weight.data;
                 ctx.cached_fp4_scales = &fp4_t.mlp_down_weight.scales;
@@ -436,11 +436,11 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             ctx.accumulate = accumulate;
             ctx.skip_weight_grad = lora_only;
             ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-            ctx.allow_fp4 = allow_fp4_layer;
-            ctx.allow_fp8 = allow_fp4_layer;
+            ctx.allow_fp4 = allow_quant_layer;
+            ctx.allow_fp8 = allow_quant_layer;
 
             // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-            if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+            if (mWeights->has_fp4_dgrad_cache() && allow_quant_layer) {
                 auto& fp4_t = mWeights->fp4_weight_cache_transposed();
                 ctx.cached_fp4_data = &fp4_t.mlp_up_weight.data;
                 ctx.cached_fp4_scales = &fp4_t.mlp_up_weight.scales;
@@ -498,11 +498,11 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             ctx.accumulate = accumulate;
             ctx.skip_weight_grad = lora_only;
             ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-            ctx.allow_fp4 = allow_fp4_layer;
-            ctx.allow_fp8 = allow_fp4_layer;
+            ctx.allow_fp4 = allow_quant_layer;
+            ctx.allow_fp8 = allow_quant_layer;
 
             // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-            if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+            if (mWeights->has_fp4_dgrad_cache() && allow_quant_layer) {
                 auto& fp4_t = mWeights->fp4_weight_cache_transposed();
                 ctx.cached_fp4_data = &fp4_t.o_weight.data;
                 ctx.cached_fp4_scales = &fp4_t.o_weight.scales;
@@ -692,11 +692,11 @@ void ModularTransformerModel<Block>::backward_block(int layer_idx, bool accumula
             ctx.accumulate = accumulate;
             ctx.skip_weight_grad = lora_only;
             ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-            ctx.allow_fp4 = allow_fp4_layer;
-            ctx.allow_fp8 = allow_fp4_layer;
+            ctx.allow_fp4 = allow_quant_layer;
+            ctx.allow_fp8 = allow_quant_layer;
 
             // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-            if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+            if (mWeights->has_fp4_dgrad_cache() && allow_quant_layer) {
                 auto& fp4_t = mWeights->fp4_weight_cache_transposed();
                 ctx.cached_fp4_data = &fp4_t.qkv_weight.data;
                 ctx.cached_fp4_scales = &fp4_t.qkv_weight.scales;
@@ -740,7 +740,7 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
     const int skip_first = std::max(0, mOptions.skip_quant_first_layers);
     const int skip_last = std::max(0, mOptions.skip_quant_last_layers);
     const bool in_skip_range = (layer_idx < skip_first) || (layer_idx >= mConfig.NumLayers - skip_last);
-    const bool allow_fp4_layer = !in_skip_range;
+    const bool allow_quant_layer = !in_skip_range;
 
     // MoE config
     assert(mConfig.moe_config.has_value() && "MoE config must be set for MoE blocks");
@@ -1430,11 +1430,11 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
         ctx.accumulate = accumulate;
         ctx.skip_weight_grad = lora_only;
         ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-        ctx.allow_fp4 = allow_fp4_layer;
-        ctx.allow_fp8 = allow_fp4_layer;
+        ctx.allow_fp4 = allow_quant_layer;
+        ctx.allow_fp8 = allow_quant_layer;
 
         // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-        if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+        if (mWeights->has_fp4_dgrad_cache() && allow_quant_layer) {
             auto& fp4_t = mWeights->fp4_weight_cache_transposed();
             ctx.cached_fp4_data = &fp4_t.o_weight.data;
             ctx.cached_fp4_scales = &fp4_t.o_weight.scales;
@@ -1667,11 +1667,11 @@ void ModularTransformerModel<Block>::backward_block_moe(int layer_idx, bool accu
         ctx.accumulate = accumulate;
         ctx.skip_weight_grad = lora_only;
         ctx.seed = static_cast<unsigned int>(mOptimizerRNG());
-        ctx.allow_fp4 = allow_fp4_layer;
-        ctx.allow_fp8 = allow_fp4_layer;
+        ctx.allow_fp4 = allow_quant_layer;
+        ctx.allow_fp8 = allow_quant_layer;
 
         // FP4 dgrad optimization: reuse cached FP4 W^T for dinp = dout @ W.
-        if (mWeights->has_fp4_dgrad_cache() && allow_fp4_layer) {
+        if (mWeights->has_fp4_dgrad_cache() && allow_quant_layer) {
             auto& fp4_t = mWeights->fp4_weight_cache_transposed();
             ctx.cached_fp4_data = &fp4_t.qkv_weight.data;
             ctx.cached_fp4_scales = &fp4_t.qkv_weight.scales;

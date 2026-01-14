@@ -86,11 +86,11 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
     for (int l = 0; l < mConfig.NumLayers; l++) {
         NvtxRange layer_range("Layer", l);
 
-        // Determine if this layer should use FP4 quantization
+        // Determine if this layer should use quantization (FP4/FP8)
         const int skip_first = std::max(0, mOptions.skip_quant_first_layers);
         const int skip_last = std::max(0, mOptions.skip_quant_last_layers);
         const bool in_skip_range = (l < skip_first) || (l >= mConfig.NumLayers - skip_last);
-        const bool allow_fp4_layer = !in_skip_range;
+        const bool allow_quant_layer = !in_skip_range;
 
         // Prefetch next block
         if (l != mConfig.NumLayers - 1) {
@@ -167,7 +167,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     rs, (int)B, (int)T, (int)C, (int)qkv_channels,
                     l, modules::MatmulOp::QKV,
                     inp_quant, cached_weight, qidx, main_stream,
-                    fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+                    fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
             }
 
             if (hook) {
@@ -257,7 +257,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                     rs, (int)B, (int)T, (int)AttC, (int)C,
                     l, modules::MatmulOp::AttnOut,
                     inp_quant, cached_weight, qidx, main_stream,
-                    fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+                    fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
             }
 
             if (hook) {
@@ -314,7 +314,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                             nullptr, rs, (int)B, (int)T, (int)C, (int)(2 * D),
                             l, modules::MatmulOp::MLPUp,
                             inp_quant, cached_weight, qidx, main_stream,
-                            fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+                            fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
                     }
 
                     if (hook) {
@@ -355,7 +355,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                             nullptr, rs, (int)B, (int)T, (int)D, (int)C,
                             l, modules::MatmulOp::MLPDown,
                             inp_quant, cached_weight, qidx, main_stream,
-                            fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+                            fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
                     }
                 } else {
                     // MLPUp projection (non-recompute path) - recipe handles all format decisions
@@ -380,7 +380,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                             nullptr, rs, (int)B, (int)T, (int)C, (int)(2 * D),
                             l, modules::MatmulOp::MLPUp,
                             inp_quant, cached_weight, qidx, main_stream,
-                            fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+                            fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
                     }
 
                     if (hook) {
@@ -421,7 +421,7 @@ void ModularTransformerModel<Block>::forward_with_hook(Tensor inputs, Tensor pos
                             nullptr, rs, (int)B, (int)T, (int)D, (int)C,
                             l, modules::MatmulOp::MLPDown,
                             inp_quant, cached_weight, qidx, main_stream,
-                            fp4_data, fp4_scales, fp4_amax, allow_fp4_layer);
+                            fp4_data, fp4_scales, fp4_amax, allow_quant_layer);
                     }
                 }
 
