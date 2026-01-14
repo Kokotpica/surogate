@@ -22,6 +22,7 @@
 #include "utilities/safetensors.h"
 #include "utilities/sol.h"
 #include "utilities/comm.h"
+#include "utilities/crash_handler.h"
 #include "config/lora_adapter_config.h"
 #include "recipes/recipe_factory.h"
 #include "modules/qlora/qlora_config.h"
@@ -102,6 +103,9 @@ nb::dlpack::dtype to_dlpack_dtype(ETensorDType dtype) {
 
 
 NB_MODULE(_surogate, m) {
+    // Install crash handler for better stack traces on segfaults and other crashes
+    surogate::install_crash_handler();
+
     nb::class_<GPUUtilInfo>(m, "GPUUtilInfo",
         "Snapshot of GPU utilization/telemetry.\n\n"
         "All fields are read/write and represent the most recently sampled values.\n"

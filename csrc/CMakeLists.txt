@@ -103,6 +103,13 @@ FetchContent_Declare(
         GIT_TAG v3.6.0
 )
 
+# backward-cpp for stack traces on crash
+FetchContent_Declare(
+        backward
+        GIT_REPOSITORY https://github.com/bombela/backward-cpp.git
+        GIT_TAG v1.6
+)
+
 # CUTLASS for optimized GEMM kernels
 # Disable all CUTLASS tests, examples, and profiler to speed up configuration
 set(CUTLASS_ENABLE_TESTS OFF CACHE BOOL "Enable CUTLASS tests")
@@ -132,6 +139,32 @@ FetchContent_MakeAvailable(cli11)
 FetchContent_MakeAvailable(fmt)
 FetchContent_MakeAvailable(catch2)
 FetchContent_MakeAvailable(cutlass)
+FetchContent_MakeAvailable(backward)
+
+# Find libdw (elfutils) or libdwarf for stack traces with backward-cpp
+# libdw (from elfutils) is preferred, libdwarf is a fallback
+find_path(LIBDW_INCLUDE_DIR NAMES elfutils/libdw.h)
+find_library(LIBDW_LIBRARY NAMES dw)
+find_path(LIBDWARF_INCLUDE_DIR NAMES libdwarf/libdwarf.h libdwarf.h)
+find_library(LIBDWARF_LIBRARY NAMES dwarf)
+find_library(LIBELF_LIBRARY NAMES elf)
+
+set(BACKWARD_HAS_DW 0)
+set(BACKWARD_HAS_DWARF 0)
+set(BACKWARD_LIBS "")
+
+if(LIBDW_INCLUDE_DIR AND LIBDW_LIBRARY)
+    message(STATUS "Found libdw: ${LIBDW_LIBRARY} (enables detailed stack traces)")
+    set(BACKWARD_HAS_DW 1)
+    list(APPEND BACKWARD_LIBS ${LIBDW_LIBRARY})
+elseif(LIBDWARF_INCLUDE_DIR AND LIBDWARF_LIBRARY AND LIBELF_LIBRARY)
+    message(STATUS "Found libdwarf: ${LIBDWARF_LIBRARY} (enables stack traces)")
+    set(BACKWARD_HAS_DWARF 1)
+    list(APPEND BACKWARD_LIBS ${LIBDWARF_LIBRARY} ${LIBELF_LIBRARY})
+else()
+    message(STATUS "Neither libdw nor libdwarf found - stack traces will have limited detail")
+    message(STATUS "  Install: sudo apt install libdw-dev (recommended) or libdwarf-dev libelf-dev")
+endif()
 
 # optional cufile
 if(USE_CUFILE)
@@ -203,6 +236,7 @@ target_sources(surogate-common PRIVATE
     src/utilities/dtype.cpp
     src/utilities/stack.cpp
     src/utilities/system_info.cpp
+    src/utilities/crash_handler.cpp
 
     src/training/dataloader.cpp
     src/training/logging.cpp
@@ -280,8 +314,30 @@ target_link_libraries(surogate-common PUBLIC CUDA::cudart CUDA::cuda_driver CUDA
 target_link_libraries(surogate-common PUBLIC ${MULTI_GPU_DEPS})
 target_compile_definitions(surogate-common PUBLIC ${MULTI_GPU_DEFS})
 target_include_directories(surogate-common PRIVATE ${CUDNN_INCLUDE_DIR})
-target_include_directories(surogate-common PUBLIC src ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
-target_compile_options(surogate-common PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo> $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+target_include_directories(surogate-common PUBLIC src ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${backward_SOURCE_DIR})
+
+# backward-cpp for stack traces
+if(BACKWARD_HAS_DW)
+    target_compile_definitions(surogate-common PRIVATE BACKWARD_HAS_DW=1)
+elseif(BACKWARD_HAS_DWARF)
+    target_compile_definitions(surogate-common PRIVATE BACKWARD_HAS_DWARF=1)
+endif()
+if(BACKWARD_LIBS)
+    target_link_libraries(surogate-common PRIVATE ${BACKWARD_LIBS})
+endif()
+# -rdynamic exports symbols to the dynamic symbol table, enabling backtrace_symbols to resolve names
+target_link_options(surogate-common PUBLIC "-rdynamic")
+# Always include debug info for stack traces (even in Release builds)
+# -g adds debug symbols, -lineinfo adds CUDA line info for GPU crashes
+# -fno-omit-frame-pointer preserves frame pointers for stack unwinding
+target_compile_options(surogate-common PUBLIC
+    $<$<COMPILE_LANGUAGE:CXX>:-g>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+    $<$<COMPILE_LANGUAGE:CUDA>:-g>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-omit-frame-pointer>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
 
 if (NOT SKBUILD)
     install(TARGETS surogate-common
@@ -297,7 +353,7 @@ if (PYTHON_BINDING)
     nanobind_add_module(_surogate STABLE_ABI src/binding/binding.cpp src/binding/py_train.cpp)
     target_link_libraries(_surogate PUBLIC surogate-common Python::Module fmt::fmt-header-only)
 
-    # make sure we pick up cuda libraries from within the current python env, if available
+    # pick up cuda libraries from within the current python env, if available
     set(RPATH_LIST
         "$ORIGIN"
         "$ORIGIN/../nvidia/nccl/lib"
