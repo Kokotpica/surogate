@@ -840,8 +840,16 @@ class RayDistributedTrainer:
             # Periodic checkpointing
             if config.save_steps > 0 and step % config.save_steps == 0 and step > 0:
                 logger.info(f"Saving checkpoint at step {step}...")
-                # Only node 0 saves (others have identical weights in data parallel)
-                ray.get(self.node_trainers[0].save_checkpoint.remote(config.checkpoint_dir, step))
+                try:
+                    # Only node 0 saves (others have identical weights in data parallel)
+                    ray.get(self.node_trainers[0].save_checkpoint.remote(config.checkpoint_dir, step))
+                    logger.info(f"Checkpoint saved successfully at step {step}")
+                except Exception as e:
+                    logger.error(f"Failed to save checkpoint at step {step}: {e}")
+                    logger.error(f"Exception type: {type(e).__name__}")
+                    logger.warning("Training will continue without saving this checkpoint")
+                    import traceback
+                    logger.error(f"Traceback:\n{traceback.format_exc()}")
 
         # Save final model
         # IMPORTANT: export_adapter/export_model contain NCCL barriers, so ALL nodes must participate

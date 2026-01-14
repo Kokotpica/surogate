@@ -23,6 +23,7 @@
 #include "modules/weights/weight_manager_quantization.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
+#include "modules/moe/moe_types.h"
 
 namespace modules {
 
@@ -189,6 +190,39 @@ public:
     Tensor& get_router_gate(int layer_idx, cudaStream_t stream);
 
     /**
+     * @brief Dequantize only the selected experts (selective dequantization)
+     *
+     * This method dequantizes only the experts that were selected by the router,
+     * significantly reducing memory usage for MoE models with many experts.
+     *
+     * The dequantized weights are placed in a compact buffer indexed by
+     * selection_info.expert_to_compact mapping.
+     *
+     * @param layer_idx Layer index
+     * @param selection_info Information about which experts were selected
+     * @param stream CUDA stream for dequantization
+     */
+    void dequantize_selected_experts(int layer_idx, const SelectiveExpertInfo& selection_info,
+                                     cudaStream_t stream);
+
+    /**
+     * @brief Check if selective expert dequantization is enabled
+     */
+    [[nodiscard]] bool use_selective_dequant() const {
+        return mConfig.qlora_config.selective_expert_dequant && mConfig.qlora_config.is_moe();
+    }
+
+    /**
+     * @brief Get the current selection info (for backward pass)
+     *
+     * Returns the selection info cached from the last dequantize_selected_experts call.
+     * This is used in backward to match the compact indexing used in forward.
+     */
+    [[nodiscard]] const SelectiveExpertInfo& get_current_selection() const {
+        return mCurrentSelection;
+    }
+
+    /**
      * @brief Get memory stats
      */
     std::size_t quantized_weights_bytes() const {
@@ -307,6 +341,16 @@ private:
 
     /// Number of experts in MoE model
     int mNumMoEExperts = 0;
+
+    /// Current selection info for selective dequantization caching
+    SelectiveExpertInfo mCurrentSelection;
+
+    /// Layer index for which the current expert selection is valid
+    /// Used to avoid reusing cached experts from a different layer
+    int mCurrentExpertLayer = -1;
+
+    /// Number of experts currently in the compact buffers
+    int mNumActiveExperts = 0;
 
     void allocate_dequant_buffers();
     void allocate_moe_expert_buffers();
@@ -766,6 +810,111 @@ void FP8WeightProvider<Block>::get_moe_attention_weights(int layer_idx, cudaStre
             mDequantBlock.attention.q_norm_weight = qblock.q_norm_weight;
             mDequantBlock.attention.k_norm_weight = qblock.k_norm_weight;
         }
+    }
+}
+
+// ============================================================================
+// Selective Expert Dequantization Implementation
+// ============================================================================
+
+template<typename Block>
+void FP8WeightProvider<Block>::dequantize_selected_experts(
+    int layer_idx, const SelectiveExpertInfo& selection_info, cudaStream_t stream)
+{
+    if (!selection_info.enabled || selection_info.num_active == 0) {
+        return;
+    }
+
+    const auto& qblock = mFP8Weights->get_moe_block(layer_idx);
+    const int hidden = mConfig.hidden_size;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+
+    // Check if we can reuse the current buffers
+    const bool same_layer_step = (mCurrentLayer == layer_idx) && (mBufferVersion == mStepVersion);
+
+    // IMPORTANT: Also check that we're on the same layer - don't reuse layer 0's experts for layer 1!
+    bool selection_matches = same_layer_step &&
+                             mCurrentExpertLayer == layer_idx &&
+                             mCurrentSelection.enabled &&
+                             mCurrentSelection.num_active == selection_info.num_active;
+    if (selection_matches) {
+        // Quick check: compare active expert lists
+        for (int i = 0; i < selection_info.num_active && selection_matches; ++i) {
+            if (mCurrentSelection.active_experts[i] != selection_info.active_experts[i]) {
+                selection_matches = false;
+            }
+        }
+    }
+
+    if (selection_matches) {
+        // Cache hit - buffers already contain the right experts
+        return;
+    }
+
+    // Dequantize selected experts into COMPACT index positions in the buffer
+    const int num_to_dequant = selection_info.num_active;
+    const int block_size = mConfig.qlora_config.fp8_block_size > 0 ?
+                           mConfig.qlora_config.fp8_block_size : 32;
+
+    for (int i = 0; i < num_to_dequant; ++i) {
+        const int global_expert_idx = selection_info.active_experts[i];
+        const auto& expert_weights = qblock.experts[global_expert_idx];
+
+        // Create slice views at the COMPACT index position (i, not global_expert_idx)
+        Tensor gate_up_slice = Tensor::from_pointer(
+            static_cast<std::byte*>(mBatchedExpertGateUp.Data) +
+                static_cast<size_t>(i) * (2 * moe_inter) * hidden * sizeof(nv_bfloat16),
+            mBatchedExpertGateUp.Device,
+            ETensorDType::BF16,
+            std::array<long, 2>{2 * moe_inter, hidden}
+        );
+
+        Tensor down_slice = Tensor::from_pointer(
+            static_cast<std::byte*>(mBatchedExpertDown.Data) +
+                static_cast<size_t>(i) * hidden * moe_inter * sizeof(nv_bfloat16),
+            mBatchedExpertDown.Device,
+            ETensorDType::BF16,
+            std::array<long, 2>{hidden, moe_inter}
+        );
+
+        // Dequantize this expert's weights into the buffer slice
+        dequantize_per_block(
+            gate_up_slice.get<nv_bfloat16>(),
+            expert_weights.gate_up_proj.data.get<__nv_fp8_e4m3>(),
+            expert_weights.gate_up_proj.block_scales.get<float>(),
+            expert_weights.gate_up_proj.M, expert_weights.gate_up_proj.K,
+            block_size, mDeviceProps, stream);
+
+        dequantize_per_block(
+            down_slice.get<nv_bfloat16>(),
+            expert_weights.down_proj.data.get<__nv_fp8_e4m3>(),
+            expert_weights.down_proj.block_scales.get<float>(),
+            expert_weights.down_proj.M, expert_weights.down_proj.K,
+            block_size, mDeviceProps, stream);
+    }
+
+    // Update cache state
+    mCurrentSelection = selection_info;
+    mCurrentExpertLayer = layer_idx;  // Track which layer these experts are from
+    mNumActiveExperts = num_to_dequant;
+
+    // Update the expert weights tensor shapes (compact indexing)
+    if constexpr (has_moe_weights<BlockWeights>::value) {
+        mDequantBlock.experts.gate_up_proj = Tensor::from_pointer(
+            mBatchedExpertGateUp.Data,
+            mBatchedExpertGateUp.Device,
+            ETensorDType::BF16,
+            std::array<long, 3>{(long)num_to_dequant, (long)(2 * moe_inter), (long)hidden}
+        );
+        mDequantBlock.experts.down_proj = Tensor::from_pointer(
+            mBatchedExpertDown.Data,
+            mBatchedExpertDown.Device,
+            ETensorDType::BF16,
+            std::array<long, 3>{(long)num_to_dequant, (long)hidden, (long)moe_inter}
+        );
+        mDequantBlock.experts.use_batched = true;
+        mDequantBlock.experts.num_active_experts = num_to_dequant;
     }
 }
 

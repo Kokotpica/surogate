@@ -196,6 +196,7 @@ class SurogateTrainerWrapper():
         self.train_loader.load_batch(in_tokens, out_tokens)
 
         # Training loop
+        logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
         for step in range(self.start_step, self.max_steps):
             # Check if we need to advance epoch
             if not self.train_loader.has_next(self.config.gradient_accumulation_steps):
@@ -217,19 +218,27 @@ class SurogateTrainerWrapper():
             # Periodic checkpointing (before training step)
             if self.config.save_steps > 0 and step % self.config.save_steps == 0 and step > self.start_step:
                 logger.info(f"Saving checkpoint to {self.config.checkpoint_dir}...")
-                self.trainer.save_checkpoint(self.config.checkpoint_dir, step)
+                try:
+                    self.trainer.save_checkpoint(self.config.checkpoint_dir, step)
+                    logger.info(f"Checkpoint saved successfully at step {step}")
 
-                # Generate training plot in checkpoint directory
-                checkpoint_plot_path = Path(self.config.checkpoint_dir) / f"step_{step:08d}" / "training_plot.png"
-                generate_training_plot(self.config.log_file, checkpoint_plot_path)
+                    # Generate training plot in checkpoint directory
+                    checkpoint_plot_path = Path(self.config.checkpoint_dir) / f"step_{step:08d}" / "training_plot.png"
+                    generate_training_plot(self.config.log_file, checkpoint_plot_path)
 
-                # Clean old checkpoints
-                if self.config.save_total_limit > 0:
-                    removed = _surogate.clean_old_checkpoints(self.config.checkpoint_dir, self.config.save_total_limit,
-                                                              -1)
-                    if removed:
-                        logger.info(
-                            f"Removed {removed} old checkpoints, keeping the most recent {self.config.save_total_limit}")
+                    # Clean old checkpoints
+                    if self.config.save_total_limit > 0:
+                        removed = _surogate.clean_old_checkpoints(self.config.checkpoint_dir, self.config.save_total_limit,
+                                                                  -1)
+                        if removed:
+                            logger.info(
+                                f"Removed {removed} old checkpoints, keeping the most recent {self.config.save_total_limit}")
+                except Exception as e:
+                    logger.error(f"Failed to save checkpoint at step {step}: {e}")
+                    logger.error(f"Exception type: {type(e).__name__}")
+                    logger.warning("Training will continue without saving this checkpoint")
+                    import traceback
+                    logger.error(f"Traceback:\n{traceback.format_exc()}")
 
             # Training step
             step_start = time.time()
@@ -272,6 +281,8 @@ class SurogateTrainerWrapper():
             epoch = self.train_loader.epoch() + 0.01 * self.train_loader.progress()
             train_logger.log_step(step, epoch, tokens_processed, elapsed_ms,
                                   result['norm'], result['loss'], lr)
+
+        logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
 
     def run_evaluation(self, in_tokens: np.ndarray, out_tokens: np.ndarray, max_steps: int) -> Tuple[float, int, int]:
         """

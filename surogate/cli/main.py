@@ -66,12 +66,22 @@ def cli_main():
     try:
         cmd_args = [python_cmd, file_path, *command_args]
         process = subprocess.Popen(cmd_args, preexec_fn=os.setsid)
-        return process.wait()
+        exit_code = process.wait()
+        # If process died from a signal (negative exit code or 128+signal),
+        # give the crash handler time to finish printing
+        if exit_code < 0 or exit_code >= 128:
+            import time
+            time.sleep(0.1)  # Allow crash handler output to complete
+        return exit_code
     except KeyboardInterrupt:
         logger.warning("Process interrupted by user")
         return 0
     finally:
-        logger.info("Cleaning up...")
+        if process and process.poll() is not None and (process.returncode < 0 or process.returncode >= 128):
+            # Process crashed - don't print "Cleaning up" to avoid interleaving with crash output
+            pass
+        else:
+            logger.info("Cleaning up...")
         if process:
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)

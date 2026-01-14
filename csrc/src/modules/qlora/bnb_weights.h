@@ -175,6 +175,16 @@ private:
     // Temporary buffer for absmax values during double quantization
     Tensor mAbsmaxBuffer;
 
+    // Staging buffers for expert weights when offloading to CPU.
+    // When offload_experts is enabled, we quantize to GPU staging buffers first,
+    // then copy to pinned CPU memory. This avoids GPU kernels writing directly
+    // to mapped pinned memory, which can cause coherence issues.
+    Tensor mExpertNF4Staging;         ///< GPU buffer for packed NF4 data
+    Tensor mExpertAbsmaxStaging;      ///< GPU buffer for absmax (FP32 or UINT8)
+    Tensor mExpertAbsmaxScaleStaging; ///< GPU buffer for double-quant scale
+    Tensor mExpertAbsmaxOffsetStaging;///< GPU buffer for double-quant offset
+    bool mExpertStagingAllocated = false;
+
     // Allocation helpers
     void allocate_single_block(int layer_idx);
     void allocate_bnb_weight(BnBBlockQuantizedWeight& weight, int M, int K,
@@ -190,7 +200,10 @@ private:
     // Quantization helpers
     void quantize_and_store(BnBBlockQuantizedWeight& dest, const Tensor& src,
                             int M, int K, cudaStream_t stream);
+    void quantize_and_store_offloaded(BnBBlockQuantizedWeight& dest, const Tensor& src,
+                                       int M, int K, cudaStream_t stream);
     void apply_double_quantization(BnBBlockQuantizedWeight& weight, cudaStream_t stream);
+    void allocate_expert_staging_buffers();
 
     // Weight loading helpers
     void load_and_quantize_block(int layer_idx, SafeTensorsReader& reader,

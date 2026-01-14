@@ -368,11 +368,82 @@ def post_process(
 
 
 def concat_datasets(datasets: List[HfDataset]) -> Optional[HfDataset]:
+    """Concatenate datasets, normalizing schemas to handle type mismatches.
+
+    When datasets have columns with the same name but different types (e.g., 'id' as
+    string vs int64), this function removes conflicting columns to allow concatenation.
+    Only columns essential for training (messages, conversations, text, input, output,
+    instruction, response) are preserved.
+    """
     if len(datasets) == 0:
-        return
+        return None
     if len(datasets) == 1:
         return datasets[0]
-    return concatenate_datasets(datasets)
+
+    # Essential columns that should be kept for training
+    # These are the columns that preprocessors actually use
+    essential_columns = {
+        # Conversation format
+        'messages', 'conversations', 'conversation',
+        # Instruction format
+        'instruction', 'input', 'output', 'response', 'system',
+        # Text format
+        'text', 'content',
+        # Common useful fields
+        'question', 'answer', 'query', 'chosen', 'rejected',
+    }
+
+    # Find columns present in all datasets
+    all_columns = [set(ds.column_names) for ds in datasets]
+    common_columns = set.intersection(*all_columns) if all_columns else set()
+
+    # Check for type conflicts in common columns
+    def get_feature_type(feature):
+        """Get a comparable type representation for a feature."""
+        if hasattr(feature, 'dtype'):
+            return str(feature.dtype)
+        return str(type(feature).__name__)
+
+    conflicting_columns = set()
+    for col in common_columns:
+        types = set()
+        for ds in datasets:
+            if col in ds.features:
+                types.add(get_feature_type(ds.features[col]))
+        if len(types) > 1:
+            conflicting_columns.add(col)
+
+    if conflicting_columns:
+        logger.warning(
+            f"Found columns with type conflicts across datasets: {conflicting_columns}. "
+            f"These columns will be removed before concatenation."
+        )
+
+    # Determine which columns to keep:
+    # 1. Must be in all datasets (common)
+    # 2. Must not have type conflicts, OR must be essential
+    # 3. Essential columns with conflicts will be removed (can't reconcile types)
+    columns_to_keep = common_columns - conflicting_columns
+
+    # Also keep essential columns that are common and don't conflict
+    essential_present = essential_columns & common_columns - conflicting_columns
+
+    if not columns_to_keep:
+        raise ValueError(
+            "No common columns remain after removing type-conflicting columns. "
+            "Datasets are incompatible for concatenation."
+        )
+
+    # Remove non-essential columns from each dataset to normalize schemas
+    normalized_datasets = []
+    for ds in datasets:
+        cols_to_remove = [c for c in ds.column_names if c not in columns_to_keep]
+        if cols_to_remove:
+            ds = ds.remove_columns(cols_to_remove)
+        normalized_datasets.append(ds)
+
+    logger.info(f"Concatenating {len(datasets)} datasets with columns: {sorted(columns_to_keep)}")
+    return concatenate_datasets(normalized_datasets)
 
 
 def shuffle_dataset(dataset, seed: int, buffer_size: int = 1000):

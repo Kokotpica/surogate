@@ -287,6 +287,10 @@ private:
     /// Current selection info for selective dequantization caching
     SelectiveExpertInfo mCurrentSelection;
 
+    /// Layer index for which the current expert selection is valid
+    /// Used to avoid reusing cached experts from a different layer
+    int mCurrentExpertLayer = -1;
+
     /// Number of experts currently in the compact buffers
     int mNumActiveExperts = 0;
 
@@ -764,7 +768,10 @@ void FP4WeightProvider<Block>::dequantize_selected_experts(
     // Check if we can reuse the current buffers
     const bool same_layer_step = (mCurrentLayer == layer_idx) && (mBufferVersion == mStepVersion);
 
-    bool selection_matches = same_layer_step && mCurrentSelection.enabled &&
+    // IMPORTANT: Also check that we're on the same layer - don't reuse layer 0's experts for layer 1!
+    bool selection_matches = same_layer_step &&
+                             mCurrentExpertLayer == layer_idx &&
+                             mCurrentSelection.enabled &&
                              mCurrentSelection.num_active == selection_info.num_active;
     if (selection_matches) {
         for (int i = 0; i < selection_info.num_active && selection_matches; ++i) {
@@ -815,6 +822,7 @@ void FP4WeightProvider<Block>::dequantize_selected_experts(
 
     // Update cache state
     mCurrentSelection = selection_info;
+    mCurrentExpertLayer = layer_idx;  // Track which layer these experts are from
     mNumActiveExperts = num_to_dequant;
 
     // Update the expert weights tensor shapes (compact indexing)

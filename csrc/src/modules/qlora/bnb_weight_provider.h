@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <vector>
+#include <iostream>
 
 #include <fmt/core.h>
 
@@ -312,6 +313,10 @@ private:
     /// Current selection info for selective dequantization caching
     /// Tracks which experts are currently in the compact buffers
     SelectiveExpertInfo mCurrentSelection;
+
+    /// Layer index for which the current expert selection is valid
+    /// Used to avoid reusing cached experts from a different layer
+    int mCurrentExpertLayer = -1;
 
     /// Number of experts currently in the compact buffers
     int mNumActiveExperts = 0;
@@ -738,7 +743,10 @@ void BnBWeightProvider<Block>::dequantize_selected_experts(
     // For selective dequant, we need to check if the current selection matches
     // Simple approach: always re-dequantize if selection changed
     // (More sophisticated: check if new selection is subset of current)
-    bool selection_matches = same_layer_step && mCurrentSelection.enabled &&
+    // IMPORTANT: Also check that we're on the same layer - don't reuse layer 0's experts for layer 1!
+    bool selection_matches = same_layer_step &&
+                             mCurrentExpertLayer == layer_idx &&
+                             mCurrentSelection.enabled &&
                              mCurrentSelection.num_active == selection_info.num_active;
     if (selection_matches) {
         // Quick check: compare active expert lists
@@ -805,6 +813,7 @@ void BnBWeightProvider<Block>::dequantize_selected_experts(
     // If we update them here, get_block() will think attention weights are cached
     // when they're not. Instead, we only track expert selection state separately.
     mCurrentSelection = selection_info;
+    mCurrentExpertLayer = layer_idx;  // Track which layer these experts are from
     mNumActiveExperts = num_to_dequant;
 
     // Update the expert weights tensor shapes
@@ -836,11 +845,37 @@ void BnBWeightProvider<Block>::stream_and_dequantize_expert(
     // 1. Copy NF4 packed data from pinned CPU memory to GPU staging buffer
     // 2. Copy absmax scales from CPU to GPU staging buffer
     // 3. Dequantize from GPU staging buffer to destination
+    //
+    // IMPORTANT: The staging buffer is reused for each expert weight tensor.
+    // Since all operations are on the same stream, they are serialized:
+    //   expert[i].gate_up: memcpy -> dequant
+    //   expert[i].down: memcpy -> dequant
+    //   expert[i+1].gate_up: memcpy -> dequant
+    //   ...
+    // No explicit synchronization is needed between operations.
+
+    // Validate input parameters
+    if (src.M <= 0 || src.K <= 0 || src.block_size <= 0 || src.data.Data == nullptr || src.absmax.Data == nullptr) {
+        std::cerr << "[BnB ERROR] Invalid source weight in stream_and_dequantize_expert!\n";
+        std::cerr << "  src.M=" << src.M << ", src.K=" << src.K << "\n";
+        std::cerr << "  src.block_size=" << src.block_size << "\n";
+        std::cerr << "  src.data.Data=" << (void*)src.data.Data << "\n";
+        std::cerr << "  src.absmax.Data=" << (void*)src.absmax.Data << "\n";
+        return;  // Skip this expert to avoid crash
+    }
+    if (src.double_quant && (src.absmax_scale.Data == nullptr || src.absmax_offset.Data == nullptr || src.double_quant_group_size <= 0)) {
+        std::cerr << "[BnB ERROR] Invalid double_quant parameters in stream_and_dequantize_expert!\n";
+        std::cerr << "  src.double_quant=" << src.double_quant << "\n";
+        std::cerr << "  src.double_quant_group_size=" << src.double_quant_group_size << "\n";
+        std::cerr << "  src.absmax_scale.Data=" << (void*)src.absmax_scale.Data << "\n";
+        std::cerr << "  src.absmax_offset.Data=" << (void*)src.absmax_offset.Data << "\n";
+        return;  // Skip this expert to avoid crash
+    }
 
     // Step 1: Copy NF4 packed data (HOST -> DEVICE)
     const size_t data_bytes = src.packed_bytes();
-    cudaMemcpyAsync(mExpertNF4Staging.Data, src.data.Data,
-                    data_bytes, cudaMemcpyHostToDevice, stream);
+    CUDA_CHECK(cudaMemcpyAsync(mExpertNF4Staging.Data, src.data.Data,
+                               data_bytes, cudaMemcpyHostToDevice, stream));
 
     // Step 2: Copy absmax data
     const long num_blocks = src.num_blocks();
@@ -866,7 +901,8 @@ void BnBWeightProvider<Block>::stream_and_dequantize_expert(
             src.M, src.K,
             src.block_size, src.double_quant_group_size,
             mDeviceProps, stream);
-      } else {
+
+    } else {
         // Copy FP32 absmax
         cudaMemcpyAsync(mExpertAbsmaxStaging.Data, src.absmax.Data,
                         num_blocks * sizeof(float), cudaMemcpyHostToDevice, stream);

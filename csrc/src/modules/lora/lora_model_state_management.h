@@ -95,6 +95,16 @@ void ModularLoRAModel<Block>::allocate_run_state(const RuntimeOptions& options, 
     if (model_opts.recompute_lora && model_opts.offload_residuals) {
         model_opts.use_cuda_graphs = false;
     }
+    // MoE + LoRA: CUDA graphs must be disabled because the MoE forward pass
+    // requires cudaStreamSynchronize to copy expert offsets to host, which is
+    // not permitted during graph capture.
+    // Check both architecture type and moe_config presence for robustness.
+    const auto& base_cfg = mBaseModel->config();
+    const bool is_moe = mIsMoEModel || base_cfg.moe_config.has_value() ||
+                        base_cfg.architecture == ArchitectureType::MoE;
+    if (is_moe && lora_enabled()) {
+        model_opts.use_cuda_graphs = false;
+    }
     // Use the ModelOptions overload to apply LoRA-specific flags
     mBaseModel->allocate_run_state(model_opts, comm, B, T, /*allocate_optimizer=*/false);
 

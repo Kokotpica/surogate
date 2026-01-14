@@ -543,6 +543,128 @@ void BnBWeightsManager::load_and_quantize_block(int layer_idx, SafeTensorsReader
     }
 }
 
+void BnBWeightsManager::allocate_expert_staging_buffers() {
+    if (mExpertStagingAllocated) return;
+
+    // Calculate the maximum size for a single expert weight matrix
+    const int hidden = mConfig.hidden_size;
+    const int moe_inter = mConfig.qlora_config.moe_intermediate_size > 0 ?
+                          mConfig.qlora_config.moe_intermediate_size : mConfig.intermediate_size;
+    const int block_size = mScaleConfig.block_size;
+    const bool double_quant = mScaleConfig.double_quant;
+    const int dq_group_size = mScaleConfig.double_quant_group_size;
+
+    // Max elements: gate_up = 2 * moe_inter * hidden, down = hidden * moe_inter
+    const long max_elems = std::max(2L * moe_inter * hidden,
+                                    static_cast<long>(hidden) * moe_inter);
+    const long max_packed_bytes = (max_elems + 1) / 2;
+    const long max_absmax_blocks = (max_elems + block_size - 1) / block_size;
+
+    // Allocate GPU staging buffers
+    void* ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&ptr, max_packed_bytes));
+    mExpertNF4Staging.Data = static_cast<std::byte*>(ptr);
+    mExpertNF4Staging.DType = ETensorDType::BYTE;
+    mExpertNF4Staging.Rank = 1;
+    mExpertNF4Staging.Sizes[0] = max_packed_bytes;
+
+    if (double_quant) {
+        // INT8 absmax
+        CUDA_CHECK(cudaMalloc(&ptr, max_absmax_blocks * sizeof(unsigned char)));
+        mExpertAbsmaxStaging.Data = static_cast<std::byte*>(ptr);
+        mExpertAbsmaxStaging.DType = ETensorDType::BYTE;
+        mExpertAbsmaxStaging.Rank = 1;
+        mExpertAbsmaxStaging.Sizes[0] = max_absmax_blocks;
+
+        const long max_groups = (max_absmax_blocks + dq_group_size - 1) / dq_group_size;
+        CUDA_CHECK(cudaMalloc(&ptr, max_groups * sizeof(float)));
+        mExpertAbsmaxScaleStaging.Data = static_cast<std::byte*>(ptr);
+        mExpertAbsmaxScaleStaging.DType = ETensorDType::FP32;
+        mExpertAbsmaxScaleStaging.Rank = 1;
+        mExpertAbsmaxScaleStaging.Sizes[0] = max_groups;
+
+        CUDA_CHECK(cudaMalloc(&ptr, max_groups * sizeof(float)));
+        mExpertAbsmaxOffsetStaging.Data = static_cast<std::byte*>(ptr);
+        mExpertAbsmaxOffsetStaging.DType = ETensorDType::FP32;
+        mExpertAbsmaxOffsetStaging.Rank = 1;
+        mExpertAbsmaxOffsetStaging.Sizes[0] = max_groups;
+    } else {
+        // FP32 absmax
+        CUDA_CHECK(cudaMalloc(&ptr, max_absmax_blocks * sizeof(float)));
+        mExpertAbsmaxStaging.Data = static_cast<std::byte*>(ptr);
+        mExpertAbsmaxStaging.DType = ETensorDType::FP32;
+        mExpertAbsmaxStaging.Rank = 1;
+        mExpertAbsmaxStaging.Sizes[0] = max_absmax_blocks;
+    }
+
+    mExpertStagingAllocated = true;
+}
+
+void BnBWeightsManager::quantize_and_store_offloaded(BnBBlockQuantizedWeight& dest, const Tensor& src,
+                                                      int M, int K, cudaStream_t stream) {
+    // For offloaded experts, we quantize to GPU staging buffers first,
+    // then copy to the pinned CPU destination. This avoids GPU kernels
+    // writing directly to mapped pinned memory, which can cause issues.
+
+    // Ensure staging buffers are allocated
+    allocate_expert_staging_buffers();
+
+    const long num_elements = static_cast<long>(M) * K;
+    const long num_blocks = (num_elements + dest.block_size - 1) / dest.block_size;
+
+    if (dest.double_quant) {
+        // Step 1: Quantize to NF4 with FP32 absmax in temp buffer (GPU)
+        quantize_bnb_nf4(
+            mExpertNF4Staging.get<unsigned char>(),
+            mAbsmaxBuffer.get<float>(),
+            src.get<nv_bfloat16>(),
+            M, K,
+            dest.block_size,
+            *mDeviceProps,
+            stream);
+
+        // Step 2: Double-quantize absmax to GPU staging
+        const int num_groups = (num_blocks + dest.double_quant_group_size - 1) / dest.double_quant_group_size;
+        quantize_absmax_double(
+            mExpertAbsmaxStaging.get<unsigned char>(),
+            mExpertAbsmaxScaleStaging.get<float>(),
+            mExpertAbsmaxOffsetStaging.get<float>(),
+            mAbsmaxBuffer.get<float>(),
+            static_cast<int>(num_blocks),
+            dest.double_quant_group_size,
+            *mDeviceProps,
+            stream);
+
+        // Step 3: Copy from GPU staging to PINNED destination (D2H)
+        const size_t packed_bytes = (num_elements + 1) / 2;
+        cudaMemcpyAsync(dest.data.Data, mExpertNF4Staging.Data,
+                        packed_bytes, cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(dest.absmax.Data, mExpertAbsmaxStaging.Data,
+                        num_blocks * sizeof(unsigned char), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(dest.absmax_scale.Data, mExpertAbsmaxScaleStaging.Data,
+                        num_groups * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(dest.absmax_offset.Data, mExpertAbsmaxOffsetStaging.Data,
+                        num_groups * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    } else {
+        // Step 1: Quantize to GPU staging
+        quantize_bnb_nf4(
+            mExpertNF4Staging.get<unsigned char>(),
+            mExpertAbsmaxStaging.get<float>(),
+            src.get<nv_bfloat16>(),
+            M, K,
+            dest.block_size,
+            *mDeviceProps,
+            stream);
+
+        // Step 2: Copy from GPU staging to PINNED destination (D2H)
+        const size_t packed_bytes = (num_elements + 1) / 2;
+        cudaMemcpyAsync(dest.data.Data, mExpertNF4Staging.Data,
+                        packed_bytes, cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(dest.absmax.Data, mExpertAbsmaxStaging.Data,
+                        num_blocks * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    }
+}
+
 void BnBWeightsManager::quantize_and_store(BnBBlockQuantizedWeight& dest, const Tensor& src,
                                            int M, int K, cudaStream_t stream) {
     const long num_elements = static_cast<long>(M) * K;
@@ -564,7 +686,7 @@ void BnBWeightsManager::quantize_and_store(BnBBlockQuantizedWeight& dest, const 
             stream);
 
         // Step 2: Apply double quantization to absmax values
-        apply_double_quantization(dest, stream);        
+        apply_double_quantization(dest, stream);
     } else {
         // Single-step quantization: NF4 with FP32 absmax directly
         quantize_bnb_nf4(
@@ -802,6 +924,23 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
     }
 
     // Load and quantize each expert
+    // When offload_experts is enabled, use quantize_and_store_offloaded which
+    // quantizes to GPU staging first, then copies to pinned CPU memory.
+    // This avoids GPU kernels writing directly to mapped pinned memory.
+    const bool use_offload_path = mConfig.offload_experts;
+    if (layer_idx == 0) {
+        std::cerr << "[BnB] Expert offload path: " << (use_offload_path ? "ENABLED (GPU->staging->PINNED)" : "DISABLED (GPU direct)") << "\n";
+    }
+
+    // Helper lambda for expert quantization that uses the right path
+    auto quantize_expert_weight = [&](BnBBlockQuantizedWeight& dest, int M, int K) {
+        if (use_offload_path) {
+            quantize_and_store_offloaded(dest, mLoadBuffer, M, K, stream);
+        } else {
+            quantize_and_store(dest, mLoadBuffer, M, K, stream);
+        }
+    };
+
     for (int e = 0; e < n_experts; ++e) {
         auto& expert = block.experts[e];
         const std::string exp_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
@@ -809,7 +948,13 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
         // Expert gate+up projection (handle both fused and separate)
         const std::string gate_up_name = exp_prefix + ".gate_up_proj.weight";
         if (find_entry_opt(reader, gate_up_name)) {
-            load_and_quantize(gate_up_name, expert.gate_up_proj, 2 * moe_inter, hidden);
+            mLoadBuffer.Sizes[0] = 2 * moe_inter;
+            mLoadBuffer.Sizes[1] = hidden;
+            mLoadBuffer.Rank = 2;
+            if (const auto* entry = find_entry_opt(reader, gate_up_name)) {
+                entry->read_tensor(mLoadBuffer, /*allow_cast=*/true);
+                quantize_expert_weight(expert.gate_up_proj, 2 * moe_inter, hidden);
+            }
         } else {
             // Separate gate and up - fuse them
             mLoadBuffer.Sizes[0] = 2 * moe_inter;
@@ -836,12 +981,43 @@ void BnBWeightsManager::load_and_quantize_moe_block(int layer_idx, SafeTensorsRe
             }
 
             mLoadBuffer.Sizes[0] = 2 * moe_inter;
-            quantize_and_store(expert.gate_up_proj, mLoadBuffer, 2 * moe_inter, hidden, stream);
+            quantize_expert_weight(expert.gate_up_proj, 2 * moe_inter, hidden);
         }
 
         // Expert down projection
-        load_and_quantize(exp_prefix + ".down_proj.weight",
-                          expert.down_proj, hidden, moe_inter);
+        mLoadBuffer.Sizes[0] = hidden;
+        mLoadBuffer.Sizes[1] = moe_inter;
+        mLoadBuffer.Rank = 2;
+        if (const auto* entry = find_entry_opt(reader, exp_prefix + ".down_proj.weight")) {
+            entry->read_tensor(mLoadBuffer, /*allow_cast=*/true);
+            quantize_expert_weight(expert.down_proj, hidden, moe_inter);
+        } else {
+            std::cerr << "[BnB WARN] layer " << layer_idx << " weight not found: "
+                      << exp_prefix << ".down_proj.weight\n";
+        }
+    }
+
+    // Free the staging buffers after all experts are processed
+    // They're only needed during initial quantization
+    if (use_offload_path && mExpertStagingAllocated && layer_idx == mConfig.num_layers - 1) {
+        // Free on the last layer
+        if (mExpertNF4Staging.Data) {
+            CUDA_CHECK(cudaFree(mExpertNF4Staging.Data));
+            mExpertNF4Staging.Data = nullptr;
+        }
+        if (mExpertAbsmaxStaging.Data) {
+            CUDA_CHECK(cudaFree(mExpertAbsmaxStaging.Data));
+            mExpertAbsmaxStaging.Data = nullptr;
+        }
+        if (mExpertAbsmaxScaleStaging.Data) {
+            CUDA_CHECK(cudaFree(mExpertAbsmaxScaleStaging.Data));
+            mExpertAbsmaxScaleStaging.Data = nullptr;
+        }
+        if (mExpertAbsmaxOffsetStaging.Data) {
+            CUDA_CHECK(cudaFree(mExpertAbsmaxOffsetStaging.Data));
+            mExpertAbsmaxOffsetStaging.Data = nullptr;
+        }
+        mExpertStagingAllocated = false;
     }
 }
 

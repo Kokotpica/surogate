@@ -265,7 +265,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     apply_recommended_values: Optional[bool] = False
     num_epochs: Optional[int] = 3
     output_dir: Optional[str] = 'output'
-    checkpoint_dir: Optional[str] = 'output'
+    checkpoint_dir: Optional[str] = None  # Defaults to output_dir if not specified
     resume_from_checkpoint: Optional[bool] = False
     save_steps: Optional[int] = 50
     save_total_limit: Optional[int] = 5

@@ -6,6 +6,8 @@ template<typename Block>
 void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& options, NCCLCommunicator& comm,
                                                          int B, int T, bool allocate_optimizer) {
     NVTX_RANGE_FN();
+    
+    mOptions = options;
 
     // Synchronize Four Over Six (4/6) setting from recipe to weight manager.
     // This ensures cached FP4 weights use the same quantization method as the recipe.
