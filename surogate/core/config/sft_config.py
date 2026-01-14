@@ -406,8 +406,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.use_fused_rope = cfg.get('use_fused_rope', self.use_fused_rope)
         self.fp8_amax_history = cfg.get('fp8_amax_history', self.fp8_amax_history)
         self.fp4_backend = cfg.get('fp4_backend', self.fp4_backend)
-        self.skip_quant_first_layers = cfg.get('skip_quant_first_layers', self.skip_quant_first_layers)
-        self.skip_quant_last_layers = cfg.get('skip_quant_last_layers', self.skip_quant_last_layers)
+        self.skip_quant_first_layers = cfg['skip_quant_first_layers'] if 'skip_quant_first_layers' in cfg else self.skip_quant_first_layers
+        self.skip_quant_last_layers = cfg['skip_quant_last_layers'] if 'skip_quant_last_layers' in cfg else self.skip_quant_last_layers
 
         self.gpus = cfg.get('gpus', self.gpus)
         self.use_cuda_graphs = cfg.get('use_cuda_graphs', self.use_cuda_graphs)
@@ -415,11 +415,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.optimizer = cfg.get('optimizer', self.optimizer)
         self.learning_rate = float(cfg.get('learning_rate', self.learning_rate))
         self.lr_scheduler_type = cfg.get('lr_scheduler_type', self.lr_scheduler_type)
-        self.cooldown_steps = cfg.get('cooldown_steps', self.cooldown_steps)
-        self.final_lr_fraction = float(cfg.get('final_lr_fraction', self.final_lr_fraction))
+        self.cooldown_steps = cfg['cooldown_steps'] if 'cooldown_steps' in cfg else self.cooldown_steps
+        self.final_lr_fraction = float(cfg['final_lr_fraction']) if 'final_lr_fraction' in cfg else self.final_lr_fraction
         self.gradient_accumulation_steps = cfg.get('gradient_accumulation_steps', self.gradient_accumulation_steps)
-        self.max_grad_norm = cfg.get('max_grad_norm', self.max_grad_norm)
-        self.weight_decay = float(cfg.get('weight_decay', self.weight_decay))
+        self.max_grad_norm = float(cfg['max_grad_norm']) if 'max_grad_norm' in cfg else self.max_grad_norm
+        self.weight_decay = float(cfg['weight_decay']) if 'weight_decay' in cfg else self.weight_decay
         self.max_steps = cfg.get('max_steps', self.max_steps)
         self.adamw_beta1 = float(cfg.get('adamw_beta1', self.adamw_beta1))
         self.adamw_beta2 = float(cfg.get('adamw_beta2', self.adamw_beta2))
@@ -430,14 +430,14 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.eval_steps = cfg.get('eval_steps', self.eval_steps)
         self.per_device_train_batch_size = cfg.get('per_device_train_batch_size', self.per_device_train_batch_size)
         self.report_to = cfg.get('report_to', self.report_to)
-        self.warmup_ratio = float(cfg.get('warmup_ratio', self.warmup_ratio))
-        self.warmup_steps = cfg.get('warmup_steps', self.warmup_steps)
+        self.warmup_ratio = float(cfg['warmup_ratio']) if 'warmup_ratio' in cfg else self.warmup_ratio
+        self.warmup_steps = cfg['warmup_steps'] if 'warmup_steps' in cfg else self.warmup_steps
         self.log_file = cfg.get('log_file', self.log_file)
 
         self.lora = cfg.get('lora', self.lora)
         self.lora_rank = cfg.get('lora_rank', self.lora_rank)
         self.lora_alpha = cfg.get('lora_alpha', self.lora_alpha)
-        self.lora_dropout = cfg.get('lora_dropout', self.lora_dropout)
+        self.lora_dropout = cfg['lora_dropout'] if 'lora_dropout' in cfg else self.lora_dropout
         self.lora_dtype = cfg.get('lora_dtype', self.lora_dtype)
         self.lora_target_modules = cfg.get('lora_target_modules', ['all-linear'])
         self.qlora_fp4 = cfg.get('qlora_fp4', self.qlora_fp4)
