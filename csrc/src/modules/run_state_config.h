@@ -103,8 +103,8 @@ struct ModularRunStateConfig {
     // MoE-specific configuration (when is_moe=true)
     int num_experts = 0;
 
-    // PretrainedConfig for IRunState base class initialization
-    PretrainedConfig pretrained_config;
+    // PretrainedConfig for IRunState base class initialization (pointer, not owned)
+    const PretrainedConfig* pretrained_config = nullptr;
 };
 
 } // namespace modules

@@ -93,7 +93,7 @@ std::string save_checkpoint(std::string target, int step, IModel& model, const D
 
     // Export full model weights in HuggingFace-compatible format (config.json + model.safetensors)
     // This allows loading the checkpoint directly with HuggingFace transformers
-    save_pretrained_config(model.get_run_state().Config, (target + "/config.json").c_str());
+    save_pretrained_config(*model.get_run_state().Config, (target + "/config.json").c_str());
     model.export_weights(target + "/model.safetensors", comm);
 
     comm.barrier();  // only write checkpoint.json once we know all the shard files are saved

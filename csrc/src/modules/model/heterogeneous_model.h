@@ -444,12 +444,12 @@ public:
         bool recompute_block = false;
         bool offload_residuals = false;
 
-        // For IRunState base class
-        PretrainedConfig pretrained_config;
+        // For IRunState base class (pointer, not owned by Config)
+        const PretrainedConfig* pretrained_config = nullptr;
     };
 
     HeterogeneousRunState(const Config& config, TensorAllocator& allocator)
-        : IRunState()  // Use default constructor - will set up base later
+        : IRunState(config.pretrained_config->clone(), config.batch_size, config.seq_length, std::shared_ptr<TensorAllocator>(&allocator, [](TensorAllocator*){}))
         , mConfig(config)
         , mAllocator(&allocator)
         , mLayerActivations(config.num_layers)
@@ -760,7 +760,7 @@ public:
         rs_config.layer_configs = mLayerConfigs;
         rs_config.recompute_block = mOptions.recompute_block;
         rs_config.offload_residuals = mOptions.offload_residuals;
-        rs_config.pretrained_config = static_cast<const PretrainedConfig&>(mConfig);
+        rs_config.pretrained_config = &mConfig;
 
         mRunState = std::make_unique<RunState>(rs_config, *mAllocator);
 

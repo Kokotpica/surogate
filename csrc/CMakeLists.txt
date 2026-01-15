@@ -436,6 +436,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
 
             # Training
             src/testing/training/test-modular-training-loop.cpp
+            src/testing/training/test-learning.cpp
 
             # Distributed
             src/testing/distributed/test-nccl.cpp

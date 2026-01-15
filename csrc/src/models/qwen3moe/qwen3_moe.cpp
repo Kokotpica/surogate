@@ -6,6 +6,7 @@
 #include "models/qwen3moe/config.h"
 
 #include <nlohmann/json.hpp>
+#include <fmt/core.h>
 
 #include "utilities/utils.h"
 

@@ -206,7 +206,7 @@ void MultiGPUPyTrainer::export_model(std::string path) {
         std::filesystem::create_directories(p);
 
         if (ctx.Communicator->rank() == 0) {
-            save_pretrained_config(ctx.Model->get_run_state().Config, (p / "config.json").c_str());
+            save_pretrained_config(*ctx.Model->get_run_state().Config, (p / "config.json").c_str());
         }
         ctx.Model->export_weights((p / "model.safetensors").c_str(), *ctx.Communicator);
     });

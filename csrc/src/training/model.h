@@ -155,7 +155,7 @@ class IRunState {
         DataLoader* loader, NCCLCommunicator& comm);
 public:
     IRunState() = default;
-    IRunState(PretrainedConfig config, long batch_size, long seq_len, std::shared_ptr<TensorAllocator> alloc);
+    IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, long seq_len, std::shared_ptr<TensorAllocator> alloc);
     ~IRunState();
 
     IRunState(const IRunState&) = delete;
@@ -184,7 +184,7 @@ public:
     void temp_acquire(Tensor& target);
     void temp_free(Tensor& tensor);
 
-    PretrainedConfig Config;
+    std::unique_ptr<PretrainedConfig> Config;
     long B;     //!< Batch size
     long T;     //!< Sequence length
     int GradAccumSteps = 1;  //!< Most recent grad-accumulation steps (for loss/grad normalization)

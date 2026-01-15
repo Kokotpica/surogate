@@ -19,7 +19,7 @@ template<typename Block>
 ModularRunState<Block>::ModularRunState(
     const typename ModularRunState<Block>::Config& config, DeviceMemoryStack& stack,
     const std::shared_ptr<TensorAllocator>& allocator)
-    : IRunState(config.pretrained_config, config.batch_size, config.seq_length, allocator)
+    : IRunState(config.pretrained_config->clone(), config.batch_size, config.seq_length, allocator)
     , mConfig(config)
     , mAllocator(allocator) {
 
@@ -678,7 +678,7 @@ void ModularRunState<Block>::allocate_non_block_state() {
     Stack.free(simulated_output);
 
     if (!mConfig.use_fused_rope) {
-        int max_seq_len = std::min((int)T, mConfig.pretrained_config.MaxPositionEmbeddings);
+        int max_seq_len = std::min((int)T, mConfig.pretrained_config->MaxPositionEmbeddings);
         int head_size = mConfig.block_config.head_size;
         float rope_theta = mConfig.block_config.rope.theta;
 

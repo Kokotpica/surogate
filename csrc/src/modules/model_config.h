@@ -127,6 +127,10 @@ struct LayerOverride {
  * support for MoE, different activation functions, and per-layer overrides.
  */
 struct ModelConfig : public PretrainedConfig {
+    // Original pretrained config (preserves derived type like Qwen3MoEConfig)
+    // This is used for config saving to preserve all fields
+    std::shared_ptr<PretrainedConfig> original_config;
+
     // Architecture specification
     ArchitectureType architecture = ArchitectureType::Dense;
     ActivationType activation_type = ActivationType::SwiGLU;
@@ -163,6 +167,9 @@ struct ModelConfig : public PretrainedConfig {
      */
     static ModelConfig from_pretrained_config(const PretrainedConfig& base) {
         ModelConfig config;
+
+        // Store the original config to preserve derived type (e.g., Qwen3MoEConfig)
+        config.original_config = base.clone();
 
         // Copy base fields
         config.Architecture = base.Architecture;

@@ -85,7 +85,8 @@ void ModularTransformerModel<Block>::allocate_run_state(const ModelOptions& opti
     }
 
     // Set PretrainedConfig for IRunState base class.
-    rs_config.pretrained_config = static_cast<const PretrainedConfig&>(mConfig);
+    // Use original_config to preserve the full derived type (e.g., Qwen3MoEConfig)
+    rs_config.pretrained_config = mConfig.original_config.get();
 
     // Two-pass stack allocation:
     // 1. First pass with a dummy stack to measure peak temporary usage

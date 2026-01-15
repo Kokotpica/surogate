@@ -42,7 +42,7 @@ Tensor& IModel::get_position_ids_buffer() {
 }
 
 
-IRunState::IRunState(PretrainedConfig config, long batch_size, long seq_len, std::shared_ptr<TensorAllocator> alloc) : Config(config), B(batch_size), T(seq_len), Allocator(std::move(alloc)) {
+IRunState::IRunState(std::unique_ptr<PretrainedConfig> config, long batch_size, long seq_len, std::shared_ptr<TensorAllocator> alloc) : Config(std::move(config)), B(batch_size), T(seq_len), Allocator(std::move(alloc)) {
     int did;
     CUDA_CHECK(cudaGetDevice(&did));
     DeviceId = did;
