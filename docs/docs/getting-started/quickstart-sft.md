@@ -218,10 +218,6 @@ gradient_accumulation_steps: 8
 sequence_len: 2048
 ```
 
-### Example MoE Configs
-
-- [qwen3moe-lora-bf16.yaml](../../examples/sft/qwen3moe-lora-bf16.yaml) - Standard MoE training
-- [qwen3moe-lora-qbnb.yaml](../../examples/sft/qwen3moe-lora-qbnb.yaml) - MoE with QLoRA (BitsAndBytes quantization)
 
 ## Notes
 
