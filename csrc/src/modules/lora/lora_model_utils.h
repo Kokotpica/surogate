@@ -28,6 +28,9 @@ inline void apply_lora_contribution(
     Tensor& intermediate,
     Tensor& slice_buffer,
     float scaling,
+    float dropout_prob,
+    unsigned int dropout_seed,
+    bool is_training,
     int BT,
     int in_features,
     int out_features,
@@ -42,6 +45,11 @@ inline void apply_lora_contribution(
     // intermediate = input @ A^T  (BT x rank)
     matmul(intermediate, lora.A, input, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+    // Apply dropout to intermediate activations (inverted dropout)
+    if (is_training && dropout_prob > 0.0f) {
+        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
+    }
 
     // Scale intermediate so we can use GEMM accumulate for B @ intermediate^T.
     if (scaling != 1.0f) {
@@ -100,6 +108,9 @@ inline void apply_lora_contribution_fp32(
     Tensor& intermediate,
     Tensor& slice_buffer,
     float scaling,
+    float dropout_prob,
+    unsigned int dropout_seed,
+    bool is_training,
     int BT,
     int in_features,
     int out_features,
@@ -115,6 +126,11 @@ inline void apply_lora_contribution_fp32(
     // Compute in work dtype (typically BF16)
     matmul(intermediate, lora.A, input, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+    // Apply dropout to intermediate activations (inverted dropout)
+    if (is_training && dropout_prob > 0.0f) {
+        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
+    }
 
     // Scale intermediate so the final B projection includes the LoRA scaling
     if (scaling != 1.0f) {
@@ -199,6 +215,9 @@ inline void backward_lora_router(
     const Tensor& A,
     const Tensor& B,
     float scaling,
+    float dropout_prob,
+    unsigned int dropout_seed,
+    bool is_training,
     Tensor& intermediate,
     Tensor& intermediate2,
     Tensor& slice_buffer,
@@ -230,6 +249,11 @@ inline void backward_lora_router(
     matmul(intermediate, A, input, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
 
+    // Apply dropout with same mask as forward pass
+    if (is_training && dropout_prob > 0.0f) {
+        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
+    }
+
     // Apply scaling to intermediate
     if (scaling != 1.0f) {
         vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
@@ -257,6 +281,11 @@ inline void backward_lora_router(
     // In column-major: temp^T(rank, BT) = B(rank, E) @ d_logits_bf16^T(E, BT)
     matmul(temp, B, d_logits_bf16, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+
+    // Apply dropout with same mask as forward pass
+    if (is_training && dropout_prob > 0.0f) {
+        lora_dropout_scale(temp, dropout_prob, dropout_seed, stream);
+    }
 
     // Apply scaling
     if (scaling != 1.0f) {
@@ -301,6 +330,10 @@ inline void apply_expert_lora(
     Tensor& intermediate,
     Tensor& slice_buffer,
     float scaling,
+    float dropout_prob,
+    unsigned int dropout_base_seed,
+    bool is_training,
+    int expert_idx,   // Expert index for unique dropout seed
     int N,            // Number of tokens for this expert
     int C,            // Hidden size
     int D,            // Expert intermediate size
@@ -311,11 +344,18 @@ inline void apply_expert_lora(
 
     if (N <= 0) return;
 
+    // Helper to compute unique dropout seed per projection
+    auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+        // seed = base_seed + expert_idx * 10000 + proj_type * 1000
+        return dropout_base_seed + expert_idx * 10000 + proj_type * 1000;
+    };
+
     // Apply LoRA to gate projection (first half of gate_up)
     if (expert_lora.gate.has_value() && expert_lora.gate->has_value()) {
         apply_lora_contribution(gate_up, D, expert_input, *expert_lora.gate,
                                 intermediate, slice_buffer,
-                                scaling, N, C, D, rank,
+                                scaling, dropout_prob, get_dropout_seed(0), is_training,
+                                N, C, D, rank,
                                 handle, workspace, stream);
     }
 
@@ -324,7 +364,8 @@ inline void apply_expert_lora(
     if (expert_lora.up.has_value() && expert_lora.up->has_value()) {
         apply_lora_contribution(gate_up, 0, expert_input, *expert_lora.up,
                                 intermediate, slice_buffer,
-                                scaling, N, C, D, rank,
+                                scaling, dropout_prob, get_dropout_seed(1), is_training,
+                                N, C, D, rank,
                                 handle, workspace, stream);
     }
 
@@ -332,7 +373,8 @@ inline void apply_expert_lora(
     if (expert_lora.down.has_value() && expert_lora.down->has_value()) {
         apply_lora_contribution(down_output, 0, activated, *expert_lora.down,
                                 intermediate, slice_buffer,
-                                scaling, N, D, C, rank,
+                                scaling, dropout_prob, get_dropout_seed(2), is_training,
+                                N, D, C, rank,
                                 handle, workspace, stream);
     }
 }
@@ -347,6 +389,9 @@ inline void backward_lora_layer(
     const Tensor& A,
     const Tensor& B,
     float scaling,
+    float dropout_prob,
+    unsigned int dropout_seed,
+    bool is_training,
     Tensor& intermediate,
     Tensor& slice_buffer,
     int BT,
@@ -387,20 +432,32 @@ inline void backward_lora_layer(
         dL_dy_offset = 0;
     }
 
-    // intermediate = x @ A^T (BT x rank)
+    // intermediate = x @ A^T (BT x rank) - recompute forward for dB
     matmul(intermediate, A, x, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+    // Apply same dropout mask as forward (same seed produces identical mask)
+    if (is_training && dropout_prob > 0.0f) {
+        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
+    }
+
     if (scaling != 1.0f) {
         vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
     }
 
-    // dB = (x @ A^T)^T @ dL_dy
+    // dB = (x @ A^T)^T @ dL_dy (uses dropout-ed intermediate)
     matmul(dB, intermediate, dL_dy_slice, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, out_features, BT, EMMTranspose::NT, /*accumulate=*/accumulate, stream);
 
-    // intermediate = B @ dL_dy^T  => (BT x rank) view
+    // intermediate = B @ dL_dy^T  => (BT x rank) view - gradient w.r.t. dropped activations
     matmul(intermediate, B, dL_dy_slice, std::nullopt, nullptr, nullptr,
            handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+
+    // Apply same dropout mask to gradient (backprop through dropout)
+    if (is_training && dropout_prob > 0.0f) {
+        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
+    }
+
     if (scaling != 1.0f) {
         vector_add_sr(intermediate, intermediate, intermediate, 0.5f * scaling, intermediate.nelem(), /*seed=*/0, stream);
     }
@@ -458,6 +515,10 @@ inline void backward_lora_expert(
     Tensor& intermediate,
     Tensor& slice_buffer,
     float scaling,
+    float dropout_prob,
+    unsigned int dropout_base_seed,
+    bool is_training,
+    int expert_idx,   // Expert index for unique dropout seed
     int N,            // Number of tokens for this expert
     int C,            // Hidden size
     int D,            // Expert intermediate size
@@ -468,6 +529,12 @@ inline void backward_lora_expert(
     cudaStream_t stream) {
 
     if (N <= 0) return;
+
+    // Helper to compute unique dropout seed per projection
+    auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+        // seed = base_seed + expert_idx * 10000 + proj_type * 1000
+        return dropout_base_seed + expert_idx * 10000 + proj_type * 1000;
+    };
 
     // Backward through down projection LoRA
     // y_down += scaling * B_down @ (A_down @ activated^T)^T
@@ -485,6 +552,7 @@ inline void backward_lora_expert(
             expert_lora_weights.down->A,
             expert_lora_weights.down->B,
             scaling,
+            dropout_prob, get_dropout_seed(2), is_training,  // proj_type=2 for down
             intermediate, slice_buffer,
             N, D, C, rank, accumulate,
             handle, workspace, stream);
@@ -503,6 +571,7 @@ inline void backward_lora_expert(
             expert_lora_weights.gate->A,
             expert_lora_weights.gate->B,
             scaling,
+            dropout_prob, get_dropout_seed(0), is_training,  // proj_type=0 for gate
             intermediate, slice_buffer,
             N, C, D, rank, accumulate,
             handle, workspace, stream);
@@ -520,6 +589,7 @@ inline void backward_lora_expert(
             expert_lora_weights.up->A,
             expert_lora_weights.up->B,
             scaling,
+            dropout_prob, get_dropout_seed(1), is_training,  // proj_type=1 for up
             intermediate, slice_buffer,
             N, C, D, rank, accumulate,
             handle, workspace, stream);
@@ -564,6 +634,11 @@ inline void backward_lora_qkv_fused(
     const LoRALayerWeights<Tensor>& lora_v,
     // Dimensions
     float scaling,
+    float dropout_prob,
+    unsigned int dropout_seed_q,
+    unsigned int dropout_seed_k,
+    unsigned int dropout_seed_v,
+    bool is_training,
     int BT,
     int in_features,    // C (hidden size)
     int q_out_features, // Hq * Hs
@@ -623,6 +698,12 @@ inline void backward_lora_qkv_fused(
         // intermediate1 = x @ A_q^T (BT x rank)
         matmul(intermediate1, lora_q.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask as forward
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_q, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
@@ -634,6 +715,12 @@ inline void backward_lora_qkv_fused(
         // intermediate2 = B_q @ dL_dy_q^T (for dA_q and dx)
         matmul(intermediate2, lora_q.B, dL_dy_q, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, q_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask to gradient (backprop through dropout)
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_q, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
@@ -653,6 +740,12 @@ inline void backward_lora_qkv_fused(
         // intermediate1 = x @ A_k^T (BT x rank)
         matmul(intermediate1, lora_k.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask as forward
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_k, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
@@ -664,6 +757,12 @@ inline void backward_lora_qkv_fused(
         // intermediate2 = B_k @ dL_dy_k^T
         matmul(intermediate2, lora_k.B, dL_dy_k, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask to gradient (backprop through dropout)
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_k, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
@@ -683,6 +782,12 @@ inline void backward_lora_qkv_fused(
         // intermediate1 = x @ A_v^T (BT x rank)
         matmul(intermediate1, lora_v.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask as forward
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_v, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
@@ -694,6 +799,12 @@ inline void backward_lora_qkv_fused(
         // intermediate2 = B_v @ dL_dy_v^T
         matmul(intermediate2, lora_v.B, dL_dy_v, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, kv_out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask to gradient (backprop through dropout)
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_v, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
@@ -739,6 +850,10 @@ inline void backward_lora_mlp_up_gate_fused(
     const LoRALayerWeights<Tensor>& lora_gate,
     // Dimensions
     float scaling,
+    float dropout_prob,
+    unsigned int dropout_seed_up,
+    unsigned int dropout_seed_gate,
+    bool is_training,
     int BT,
     int in_features,    // C (hidden size)
     int out_features,   // D (intermediate size)
@@ -790,6 +905,12 @@ inline void backward_lora_mlp_up_gate_fused(
         // intermediate1 = x @ A_up^T
         matmul(intermediate1, lora_up.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask as forward
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_up, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
@@ -801,6 +922,12 @@ inline void backward_lora_mlp_up_gate_fused(
         // intermediate2 = B_up @ dL_dy_up^T
         matmul(intermediate2, lora_up.B, dL_dy_up, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask to gradient (backprop through dropout)
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_up, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
@@ -821,6 +948,12 @@ inline void backward_lora_mlp_up_gate_fused(
         // intermediate1 = x @ A_gate^T
         matmul(intermediate1, lora_gate.A, x, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, in_features, EMMTranspose::TN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask as forward
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate1, dropout_prob, dropout_seed_gate, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate1, intermediate1, intermediate1, 0.5f * scaling, intermediate1.nelem(), /*seed=*/0, stream);
         }
@@ -832,6 +965,12 @@ inline void backward_lora_mlp_up_gate_fused(
         // intermediate2 = B_gate @ dL_dy_gate^T
         matmul(intermediate2, lora_gate.B, dL_dy_gate, std::nullopt, nullptr, nullptr,
                handle, workspace, rank, BT, out_features, EMMTranspose::NN, /*accumulate=*/false, stream);
+
+        // Apply same dropout mask to gradient (backprop through dropout)
+        if (is_training && dropout_prob > 0.0f) {
+            lora_dropout_scale(intermediate2, dropout_prob, dropout_seed_gate, stream);
+        }
+
         if (scaling != 1.0f) {
             vector_add_sr(intermediate2, intermediate2, intermediate2, 0.5f * scaling, intermediate2.nelem(), /*seed=*/0, stream);
         }
@@ -844,8 +983,9 @@ inline void backward_lora_mlp_up_gate_fused(
         matmul(dx, lora_gate.A, intermediate2, std::nullopt, nullptr, nullptr,
                handle, workspace, in_features, BT, rank, EMMTranspose::NN, /*accumulate=*/true, stream);
     }
+}
+
 } // namespace detail
-    }
 } // namespace modules
 
 #endif // SUROGATE_SRC_MODULES_LORA_LORA_MODEL_UTILS_H

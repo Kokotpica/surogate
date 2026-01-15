@@ -28,7 +28,11 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
         if (mBnBWeightProvider) mBnBWeightProvider->invalidate_cache();
     }
 
-    auto hook = [this](int layer_idx, cudaStream_t stream, ForwardHookPoint point, void* context) {
+    // Store micro_step for dropout seed computation (needed by backward pass)
+    mLoRARunState->micro_step = micro_step;
+    mLoRARunState->is_training = true;
+
+    auto hook = [this, micro_step](int layer_idx, cudaStream_t stream, ForwardHookPoint point, void* context) {
         const auto& cfg = mBaseModel->config();
         auto& rs = mBaseModel->run_state();
         const int B = (int)rs.B;
@@ -42,6 +46,17 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
         const int Hs = (int)cfg.head_size();
         const int rank = mLoRAConfig.rank;
         const float scaling = mLoRAConfig.scaling();
+        const float dropout = mLoRAConfig.dropout;
+        const bool is_training = mLoRARunState->is_training;
+
+        // Helper to compute unique dropout seed per layer and projection type
+        auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+            // seed = base_seed + layer_idx * 1000000 + proj_type * 100000 + micro_step * 10000
+            return mLoRARunState->dropout_base_seed
+                   + static_cast<unsigned int>(layer_idx) * 1000000u
+                   + static_cast<unsigned int>(proj_type) * 100000u
+                   + static_cast<unsigned int>(micro_step) * 10000u;
+        };
 
         auto& acts = rs.simplified_acts(layer_idx);
         auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
@@ -131,22 +146,26 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                 }
             } break;
             case ForwardHookPoint::AfterQKVProjection: {
+                // Projection types: 0=Q, 1=K, 2=V, 3=O, 4=Up, 5=Gate, 6=Down, 7=Router
                 if (lora_block.attention.q.has_value()) {
                     detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, Hq * Hs, rank,
+                                                    scaling, dropout, get_dropout_seed(0), is_training,
+                                                    B * T, C, Hq * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
                 if (lora_block.attention.k.has_value()) {
                     detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, Hkv * Hs, rank,
+                                                    scaling, dropout, get_dropout_seed(1), is_training,
+                                                    B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
                 if (lora_block.attention.v.has_value()) {
                     detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, Hkv * Hs, rank,
+                                                    scaling, dropout, get_dropout_seed(2), is_training,
+                                                    B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
@@ -154,7 +173,8 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                 if (lora_block.attention.o.has_value()) {
                     detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, Hq * Hs, C, rank,
+                                                    scaling, dropout, get_dropout_seed(3), is_training,
+                                                    B * T, Hq * Hs, C, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
@@ -162,13 +182,15 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                 if (lora_block.mlp.up.has_value()) {
                     detail::apply_lora_contribution(acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, D, rank,
+                                                    scaling, dropout, get_dropout_seed(4), is_training,
+                                                    B * T, C, D, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
                 if (lora_block.mlp.gate.has_value()) {
                     detail::apply_lora_contribution(acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, D, rank,
+                                                    scaling, dropout, get_dropout_seed(5), is_training,
+                                                    B * T, C, D, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
@@ -176,7 +198,8 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                 if (lora_block.mlp.down.has_value()) {
                     detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, D, C, rank,
+                                                    scaling, dropout, get_dropout_seed(6), is_training,
+                                                    B * T, D, C, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
@@ -190,7 +213,8 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                     detail::apply_lora_contribution_fp32(
                         *router_ctx->logits, 0, *router_ctx->input, *lora_block.router,
                         mLoRARunState->intermediate, mLoRARunState->slice,
-                        scaling, B * T, C, E, rank,
+                        scaling, dropout, get_dropout_seed(7), is_training,
+                        B * T, C, E, rank,
                         rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
@@ -289,22 +313,26 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
                 }
             } break;
             case ForwardHookPoint::AfterQKVProjection: {
+                // Validation: no dropout (is_training=false)
                 if (lora_block.attention.q.has_value()) {
                     detail::apply_lora_contribution(acts.qkv, 0, acts.ln1, lora_block.attention.q.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, Hq * Hs, rank,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, Hq * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
                 if (lora_block.attention.k.has_value()) {
                     detail::apply_lora_contribution(acts.qkv, Hq * Hs, acts.ln1, lora_block.attention.k.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, Hkv * Hs, rank,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
                 if (lora_block.attention.v.has_value()) {
                     detail::apply_lora_contribution(acts.qkv, (Hq + Hkv) * Hs, acts.ln1, lora_block.attention.v.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, Hkv * Hs, rank,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, Hkv * Hs, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
@@ -312,7 +340,8 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
                 if (lora_block.attention.o.has_value()) {
                     detail::apply_lora_contribution(acts.att_out, 0, acts.att, lora_block.attention.o.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, Hq * Hs, C, rank,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, Hq * Hs, C, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
@@ -320,13 +349,15 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
                 if (lora_block.mlp.up.has_value()) {
                     detail::apply_lora_contribution(acts.mlp_up, 0, acts.ln2, lora_block.mlp.up.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, D, rank,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, D, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
                 if (lora_block.mlp.gate.has_value()) {
                     detail::apply_lora_contribution(acts.mlp_up, D, acts.ln2, lora_block.mlp.gate.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, C, D, rank,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, C, D, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;
@@ -334,7 +365,8 @@ float ModularLoRAModel<Block>::validate(Tensor inputs, Tensor position_ids, Tens
                 if (lora_block.mlp.down.has_value()) {
                     detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
                                                     mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, B * T, D, C, rank,
+                                                    scaling, 0.0f, 0, false,
+                                                    B * T, D, C, rank,
                                                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
                 }
             } break;

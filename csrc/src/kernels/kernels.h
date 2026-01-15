@@ -1520,4 +1520,21 @@ void moe_grouped_gemm_gate_up_backward(nv_bfloat16* d_input, const nv_bfloat16* 
                                         bool weight_is_compact = true,
                                         int num_active_experts = -1);
 
+// ----------------------------------------------------------------------------
+// LoRA Dropout
+// ----------------------------------------------------------------------------
+
+/**
+ * @brief Apply in-place dropout scaling to LoRA intermediate activations.
+ *
+ * Uses deterministic Squirrel Noise 5 for reproducible dropout masks.
+ * Same seed produces identical masks in forward and backward passes.
+ *
+ * @param intermediate Tensor to apply dropout to (modified in place)
+ * @param dropout_prob Dropout probability (0.0 = no dropout)
+ * @param seed Random seed for deterministic mask generation
+ * @param stream CUDA stream
+ */
+void lora_dropout_scale(Tensor& intermediate, float dropout_prob, unsigned int seed, cudaStream_t stream);
+
 #endif //SUROGATE_SRC_KERNELS_KERNELS_H

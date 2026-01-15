@@ -291,6 +291,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/random.cu
     src/kernels/fill.cu
     src/kernels/convert.cu
+    src/kernels/lora_dropout.cu
 
     # FP8 Hybrid recipe kernels
     src/recipes/fp8_hybrid/kernels/quant.cu
@@ -400,6 +401,7 @@ if (BUILD_TESTS)
 	            src/testing/test-moe.cu
 	            src/testing/test_moe.cpp
 	            src/testing/test-fast-lora-silu.cu
+	            src/testing/test-lora-dropout.cu
 	            src/testing/test-heterogeneous.cu
 	    )
     target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)

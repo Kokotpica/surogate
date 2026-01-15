@@ -32,6 +32,11 @@ struct LoRARunState {
     // MoE expert LoRA state: pointers to current expert activations during hook execution.
     // These are set by the MoE block before calling expert hooks and read by the hook callback.
     // This avoids the need to pass activation pointers through the hook signature.
+
+    // Dropout state: used to maintain consistent dropout masks between forward and backward passes
+    bool is_training = true;              ///< Training mode (dropout applied) vs eval mode (no dropout)
+    int micro_step = 0;                   ///< Current micro-step for seed computation
+    unsigned int dropout_base_seed = 42;  ///< Base seed for dropout RNG
 };
 
 } // namespace modules

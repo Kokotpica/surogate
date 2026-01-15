@@ -266,6 +266,17 @@ void ModularLoRAModel<Block>::backward_lora_qkv(int layer_idx, int B, int T, boo
     const int Hkv = (int)cfg.NumKeyValHeads;
     const int Hs = (int)cfg.head_size();
     const int rank = mLoRAConfig.rank;
+    const float dropout = mLoRAConfig.dropout;
+    const bool is_training = mLoRARunState->is_training;
+    const int micro_step = mLoRARunState->micro_step;
+
+    // Helper to compute unique dropout seed per layer and projection type
+    auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+        return mLoRARunState->dropout_base_seed
+               + static_cast<unsigned int>(layer_idx) * 1000000u
+               + static_cast<unsigned int>(proj_type) * 100000u
+               + static_cast<unsigned int>(micro_step) * 10000u;
+    };
 
     auto& rs = mBaseModel->run_state();
     auto& a = rs.simplified_acts(layer_idx);
@@ -308,6 +319,7 @@ void ModularLoRAModel<Block>::backward_lora_qkv(int layer_idx, int B, int T, boo
         lora_v = *lora_block.attention.v;
     }
 
+    // Projection types: 0=Q, 1=K, 2=V
     detail::backward_lora_qkv_fused(
         dA_q, dB_q,
         dA_k, dB_k,
@@ -317,6 +329,7 @@ void ModularLoRAModel<Block>::backward_lora_qkv(int layer_idx, int B, int T, boo
         ln1_input,
         lora_q, lora_k, lora_v,
         mLoRAConfig.scaling(),
+        dropout, get_dropout_seed(0), get_dropout_seed(1), get_dropout_seed(2), is_training,
         B * T,
         C,
         Hq * Hs,
@@ -338,6 +351,15 @@ void ModularLoRAModel<Block>::backward_lora_attn_out(int layer_idx, int B, int T
     const int Hq = (int)cfg.NumQueryHeads;
     const int Hs = (int)cfg.head_size();
     const int rank = mLoRAConfig.rank;
+    const float dropout = mLoRAConfig.dropout;
+    const bool is_training = mLoRARunState->is_training;
+    const int micro_step = mLoRARunState->micro_step;
+
+    // Projection type 3 = O
+    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
+                                      + static_cast<unsigned int>(layer_idx) * 1000000u
+                                      + 3u * 100000u
+                                      + static_cast<unsigned int>(micro_step) * 10000u;
 
     auto& rs = mBaseModel->run_state();
     auto& a = rs.simplified_acts(layer_idx);
@@ -360,6 +382,7 @@ void ModularLoRAModel<Block>::backward_lora_attn_out(int layer_idx, int B, int T
                                x,
                                lora_block.attention.o->A, lora_block.attention.o->B,
                                mLoRAConfig.scaling(),
+                               dropout, dropout_seed, is_training,
                                mLoRARunState->intermediate, mLoRARunState->slice,
                                B * T, Hq * Hs, C, rank, lora_accum,
                                rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
@@ -371,6 +394,17 @@ void ModularLoRAModel<Block>::backward_lora_mlp_up(int layer_idx, int B, int T, 
     const int C = (int)cfg.HiddenSize;
     const int D = (int)cfg.IntermediateSize;
     const int rank = mLoRAConfig.rank;
+    const float dropout = mLoRAConfig.dropout;
+    const bool is_training = mLoRARunState->is_training;
+    const int micro_step = mLoRARunState->micro_step;
+
+    // Helper to compute unique dropout seed per layer and projection type
+    auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+        return mLoRARunState->dropout_base_seed
+               + static_cast<unsigned int>(layer_idx) * 1000000u
+               + static_cast<unsigned int>(proj_type) * 100000u
+               + static_cast<unsigned int>(micro_step) * 10000u;
+    };
 
     auto& rs = mBaseModel->run_state();
     auto& a = rs.simplified_acts(layer_idx);
@@ -407,6 +441,7 @@ void ModularLoRAModel<Block>::backward_lora_mlp_up(int layer_idx, int B, int T, 
         lora_gate = *lora_block.mlp.gate;
     }
 
+    // Projection types: 4=Up, 5=Gate
     detail::backward_lora_mlp_up_gate_fused(
         dA_up, dB_up,
         dA_gate, dB_gate,
@@ -415,6 +450,7 @@ void ModularLoRAModel<Block>::backward_lora_mlp_up(int layer_idx, int B, int T, 
         ln2_input,
         lora_up, lora_gate,
         mLoRAConfig.scaling(),
+        dropout, get_dropout_seed(4), get_dropout_seed(5), is_training,
         B * T,
         C,
         D,
@@ -434,6 +470,15 @@ void ModularLoRAModel<Block>::backward_lora_mlp_down(int layer_idx, int B, int T
     const int C = (int)cfg.HiddenSize;
     const int D = (int)cfg.IntermediateSize;
     const int rank = mLoRAConfig.rank;
+    const float dropout = mLoRAConfig.dropout;
+    const bool is_training = mLoRARunState->is_training;
+    const int micro_step = mLoRARunState->micro_step;
+
+    // Projection type 6 = Down
+    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
+                                      + static_cast<unsigned int>(layer_idx) * 1000000u
+                                      + 6u * 100000u
+                                      + static_cast<unsigned int>(micro_step) * 10000u;
 
     auto& rs = mBaseModel->run_state();
     auto& a = rs.simplified_acts(layer_idx);
@@ -456,6 +501,7 @@ void ModularLoRAModel<Block>::backward_lora_mlp_down(int layer_idx, int B, int T
                                x,
                                lora_block.mlp.down->A, lora_block.mlp.down->B,
                                mLoRAConfig.scaling(),
+                               dropout, dropout_seed, is_training,
                                mLoRARunState->intermediate, mLoRARunState->slice,
                                B * T, D, C, rank, lora_accum,
                                rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
@@ -468,6 +514,15 @@ void ModularLoRAModel<Block>::backward_lora_router(int layer_idx, MoERouterBackw
     const int E = ctx->num_experts;
     const int BT = ctx->BT;
     const int rank = mLoRAConfig.rank;
+    const float dropout = mLoRAConfig.dropout;
+    const bool is_training = mLoRARunState->is_training;
+    const int micro_step = mLoRARunState->micro_step;
+
+    // Projection type 7 = Router
+    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
+                                      + static_cast<unsigned int>(layer_idx) * 1000000u
+                                      + 7u * 100000u
+                                      + static_cast<unsigned int>(micro_step) * 10000u;
 
     auto& rs = mBaseModel->run_state();
 
@@ -490,6 +545,7 @@ void ModularLoRAModel<Block>::backward_lora_router(int layer_idx, MoERouterBackw
         lora_block.router->A,
         lora_block.router->B,
         mLoRAConfig.scaling(),
+        dropout, dropout_seed, is_training,
         mLoRARunState->intermediate,
         mLoRARunState->intermediate2,
         mLoRARunState->slice,
