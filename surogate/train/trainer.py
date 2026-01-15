@@ -10,6 +10,7 @@ from surogate.core.config.sft_config import SFTConfig
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.reporter import training_logger_context
 from surogate.train.training_plot import generate_training_plot
+from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info, print_system_diagnostics
@@ -173,7 +174,28 @@ class SurogateTrainerWrapper():
                 self.trainer.export_adapter(str(adapter_dir))
                 logger.info("done")
                 logger.info(f"LoRA adapter saved to {adapter_dir}")
-                logger.info("To use with HuggingFace PEFT, load the base model and apply this adapter.")
+
+                # Merge adapter into base model if requested
+                if self.config.merge_adapter:
+                    merged_dir = Path(self.config.output_dir) / "merged"
+                    try:
+                        merge_adapter(
+                            base_model_path=self.config.model_dir,
+                            adapter_path=str(adapter_dir),
+                            output_path=str(merged_dir),
+                            max_shard_size="5GB",
+                            cpu_offload=True
+                        )
+                        # Generate training plot in merged directory
+                        generate_training_plot(self.config.log_file, merged_dir / "training_plot.png")
+                    except Exception as e:
+                        logger.error(f"Failed to merge adapter: {e}")
+                        import traceback
+                        logger.error(f"Traceback:\n{traceback.format_exc()}")
+                        logger.warning("Adapter merge failed, but adapter was saved successfully")
+                else:
+                    logger.info("To use with HuggingFace PEFT, load the base model and apply this adapter.")
+
                 # Generate training plot in adapter directory
                 generate_training_plot(self.config.log_file, adapter_dir / "training_plot.png")
             else:

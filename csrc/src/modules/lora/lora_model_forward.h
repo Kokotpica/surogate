@@ -111,6 +111,20 @@ void ModularLoRAModel<Block>::forward(Tensor inputs, Tensor position_ids, NCCLCo
                                 moe_ctx->host_offsets,
                                 selection_info.enabled ? &selection_info : nullptr
                             );
+
+                            // Copy base gate_up to context for backward pass reconstruction.
+                            // grouped_fast_expert_lora_forward writes the base projection (before LoRA)
+                            // to moe_lora_gate_up. The backward pass needs this to reconstruct
+                            // the forward activations for correct gradient computation.
+                            if (moe_ctx->expert_gate_up && moe_ctx->expert_gate_up->Data) {
+                                CUDA_CHECK(cudaMemcpyAsync(
+                                    moe_ctx->expert_gate_up->Data,
+                                    mLoRARunState->moe_lora_gate_up.Data,
+                                    mLoRARunState->moe_lora_gate_up.bytes(),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream));
+                            }
+
                             moe_ctx->handled = true;
                         }
                     }

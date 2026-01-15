@@ -244,6 +244,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Whether to use chat template for training.
         merge_adapter: (Optional[bool], defaults to False):
             Whether to merge LoRA adapters into the base model after training.
+            When enabled, saves both the adapter (in output_dir/adapter/) and merged model (in output_dir/merged/).
 
         debug_time_breakdown (Optional[bool], defaults to False):
             Whether to enable detailed training timing breakdown for debugging.

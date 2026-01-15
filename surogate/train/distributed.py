@@ -875,6 +875,24 @@ class RayDistributedTrainer:
                         logger.info(f"LoRA adapter saved to {adapter_dir} (export timed out but file exists)")
                     else:
                         logger.warning(f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed.")
+
+                # Merge adapter into base model if requested (only on head node)
+                if config.merge_adapter:
+                    from surogate.utils.adapter_merge import merge_adapter
+                    merged_dir = Path(config.output_dir) / "merged"
+                    try:
+                        merge_adapter(
+                            base_model_path=config.model_dir,
+                            adapter_path=adapter_dir,
+                            output_path=str(merged_dir),
+                            max_shard_size="5GB",
+                            cpu_offload=True
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to merge adapter: {e}")
+                        import traceback
+                        logger.error(f"Traceback:\n{traceback.format_exc()}")
+                        logger.warning("Adapter merge failed, but adapter was saved successfully")
             else:
                 logger.info(f"Exporting model to {config.output_dir}...")
                 # Call export on ALL nodes - they all participate in NCCL barriers

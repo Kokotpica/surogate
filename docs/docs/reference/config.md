@@ -1,8 +1,4 @@
-# Config Reference
-
-This page is the canonical reference for all configuration options.
-
----
+# Configuration Reference
 
 This section provides a comprehensive reference for all configuration options available in Surogate. Each option is described in detail, including its purpose, default value, and possible values.
 
@@ -67,7 +63,9 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 | `use_zero_copy`      | bool | `false` | Use ZeroCopy memory access instead of double-buffered cudaMemcpy for offloaded optimizer states. DMA is slower on consumer cards but faster on professional cards.                                                            |
 | `use_write_combined` | bool | `false` | Use write-combined memory for offloaded tensors. May improve PCIe throughput in some situations.                                                                                                                              |
 
-## Distributed Training (ZeRO) Options
+## Multi-GPU Training (ZeRO) Options
+
+These options apply to single-node multi-GPU training. For multi-node distributed training, see [Multi-Node Distributed Training](#multi-node-distributed-training).
 
 | Option                  | Type | Default | Description                                                                                                                                                                     |
 | ----------------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -77,6 +75,26 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 | `use_all_to_all_reduce` | bool | `false` | Use all-to-all-based reduce algorithm (combine with `memcpy_send_recv`).                                                                                                        |
 | `memcpy_all_gather`     | bool | `false` | Use memcpy for all-gather operations (threads backend only). Generally gets better bandwidth utilization on PCIe and does not consume SM resources.                             |
 | `memcpy_send_recv`      | bool | `false` | Use memcpy for send/receive operations (threads backend only).                                                                                                                  |
+
+## Multi-Node Distributed Training
+
+Configuration for training across multiple machines using Ray and NCCL. See the [Multi-Node Training Guide](guides/multi-node.md) for detailed setup instructions.
+
+| Option                        | Type   | Default  | Description                                                                                                                                                |
+| ----------------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `distributed.ray_address`     | string | `"auto"` | Ray cluster address. Options: `"auto"` (connect to existing cluster), `"local"` (start local instance), `"ray://host:port"` (connect to specific head).   |
+| `distributed.num_nodes`       | int    | `1`      | Total number of nodes to use for training. Set to `> 1` to enable multi-node training.                                                                     |
+| `distributed.gpus_per_node`   | int    | `0`      | Number of GPUs per node. If `0`, uses the value from `gpus` config parameter.                                                                              |
+| `distributed.worker_output_dir` | string | `null`   | Base directory for worker-local tokenized data. Each worker creates a `node-{rank}/` subdirectory. If `null`, uses `/tmp/surogate-{run_name}/` on each node. |
+
+**Example configuration:**
+```yaml
+distributed:
+  ray_address: "auto"
+  num_nodes: 2
+  gpus_per_node: 8
+  worker_output_dir: /shared/surogate-data
+```
 
 ## Hardware Settings
 
@@ -110,31 +128,31 @@ Offloading options move tensors to host (CPU) memory to reduce GPU memory usage 
 
 | Option                    | Type | Default | Description                                                                           |
 | ------------------------- | ---- | ------- | ------------------------------------------------------------------------------------- |
-| `skip_quant_first_layers` | int  | `0`     | Skip quantization for the first N transformer layers (embedding layers kept in BF16). |
-| `skip_quant_last_layers`  | int  | `0`     | Skip quantization for the last N transformer layers (lm_head layers kept in BF16).    |
+| `skip_quant_first_layers` | int  | `0`     | Skip quantization for the first N transformer decoder layers. (embedding layers are always kept in BF16). |
+| `skip_quant_last_layers`  | int  | `0`     | Skip quantization for the last N transformer decoder layers (lm_head layers are always kept in BF16).    |
 
 ## Optimizer Settings
 
-| Option              | Type   | Default        | Description                                                                         |
-| ------------------- | ------ | -------------- | ----------------------------------------------------------------------------------- |
-| `optimizer`         | string | `"adamw_8bit"` | Optimizer type. Options: `"adamw_8bit"` (8-bit AdamW), `"normuon"` (NorMuon hybrid) |
-| `learning_rate`     | float  | `2e-4`         | The initial learning rate for the optimizer.                                        |
-| `lr_scheduler_type` | string | `"linear"`     | Learning rate schedule function: `"linear"`, `"cosine"`, or `"wsd"`.               |
-| `warmup_ratio`      | float  | `0.0`          | Ratio of total training steps used for linear warmup from 0 to `learning_rate`.     |
-| `warmup_steps`      | int    | `0`            | Number of steps for linear warmup. Overrides `warmup_ratio` if set.                 |
+| Option              | Type   | Default        | Description                                                                                      |
+| ------------------- | ------ | -------------- | ------------------------------------------------------------------------------------------------ |
+| `optimizer`         | string | `"adamw_8bit"` | Optimizer type. Options: `"adamw_8bit"` (8-bit AdamW), `"normuon"` (NorMuon hybrid)              |
+| `learning_rate`     | float  | `2e-4`         | The initial learning rate for the optimizer.                                                     |
+| `lr_scheduler_type` | string | `"linear"`     | Learning rate schedule function: `"linear"`, `"cosine"`, or `"wsd"`.                             |
+| `warmup_ratio`      | float  | `0.0`          | Ratio of total training steps used for linear warmup from 0 to `learning_rate`.                  |
+| `warmup_steps`      | int    | `0`            | Number of steps for linear warmup. Overrides `warmup_ratio` if set.                              |
 | `cooldown_steps`    | int    | `0`            | Number of steps for linear cooldown from `learning_rate` to `final_lr_fraction * learning_rate`. |
-| `final_lr_fraction` | float  | `0.0`          | Final learning rate as a fraction of the initial learning rate.                     |
-| `weight_decay`      | float  | `0.1`          | Weight decay applied to all layers except bias and LayerNorm weights.               |
-| `max_grad_norm`     | float  | `1.0`          | Maximum gradient norm for gradient clipping. `0.0` disables clipping.               |
+| `final_lr_fraction` | float  | `0.0`          | Final learning rate as a fraction of the initial learning rate.                                  |
+| `weight_decay`      | float  | `0.1`          | Weight decay applied to all layers except bias and LayerNorm weights.                            |
+| `max_grad_norm`     | float  | `1.0`          | Maximum gradient norm for gradient clipping. `0.0` disables clipping.                            |
 
 ### AdamW 8-bit Optimizer Parameters
 
 Used when `optimizer: "adamw_8bit"` (default).
 
-| Option          | Type  | Default | Description                              |
-| --------------- | ----- | ------- | ---------------------------------------- |
-| `adamw_beta1`   | float | `0.9`   | The beta1 parameter for AdamW optimizer. |
-| `adamw_beta2`   | float | `0.999` | The beta2 parameter for AdamW optimizer. |
+| Option          | Type  | Default | Description                                |
+| --------------- | ----- | ------- | ------------------------------------------ |
+| `adamw_beta1`   | float | `0.9`   | The beta1 parameter for AdamW optimizer.   |
+| `adamw_beta2`   | float | `0.999` | The beta2 parameter for AdamW optimizer.   |
 | `adamw_epsilon` | float | `1e-8`  | The epsilon parameter for AdamW optimizer. |
 
 ### NorMuon Optimizer Parameters
@@ -193,11 +211,11 @@ For pre-training or continued pre-training on raw text data.
 **Example:**
 ```yaml
 datasets:
-	- path: "HuggingFaceFW/fineweb-edu"
-		type: text
-		text_field: text
-		split: train
-		samples: 100000
+  - path: "HuggingFaceFW/fineweb-edu"
+	type: text
+	text_field: text
+	split: train
+	samples: 100000
 ```
 
 #### Instruction Dataset Options (`type: "instruction"`)
@@ -218,13 +236,13 @@ For instruction-following datasets with system/instruction/input/output format.
 **Example:**
 ```yaml
 datasets:
-	- path: "yahma/alpaca-cleaned"
-		type: instruction
-		instruction_field: instruction
-		input_field: input
-		output_field: output
-		system_prompt_type: fixed
-		system_prompt: "You are a helpful AI assistant."
+  - path: "yahma/alpaca-cleaned"
+	type: instruction
+	instruction_field: instruction
+	input_field: input
+	output_field: output
+	system_prompt_type: fixed
+	system_prompt: "You are a helpful AI assistant."
 ```
 
 #### Conversation Dataset Options (`type: "conversation"`)
@@ -241,10 +259,10 @@ For multi-turn conversational datasets in chat format.
 **Example:**
 ```yaml
 datasets:
-	- path: "HuggingFaceH4/ultrachat_200k"
-		type: conversation
-		messages_field: messages
-		split: train_sft
+  - path: "HuggingFaceH4/ultrachat_200k"
+	type: conversation
+	messages_field: messages
+	split: train_sft
 ```
 
 ## Memory Optimization Settings
@@ -302,7 +320,7 @@ Chat template settings control how conversations are formatted for training and 
 ## Logging & Reporting
 
 | Option         | Type   | Default        | Description                                                                                 |
-| -------------- | ------ | -------------- | ------------------------------------------------------------------------------------------- |
+| -------------- | ------ |f -------------- | ------------------------------------------------------------------------------------------- |
 | `report_to`    | list   | `null`         | Report results and logs to specified platforms. Options: `"wandb"`, `"aim"`.                |
 | `log_file`     | string | auto-generated | Where to save the training log. Defaults to `{output_dir}/log-{run_name}-{timestamp}.json`. |
 | `log_gpu_util` | int    | `100`          | Interval for logging GPU utilization.                                                       |
@@ -362,17 +380,17 @@ warmup_ratio: 0.03
 
 # Dataset
 datasets:
-	# Conversation dataset (most common for fine-tuning)
-	- path: "mlabonne/FineTome-100k"
-		type: conversation
-		messages_field: conversations
-		split: train
-	# Or use instruction dataset format
-	# - path: "yahma/alpaca-cleaned"
-	#   type: instruction
-	#   instruction_field: instruction
-	#   input_field: input
-	#   output_field: output
+  # Conversation dataset (most common for fine-tuning)
+  - path: "mlabonne/FineTome-100k"
+	type: conversation
+	messages_field: conversations
+	split: train
+  # Or use instruction dataset format
+  # - path: "yahma/alpaca-cleaned"
+  #   type: instruction
+  #   instruction_field: instruction
+  #   input_field: input
+  #   output_field: output
 validation_split_ratio: 0.1
 train_seed: 1234
 eval_seed: 1234
@@ -400,11 +418,3 @@ recipe: bf16
 gpus: 1
 use_cuda_graphs: true
 ```
-
----
-
-## See also
-
-- [Configuration guide](../guides/configuration.md)
-- [Back to docs index](../index.mdx)
-

@@ -419,19 +419,36 @@ void ModularLoRAWeightsManager::iterate_tensors(
 
         // MoE expert LoRA
         if (block.moe.use_grouped) {
+            // Export grouped tensors in per-expert format for PEFT compatibility
+            // Grouped tensors have shape [num_experts, ...], slice along dim 0
             auto& g = block.moe.grouped;
-            if (g.gate.has_value()) {
-                callback(prefix + ".mlp.experts.grouped.gate_proj.lora_A.weight", g.gate->A);
-                callback(prefix + ".mlp.experts.grouped.gate_proj.lora_B.weight", g.gate->B);
-            }
-            if (g.up.has_value()) {
-                callback(prefix + ".mlp.experts.grouped.up_proj.lora_A.weight", g.up->A);
-                callback(prefix + ".mlp.experts.grouped.up_proj.lora_B.weight", g.up->B);
-            }
-            if (g.down.has_value()) {
-                callback(prefix + ".mlp.experts.grouped.down_proj.lora_A.weight", g.down->A);
-                callback(prefix + ".mlp.experts.grouped.down_proj.lora_B.weight", g.down->B);
-            }
+            const int num_experts = mConfig.num_experts;
+
+            auto export_grouped_layer = [&](const std::optional<LoRAGroupedLayerWeights<TensorShard>>& layer,
+                                            const char* proj_name) {
+                if (!layer.has_value() || !layer->has_value()) return;
+                for (int e = 0; e < num_experts; ++e) {
+                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                    // Slice out expert e from dim 0: A[e,:,:] and B[e,:,:]
+                    TensorShard A_slice = TensorShard(slice(layer->A, 0, e, e + 1));
+                    TensorShard B_slice = TensorShard(slice(layer->B, 0, e, e + 1));
+                    // Remove the leading dimension of size 1 by adjusting shape
+                    // A: [1, rank, in] -> [rank, in], B: [1, out, rank] -> [out, rank]
+                    A_slice.Rank = layer->A.Rank - 1;
+                    B_slice.Rank = layer->B.Rank - 1;
+                    for (int d = 0; d < A_slice.Rank; ++d) A_slice.Sizes[d] = A_slice.Sizes[d + 1];
+                    for (int d = 0; d < B_slice.Rank; ++d) B_slice.Sizes[d] = B_slice.Sizes[d + 1];
+                    // Update global shape to match local shape (not sharded)
+                    std::copy(A_slice.Sizes.begin(), A_slice.Sizes.end(), A_slice.GlobalShape.begin());
+                    std::copy(B_slice.Sizes.begin(), B_slice.Sizes.end(), B_slice.GlobalShape.begin());
+                    callback(expert_prefix + "." + proj_name + ".lora_A.weight", A_slice);
+                    callback(expert_prefix + "." + proj_name + ".lora_B.weight", B_slice);
+                }
+            };
+
+            export_grouped_layer(g.gate, "gate_proj");
+            export_grouped_layer(g.up, "up_proj");
+            export_grouped_layer(g.down, "down_proj");
         } else {
             // MoE expert LoRA (HuggingFace naming convention: .mlp.experts.{e}.{proj})
             for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
