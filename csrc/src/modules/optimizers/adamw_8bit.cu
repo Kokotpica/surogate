@@ -904,6 +904,11 @@ void init_adamw8bit_state(
     size_t n,
     cudaStream_t stream
 ) {
+    // Guard against empty tensors - nothing to initialize
+    if (n == 0) {
+        return;
+    }
+
     const size_t num_blocks = div_ceil(n, (size_t)ADAMW8BIT_BLOCK_SIZE_INTERNAL);
     const size_t total_elements = std::max(n, num_blocks);
 
@@ -1217,6 +1222,11 @@ void adamw_update_8bit_multi_tensor(
     const float* quantiles2,
     cudaStream_t stream
 ) {
+    // Guard against empty tensors
+    if (num_tensors == 0 || total_params == 0) {
+        return;
+    }
+
     constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
@@ -1259,6 +1269,11 @@ void adamw_update_8bit_multi_tensor(
     const float* quantiles2,
     cudaStream_t stream
 ) {
+    // Guard against empty tensors
+    if (num_tensors == 0 || total_params == 0) {
+        return;
+    }
+
     constexpr int BLOCK_SIZE = ADAMW8BIT_BLOCK_SIZE_INTERNAL;
     constexpr int N_PER_TH = ADAMW8BIT_NUM_PER_THREAD;
 
