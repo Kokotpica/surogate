@@ -320,6 +320,17 @@ class NodeTrainer:
 
         # Determine if using LoRA
         use_lora = self._config.lora and self._config.lora_rank and self._config.lora_alpha and self._config.lora_target_modules
+
+        # Check for checkpoint resumption
+        self.start_step = 0
+        if self._config.resume_from_checkpoint:
+            self.start_step = _surogate.find_latest_checkpoint(self._config.checkpoint_dir)
+            if self.start_step >= 0:
+                logger.info(f"Node {self.node_rank}: Found checkpoint at step {self.start_step}")
+            else:
+                logger.warning(f"Node {self.node_rank}: No checkpoint found to resume from. Starting training from beginning.")
+                self.start_step = 0
+
         # Create the trainer with NCCL multi-node support
         if self.num_nodes > 1:
             # Synchronization barrier: ensure all nodes are ready before NCCL initialization
@@ -363,8 +374,20 @@ class NodeTrainer:
                 qlora_config=self._config.qlora_config if use_lora else None
             )
 
-        # Import weights
-        self._trainer.import_weights(model_weights_path)
+        # Load checkpoint or import weights
+        if self._config.resume_from_checkpoint and self.start_step >= 0:
+            # For LoRA models, base model weights must be imported first.
+            # The checkpoint only contains LoRA adapter weights and optimizer state,
+            # not the frozen base model weights.
+            if use_lora:
+                logger.info(f"Node {self.node_rank}: Importing base model weights for LoRA checkpoint resume...")
+                self._trainer.import_weights(model_weights_path)
+            logger.info(f"Node {self.node_rank}: Loading checkpoint from step {self.start_step}...")
+            self._trainer.load_checkpoint(str(self._config.checkpoint_dir), self.start_step)
+            logger.info(f"Node {self.node_rank}: Checkpoint loaded successfully")
+        else:
+            # Import weights from pretrained model
+            self._trainer.import_weights(model_weights_path)
 
         self.local_gpus = local_gpus
 
@@ -687,6 +710,10 @@ class RayDistributedTrainer:
             def init_trainer(self) -> None:
                 self.trainer.init_trainer()
 
+            def get_start_step(self) -> int:
+                """Get the starting step (0 for fresh training, >0 for resumed from checkpoint)."""
+                return self.trainer.start_step
+
             def train_step(self, step: int, lr: float) -> Tuple[float, float]:
                 return self.trainer.train_step(step, lr)
 
@@ -751,6 +778,10 @@ class RayDistributedTrainer:
         ray.get([t.init_trainer.remote() for t in self.node_trainers])
         logger.info("All nodes finished NCCL initialization")
 
+        # Get start step from node 0 (all nodes should have the same value)
+        start_step = ray.get(self.node_trainers[0].get_start_step.remote())
+        return start_step
+
     def train(self) -> None:
         """Run the distributed training loop."""
         ray = _get_ray()
@@ -761,7 +792,7 @@ class RayDistributedTrainer:
 
         # Setup workers
         logger.info(f"Setting up distributed training with {self.num_nodes} nodes...")
-        self._setup_workers()
+        start_step = self._setup_workers()
 
         # Calculate training parameters
         config = self._config
@@ -807,13 +838,14 @@ class RayDistributedTrainer:
         logger.info(f"  GPUs per node: {local_gpus}")
         logger.info(f"  Total GPUs: {self.num_nodes * local_gpus}")
         logger.info(f"  Tokens per step: {total_tokens_per_step}")
+        logger.info(f"  Starting from step: {start_step}")
         logger.info(f"  Max steps: {max_steps}")
 
         # Training loop
         import time
         step_start_time = time.time()
 
-        for step in range(max_steps):
+        for step in range(start_step, max_steps):
             lr = lr_schedule.get_lr(step)
 
             # Run training step on all nodes in parallel
@@ -849,14 +881,14 @@ class RayDistributedTrainer:
             step_start_time = time.time()
 
             # Periodic evaluation
-            if self.eval_files and config.eval_steps > 0 and step % config.eval_steps == 0 and step > 0:
+            if self.eval_files and config.eval_steps > 0 and step % config.eval_steps == 0 and step > start_step:
                 eval_futures = [t.validate.remote(100) for t in self.node_trainers]
                 eval_losses = ray.get(eval_futures)
                 avg_eval_loss = sum(eval_losses) / len(eval_losses)
                 logger.info(f"  Eval loss: {avg_eval_loss:.4f}")
 
             # Periodic checkpointing
-            if config.save_steps > 0 and step % config.save_steps == 0 and step > 0:
+            if config.save_steps > 0 and step % config.save_steps == 0 and step > start_step:
                 logger.info(f"Saving checkpoint at step {step}...")
                 try:
                     # Only node 0 saves (others have identical weights in data parallel)

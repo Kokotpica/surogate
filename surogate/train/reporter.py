@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import pathlib
 import json
 import sys
 from typing import List, Dict, Union, Callable, Any
@@ -52,13 +53,43 @@ def training_logger_context(config: SFTConfig):
 
             project = getattr(config, "wandb_project", None) or "Surogate"
             name = getattr(config, "wandb_name", None) or getattr(config, "run_name", None)
+
+            # When resuming from checkpoint, try to resume the existing wandb run
+            resume_mode = "allow"  # Default: create new or resume if id matches
+            run_id = getattr(config, "wandb_id", None)
+
+            checkpoint_dir = getattr(config, "checkpoint_dir", None)
+            resume_from_checkpoint = getattr(config, "resume_from_checkpoint", False)
+
+            if resume_from_checkpoint and checkpoint_dir and not run_id:
+                # Try to load run_id from checkpoint metadata if available
+                checkpoint_path = pathlib.Path(checkpoint_dir)
+                if (checkpoint_path / "wandb_id.txt").exists():
+                    try:
+                        run_id = (checkpoint_path / "wandb_id.txt").read_text().strip()
+                        resume_mode = "must"  # Force resume if we have a stored id
+                    except Exception:
+                        pass
+
             wandb_run = stack.enter_context(
                 wandb.init(
                     project=project,
                     name=name,
+                    id=run_id,
+                    resume=resume_mode,
                     config=filtered_options,
                 )
             )
+
+            # Save the run id for future resumption
+            if checkpoint_dir:
+                try:
+                    checkpoint_path = pathlib.Path(checkpoint_dir)
+                    checkpoint_path.mkdir(parents=True, exist_ok=True)
+                    (checkpoint_path / "wandb_id.txt").write_text(wandb_run.id)
+                except Exception:
+                    pass
+
             handlers.append(functools.partial(log_line_to_wandb, wandb_run))
 
         if "aim" in backends_set:
@@ -271,17 +302,45 @@ def _aim_run_context(config: SFTConfig):
 
     experiment = getattr(config, "aim_experiment", None) or "Surogate"
     repo = getattr(config, "aim_repo", None)
+    run_name = getattr(config, "aim_name", None) or getattr(config, "run_name", None)
 
     kwargs: Dict[str, Any] = {"experiment": experiment}
     if repo:
         kwargs["repo"] = repo
 
+    # When resuming from checkpoint, try to resume the existing run using stored hash
+    checkpoint_dir = getattr(config, "checkpoint_dir", None)
+    resume_from_checkpoint = getattr(config, "resume_from_checkpoint", False)
+    
+    run_hash = None
+    if resume_from_checkpoint and checkpoint_dir:
+        # Try to load run_hash from checkpoint metadata if available
+        checkpoint_path = pathlib.Path(checkpoint_dir)
+        if (checkpoint_path / "aim_run_hash.txt").exists():
+            try:
+                run_hash = (checkpoint_path / "aim_run_hash.txt").read_text().strip()
+            except Exception:
+                pass
+
+    if run_hash:
+        kwargs["run_hash"] = run_hash
+
     run = aim.Run(**kwargs)
     try:
         try:
-            run.name = getattr(config, "aim_name", None) or getattr(config, "run_name", None)
+            run.name = run_name
         except Exception:
             pass
+
+        # Save the run hash for future resumption
+        if checkpoint_dir:
+            try:
+                checkpoint_path = pathlib.Path(checkpoint_dir)
+                checkpoint_path.mkdir(parents=True, exist_ok=True)
+                (checkpoint_path / "aim_run_hash.txt").write_text(run.hash)
+            except Exception:
+                pass
+
         yield run
     finally:
         close = getattr(run, "close", None)

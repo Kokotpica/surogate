@@ -472,13 +472,19 @@ void ModularLoRAModel<Block>::initialize_multi_tensor_state(NCCLCommunicator& co
     CUDA_CHECK(cudaMemcpyAsync(state.tensor_sizes.Data, h_sizes.data(), h_sizes.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(state.state_offsets.Data, h_state_offsets.data(), h_state_offsets.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
 
-    state.state1 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state1", EAllocationType::ON_DEVICE, {(long)total_params});
-    state.state2 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state2", EAllocationType::ON_DEVICE, {(long)total_params});
-    state.absmax1 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_absmax1", EAllocationType::ON_DEVICE, {(long)state.num_blocks});
-    state.absmax2 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_absmax2", EAllocationType::ON_DEVICE, {(long)state.num_blocks});
+    // Only allocate state buffers if not already allocated (e.g., from checkpoint restore)
+    if (!state.state1.Data) {
+        state.state1 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state1", EAllocationType::ON_DEVICE, {(long)total_params});
+        state.state2 = mAllocator->allocate(ETensorDType::BYTE, "lora_adamw8bit_state2", EAllocationType::ON_DEVICE, {(long)total_params});
+        state.absmax1 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_absmax1", EAllocationType::ON_DEVICE, {(long)state.num_blocks});
+        state.absmax2 = mAllocator->allocate(ETensorDType::FP32, "lora_adamw8bit_absmax2", EAllocationType::ON_DEVICE, {(long)state.num_blocks});
+    }
 
-    init_adamw8bit_state(reinterpret_cast<unsigned char*>(state.state1.Data), reinterpret_cast<unsigned char*>(state.state2.Data),
-        state.absmax1.template get<float>(), state.absmax2.template get<float>(), total_params, stream);
+    // Only initialize state values if not restored from checkpoint
+    if (!state.values_restored) {
+        init_adamw8bit_state(reinterpret_cast<unsigned char*>(state.state1.Data), reinterpret_cast<unsigned char*>(state.state2.Data),
+            state.absmax1.template get<float>(), state.absmax2.template get<float>(), total_params, stream);
+    }
 
     state.initialized = true;
 }

@@ -56,7 +56,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         checkpoint_dir (Optional[str], defaults to None):
             Directory to save checkpoints during training. If None, defaults to `output_dir`.
         resume_from_checkpoint (Optional[bool], defaults to None):
-            Continue from checkpoint. If no number is given, uses the latest checkpoint.
+            Continue from checkpoint. Uses the latest checkpoint.
         save_steps (`int` or Optional[float], defaults to 50):
             Number of steps between saving checkpoints..
         save_total_limit (Optional[int], defaults to 5):

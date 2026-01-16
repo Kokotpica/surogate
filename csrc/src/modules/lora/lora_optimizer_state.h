@@ -119,6 +119,7 @@ private:
 // 8-bit AdamW optimizer state for LoRA weights
 struct LoRAAdamW8BitState {
     bool initialized = false;
+    bool values_restored = false;  // Set when state values loaded from checkpoint
     size_t total_params = 0;
     size_t num_blocks = 0;
     int num_tensors = 0;
@@ -146,6 +147,7 @@ struct LoRAAdamW8BitState {
 // Uses 8-bit quantized momentum + FP32 variance buffers
 struct LoRANorMuonState {
     bool initialized = false;
+    bool values_restored = false;  // Set when state values loaded from checkpoint
     size_t total_params = 0;
     size_t state_elems = 0;
     size_t num_blocks = 0;

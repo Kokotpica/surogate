@@ -31,7 +31,7 @@ ETensorDType dtype_from_str(std::string_view dtype) {
         return ETensorDType::FP8_E5M2;
     } else if(iequals_any(dtype, "E2M1", "fp4_e2m1", "F4_E2M1", "FP4", "F4", "NVFP4")) {
         return ETensorDType::FP4_E2M1;
-    } else if(iequals_any(dtype, "byte")) {
+    } else if(iequals_any(dtype, "byte", "U8", "u8", "uint8")) {
         return ETensorDType::BYTE;
     } else if(iequals_any(dtype, "FP8", "F8")) {
         throw std::runtime_error("Invalid dtype FP8: Please specify E4M3 or E5M2");
