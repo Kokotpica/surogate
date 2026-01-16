@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import glob
 import os
+import shutil
 from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -967,6 +968,8 @@ class RayDistributedTrainer:
                     results = ray.get(ready)
                     if any(results):
                         logger.info(f"Model saved to {config.output_dir}")
+                        # Copy tokenizer files from source model
+                        self._copy_tokenizer_files(config.model_dir, config.output_dir)
                     else:
                         logger.warning("Model export: all nodes returned False")
                 else:
@@ -974,6 +977,8 @@ class RayDistributedTrainer:
                     model_file = Path(config.output_dir) / "model.safetensors"
                     if model_file.exists():
                         logger.info(f"Model saved to {config.output_dir} (export timed out but file exists)")
+                        # Copy tokenizer files from source model
+                        self._copy_tokenizer_files(config.model_dir, config.output_dir)
                     else:
                         logger.warning(f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed.")
         except Exception as e:
@@ -983,6 +988,22 @@ class RayDistributedTrainer:
             logger.info("Shutting down Ray actors...")
             self.shutdown()
             logger.info("Ray actors shut down. Training complete.")
+
+    def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
+        """Copy tokenizer and vocab files from source model to output directory."""
+        from surogate.utils.logger import get_logger
+        logger = get_logger()
+        tokenizer_files = [
+            "tokenizer.json", "tokenizer_config.json",
+            "special_tokens_map.json", "vocab.json", "merges.txt"
+        ]
+        src_path = Path(src_dir)
+        dst_path = Path(dst_dir)
+        for filename in tokenizer_files:
+            src = src_path / filename
+            if src.exists():
+                shutil.copy(src, dst_path / filename)
+                logger.info(f"Copied {filename}")
 
     def shutdown(self) -> None:
         """Shutdown Ray actors and cleanup resources."""

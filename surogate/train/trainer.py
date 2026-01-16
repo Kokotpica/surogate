@@ -1,3 +1,4 @@
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -151,6 +152,20 @@ class SurogateTrainerWrapper():
             schedule_type=config.lr_scheduler_type
         )
 
+    def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
+        """Copy tokenizer and vocab files from source model to output directory."""
+        tokenizer_files = [
+            "tokenizer.json", "tokenizer_config.json",
+            "special_tokens_map.json", "vocab.json", "merges.txt"
+        ]
+        src_path = Path(src_dir)
+        dst_path = Path(dst_dir)
+        for filename in tokenizer_files:
+            src = src_path / filename
+            if src.exists():
+                shutil.copy(src, dst_path / filename)
+                logger.info(f"Copied {filename}")
+
     def train(self):
         with training_logger_context(self.config) as train_logger:
             # Log dataset information
@@ -227,6 +242,8 @@ class SurogateTrainerWrapper():
             else:
                 logger.info(f"Saving model to {self.config.output_dir}...")
                 self.trainer.export_model(str(self.config.output_dir))
+                # Copy tokenizer files from source model
+                self._copy_tokenizer_files(self.config.model_dir, self.config.output_dir)
                 logger.info("done")
                 # Generate training plot in output directory
                 generate_training_plot(self.config.log_file, Path(self.config.output_dir) / "training_plot.png")
