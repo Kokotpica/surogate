@@ -32,12 +32,7 @@ void ModularTransformerModel<Block>::initialize_optimizer_state(cudaStream_t str
     // Count final norm parameters
     add_tensor(mWeights->get_master_final_norm().nelem());
 
-    // Count LM head parameters (if not tied)
-    if (!mConfig.TiedWordEmbeddings) {
-        add_tensor(mWeights->get_master_lm_head().nelem());
-    }
-
-    // Count block parameters
+    // Count block parameters (must match order in update_adamw_8bit)
     for (int i = 0; i < mConfig.NumLayers; ++i) {
         mWeights->fetch_master_block(i, stream);
         auto& bw = mWeights->get_master_block(i, stream);
@@ -54,13 +49,36 @@ void ModularTransformerModel<Block>::initialize_optimizer_state(cudaStream_t str
             if constexpr (requires { bw.attention.out_weight; }) {
                 add_tensor(bw.attention.out_weight.nelem());
             }
+            // QK norms (optional, present in some architectures like Qwen3MoE)
+            if constexpr (requires { bw.attention.q_norm_weight; bw.attention.k_norm_weight; }) {
+                if (bw.attention.q_norm_weight.has_value()) {
+                    add_tensor(bw.attention.q_norm_weight->nelem());
+                }
+                if (bw.attention.k_norm_weight.has_value()) {
+                    add_tensor(bw.attention.k_norm_weight->nelem());
+                }
+            }
         }
         if constexpr (has_mlp_weights<typename Block::Weights>::value) {
             add_tensor(bw.mlp_up_weight.nelem());
             add_tensor(bw.mlp_down_weight.nelem());
         }
 
+        // MoE weights (router + experts)
+        if constexpr (has_moe_weights<typename Block::Weights>::value) {
+            add_tensor(bw.router.gate.nelem());
+            if (bw.experts.use_batched) {
+                add_tensor(bw.experts.gate_up_proj.nelem());
+                add_tensor(bw.experts.down_proj.nelem());
+            }
+        }
+
         mWeights->release_master_block(i, stream, stream);
+    }
+
+    // Count LM head parameters (if not tied) - must be after blocks to match update order
+    if (!mConfig.TiedWordEmbeddings) {
+        add_tensor(mWeights->get_master_lm_head().nelem());
     }
 
     state.total_params = total_params;

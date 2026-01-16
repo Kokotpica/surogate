@@ -56,6 +56,24 @@ TrainingRunLogger::~TrainingRunLogger()
 }
 
 /**
+ * @brief Sanitize a float value for JSON serialization.
+ *
+ * Converts infinity and NaN to JSON-compatible string representations.
+ *
+ * @param value Float value to sanitize.
+ * @return String representation suitable for JSON (quoted if inf/nan, otherwise numeric).
+ */
+std::string sanitize_float_for_json(float value) {
+    if (std::isnan(value)) {
+        return "\"nan\"";
+    } else if (std::isinf(value)) {
+        return value > 0 ? "\"inf\"" : "\"-inf\"";
+    } else {
+        return fmt::format("{}", value);
+    }
+}
+
+/**
  * @brief Format a token count as a human-readable short string (k/M/B/T).
  *
  * Uses integer or one-decimal formatting depending on magnitude.
@@ -287,7 +305,8 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
         fflush(stdout);
     }
     log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}}})",
-        std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms, norm, loss, lr ));
+        std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms,
+        sanitize_float_for_json(norm), sanitize_float_for_json(loss), sanitize_float_for_json(lr) ));
 }
 
 /**
@@ -381,8 +400,11 @@ void TrainingRunLogger::log_step(int step, float epoch, int step_tokens, int dur
                step, progress, trend, loss, norm_flag, norm, tps / 1000.0f, duration_ms, moe_str.c_str(), sol_str.c_str(), eta_str.c_str());
         fflush(stdout);
     }
-    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {:.6f}, "moe_z_loss": {:.6f}, "moe_load_imbalance": {:.4f}, "moe_expert_utilization": {:.4f}}})",
-        std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms, norm, loss, lr, moe_aux_loss, moe_z_loss, moe_load_imbalance, moe_expert_utilization));
+    log_line(fmt::format(R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {}, "moe_z_loss": {}, "moe_load_imbalance": {}, "moe_expert_utilization": {}}})",
+        std::chrono::system_clock::now(), step, epoch, step_tokens, duration_ms,
+        sanitize_float_for_json(norm), sanitize_float_for_json(loss), sanitize_float_for_json(lr),
+        sanitize_float_for_json(moe_aux_loss), sanitize_float_for_json(moe_z_loss),
+        sanitize_float_for_json(moe_load_imbalance), sanitize_float_for_json(moe_expert_utilization)));
 }
 
 /**
@@ -414,7 +436,7 @@ void TrainingRunLogger::log_eval(int step, float epoch, int eval_tokens, int dur
     mTotalTrainingLoss = 0;
     mTotalTrainingSteps = 0;
     log_line(fmt::format(R"(  {{"log": "eval", "time": "{}", "step": {}, "epoch": {}, "eval_tokens": {}, "duration_ms": {}, "loss": {}}})",
-        std::chrono::system_clock::now(), step, epoch, eval_tokens, duration_ms, loss ));
+        std::chrono::system_clock::now(), step, epoch, eval_tokens, duration_ms, sanitize_float_for_json(loss) ));
 }
 
 /**
@@ -432,8 +454,10 @@ void TrainingRunLogger::log_eval(int step, float epoch, int eval_tokens, int dur
 void TrainingRunLogger::log_moe_stats(int step, float aux_loss, float z_loss, float expert_utilization, float load_imbalance)
 {
     if (mRank != 0) return;
-    log_line(fmt::format(R"(  {{"log": "moe", "time": "{}", "step": {}, "aux_loss": {:.6f}, "z_loss": {:.6f}, "expert_utilization": {:.4f}, "load_imbalance": {:.4f}}})",
-        std::chrono::system_clock::now(), step, aux_loss, z_loss, expert_utilization, load_imbalance));
+    log_line(fmt::format(R"(  {{"log": "moe", "time": "{}", "step": {}, "aux_loss": {}, "z_loss": {}, "expert_utilization": {}, "load_imbalance": {}}})",
+        std::chrono::system_clock::now(), step,
+        sanitize_float_for_json(aux_loss), sanitize_float_for_json(z_loss),
+        sanitize_float_for_json(expert_utilization), sanitize_float_for_json(load_imbalance)));
 }
 
 /**

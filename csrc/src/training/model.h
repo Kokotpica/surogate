@@ -134,6 +134,12 @@ public:
     //! Load LoRA adapter from a checkpoint directory (no-op for non-LoRA models)
     virtual void load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {}
 
+    //! Prepare optimizer state buffers for checkpoint loading.
+    //! Must be called before loading optimizer state from safetensors files.
+    //! This allocates state buffers based on model structure so they can receive checkpoint data.
+    //! Default no-op for models that don't need pre-allocation.
+    virtual void prepare_optimizer_for_checkpoint_load() {}
+
     //! Get the model type identifier
     virtual std::string_view model_type() const = 0;
 

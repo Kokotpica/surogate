@@ -114,6 +114,25 @@ void ModularTransformerModel<Block>::export_weights(const std::string& file_name
 template<typename Block>
 void ModularTransformerModel<Block>::on_restore_checkpoint(NCCLCommunicator& comm) {
     mWeights->synchronize_absmax(comm);
+    // Mark optimizer state as initialized after restore (values came from checkpoint)
+    if (mAdamW8BitState && mAdamW8BitState->state1.Data) {
+        mAdamW8BitState->initialized = true;
+    }
+    if (mNorMuonState && mNorMuonState->momentum_state.Data) {
+        mNorMuonState->initialized = true;
+    }
+}
+
+template<typename Block>
+void ModularTransformerModel<Block>::prepare_optimizer_for_checkpoint_load() {
+    // Pre-allocate optimizer state buffers so checkpoint loading can fill them.
+    // Uses the run state's main stream if available, otherwise the default stream.
+    if (mAdamW8BitState && !mAdamW8BitState->initialized) {
+        cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
+        initialize_optimizer_state(stream);
+    }
+    // Note: NorMuon state would need similar handling if we support checkpointing for it.
+    // Currently NorMuon is lazily initialized in update_normuon().
 }
 
 template<typename Block>

@@ -376,12 +376,26 @@ class NodeTrainer:
 
         # Load checkpoint or import weights
         if self._config.resume_from_checkpoint and self.start_step >= 0:
-            # For LoRA models, base model weights must be imported first.
-            # The checkpoint only contains LoRA adapter weights and optimizer state,
-            # not the frozen base model weights.
+            # Base model weights must be imported first to initialize the weight structure.
+            # For LoRA: checkpoint only contains adapter weights + optimizer state, so we
+            #           need the original base model weights.
+            # For FFT/upcycle: checkpoint contains trained weights. We import from the
+            #                  checkpoint's model.safetensors to handle upcycled models
+            #                  where config.model_dir points to a different architecture.
             if use_lora:
-                logger.info(f"Node {self.node_rank}: Importing base model weights for LoRA checkpoint resume...")
-                self._trainer.import_weights(model_weights_path)
+                # LoRA: use base model weights
+                weights_path = model_weights_path
+            else:
+                # FFT/upcycle: use checkpoint's saved weights (handles architecture changes)
+                checkpoint_dir = Path(self._config.checkpoint_dir) / f"step_{self.start_step:08d}"
+                checkpoint_weights = checkpoint_dir / "model.safetensors"
+                if checkpoint_weights.exists():
+                    weights_path = str(checkpoint_weights)
+                else:
+                    # Fallback to base model if checkpoint doesn't have model.safetensors
+                    weights_path = model_weights_path
+            logger.info(f"Node {self.node_rank}: Importing base model weights from {weights_path}...")
+            self._trainer.import_weights(weights_path)
             logger.info(f"Node {self.node_rank}: Loading checkpoint from step {self.start_step}...")
             self._trainer.load_checkpoint(str(self._config.checkpoint_dir), self.start_step)
             logger.info(f"Node {self.node_rank}: Checkpoint loaded successfully")

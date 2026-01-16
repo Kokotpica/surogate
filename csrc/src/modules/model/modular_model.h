@@ -5,6 +5,8 @@
 #ifndef SUROGATE_SRC_MODULES_MODEL_MODULAR_MODEL_H
 #define SUROGATE_SRC_MODULES_MODEL_MODULAR_MODEL_H
 
+#include <optional>
+
 #include "modular_model_fwd.h"
 
 namespace modules {
@@ -60,6 +62,7 @@ public:
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
     void export_weights(const std::string& file_name, NCCLCommunicator& comm) override;
     void on_restore_checkpoint(NCCLCommunicator& comm) override;
+    void prepare_optimizer_for_checkpoint_load() override;
 
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
@@ -388,6 +391,14 @@ private:
 
     // Optimizer RNG
     std::minstd_rand mOptimizerRNG;
+
+    // Mutable containers for checkpoint access (lazily created in accessors)
+    // These wrap pointers to the optimizer state tensors for ITensorContainer interface.
+    // Using optional with concrete types since ITensorContainer has a protected destructor.
+    mutable std::optional<detail::AdamW8BitMomentumContainer> mAdamWMomentumContainer;
+    mutable std::optional<detail::AdamW8BitVarianceContainer> mAdamWVarianceContainer;
+    mutable std::optional<detail::NorMuonMomentumContainer> mNorMuonMomentumContainer;
+    mutable std::optional<detail::NorMuonVarianceContainer> mNorMuonVarianceContainer;
 
     // Helper: create module context from run state
     ModuleContext create_context(int B, int T);

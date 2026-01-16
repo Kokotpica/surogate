@@ -287,6 +287,150 @@ public:
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>&) override {}
 };
 
+namespace detail {
+
+/**
+ * @brief Container exposing 8-bit AdamW first moment (state1 + absmax1) for checkpointing
+ */
+class AdamW8BitMomentumContainer final : public ITensorContainer {
+public:
+    AdamW8BitMomentumContainer(Tensor* state1, Tensor* absmax1)
+        : mState1(state1), mAbsmax1(absmax1) {}
+
+    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
+        if (!mState1 || !mState1->Data) return;
+        callback("adamw8bit.state1", TensorShard(*mState1));
+        if (mAbsmax1 && mAbsmax1->Data) {
+            callback("adamw8bit.absmax1", TensorShard(*mAbsmax1));
+        }
+    }
+
+    void update_pointers(Tensor* state1, Tensor* absmax1) {
+        mState1 = state1;
+        mAbsmax1 = absmax1;
+    }
+
+private:
+    Tensor* mState1;
+    Tensor* mAbsmax1;
+};
+
+/**
+ * @brief Container exposing 8-bit AdamW second moment (state2 + absmax2) for checkpointing
+ */
+class AdamW8BitVarianceContainer final : public ITensorContainer {
+public:
+    AdamW8BitVarianceContainer(Tensor* state2, Tensor* absmax2)
+        : mState2(state2), mAbsmax2(absmax2) {}
+
+    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
+        if (!mState2 || !mState2->Data) return;
+        callback("adamw8bit.state2", TensorShard(*mState2));
+        if (mAbsmax2 && mAbsmax2->Data) {
+            callback("adamw8bit.absmax2", TensorShard(*mAbsmax2));
+        }
+    }
+
+    void update_pointers(Tensor* state2, Tensor* absmax2) {
+        mState2 = state2;
+        mAbsmax2 = absmax2;
+    }
+
+private:
+    Tensor* mState2;
+    Tensor* mAbsmax2;
+};
+
+/**
+ * @brief Container exposing NorMuon momentum state for checkpointing
+ *
+ * Includes: AdamW state for 1D params + NorMuon momentum for 2D params
+ */
+class NorMuonMomentumContainer final : public ITensorContainer {
+public:
+    NorMuonMomentumContainer(Tensor* adamw_state1, Tensor* adamw_absmax1,
+                              Tensor* normuon_momentum, Tensor* normuon_absmax)
+        : mAdamwState1(adamw_state1), mAdamwAbsmax1(adamw_absmax1),
+          mNormuonMomentum(normuon_momentum), mNormuonAbsmax(normuon_absmax) {}
+
+    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
+        // AdamW momentum for 1D parameters
+        if (mAdamwState1 && mAdamwState1->Data) {
+            callback("normuon.adamw_state1", TensorShard(*mAdamwState1));
+            if (mAdamwAbsmax1 && mAdamwAbsmax1->Data) {
+                callback("normuon.adamw_absmax1", TensorShard(*mAdamwAbsmax1));
+            }
+        }
+        // NorMuon momentum for 2D parameters
+        if (mNormuonMomentum && mNormuonMomentum->Data) {
+            callback("normuon.momentum_state", TensorShard(*mNormuonMomentum));
+            if (mNormuonAbsmax && mNormuonAbsmax->Data) {
+                callback("normuon.momentum_absmax", TensorShard(*mNormuonAbsmax));
+            }
+        }
+    }
+
+    void update_pointers(Tensor* adamw_state1, Tensor* adamw_absmax1,
+                        Tensor* normuon_momentum, Tensor* normuon_absmax) {
+        mAdamwState1 = adamw_state1;
+        mAdamwAbsmax1 = adamw_absmax1;
+        mNormuonMomentum = normuon_momentum;
+        mNormuonAbsmax = normuon_absmax;
+    }
+
+private:
+    Tensor* mAdamwState1;
+    Tensor* mAdamwAbsmax1;
+    Tensor* mNormuonMomentum;
+    Tensor* mNormuonAbsmax;
+};
+
+/**
+ * @brief Container exposing NorMuon variance state for checkpointing
+ *
+ * Includes: AdamW variance for 1D params + NorMuon variance buffers for 2D params
+ */
+class NorMuonVarianceContainer final : public ITensorContainer {
+public:
+    NorMuonVarianceContainer(Tensor* adamw_state2, Tensor* adamw_absmax2,
+                              std::vector<Tensor>* variance_buffers)
+        : mAdamwState2(adamw_state2), mAdamwAbsmax2(adamw_absmax2),
+          mVarianceBuffers(variance_buffers) {}
+
+    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override {
+        // AdamW variance for 1D parameters
+        if (mAdamwState2 && mAdamwState2->Data) {
+            callback("normuon.adamw_state2", TensorShard(*mAdamwState2));
+            if (mAdamwAbsmax2 && mAdamwAbsmax2->Data) {
+                callback("normuon.adamw_absmax2", TensorShard(*mAdamwAbsmax2));
+            }
+        }
+        // NorMuon variance buffers for 2D parameters (one per weight)
+        if (mVarianceBuffers) {
+            for (size_t i = 0; i < mVarianceBuffers->size(); ++i) {
+                auto& buf = (*mVarianceBuffers)[i];
+                if (buf.Data) {
+                    callback(fmt::format("normuon.variance_{}", i), TensorShard(buf));
+                }
+            }
+        }
+    }
+
+    void update_pointers(Tensor* adamw_state2, Tensor* adamw_absmax2,
+                        std::vector<Tensor>* variance_buffers) {
+        mAdamwState2 = adamw_state2;
+        mAdamwAbsmax2 = adamw_absmax2;
+        mVarianceBuffers = variance_buffers;
+    }
+
+private:
+    Tensor* mAdamwState2;
+    Tensor* mAdamwAbsmax2;
+    std::vector<Tensor>* mVarianceBuffers;
+};
+
+} // namespace detail
+
 } // namespace modules
 
 #endif // SUROGATE_SRC_MODULES_MODEL_MODULAR_MODEL_FWD_H

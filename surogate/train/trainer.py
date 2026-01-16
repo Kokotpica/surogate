@@ -58,15 +58,30 @@ class SurogateTrainerWrapper():
                     lora_config=config.lora_config,
                     qlora_config=config.qlora_config
                 )
-                # For LoRA models, base model weights must be imported first.
-                # The checkpoint only contains LoRA adapter weights and optimizer state,
-                # not the frozen base model weights.
+                # Base model weights must be imported first to initialize the weight structure.
+                # For LoRA: checkpoint only contains adapter weights + optimizer state, so we
+                #           need the original base model weights.
+                # For FFT/upcycle: checkpoint contains trained weights. We import from the
+                #                  checkpoint's model.safetensors to handle upcycled models
+                #                  where config.model_dir points to a different architecture.
                 if config.lora:
-                    model_weights_path = str(Path(config.model_dir) / "model.safetensors")
-                    if not Path(model_weights_path).exists():
-                        model_weights_path = config.model_dir
-                    logger.info(f"Importing base model weights from {model_weights_path}...")
-                    self.trainer.import_weights(model_weights_path)
+                    # LoRA: use base model weights
+                    base_weights_path = str(Path(config.model_dir) / "model.safetensors")
+                    if not Path(base_weights_path).exists():
+                        base_weights_path = config.model_dir
+                else:
+                    # FFT/upcycle: use checkpoint's saved weights (handles architecture changes)
+                    checkpoint_dir = Path(config.checkpoint_dir) / f"step_{self.start_step:08d}"
+                    checkpoint_weights = checkpoint_dir / "model.safetensors"
+                    if checkpoint_weights.exists():
+                        base_weights_path = str(checkpoint_weights)
+                    else:
+                        # Fallback to base model if checkpoint doesn't have model.safetensors
+                        base_weights_path = str(Path(config.model_dir) / "model.safetensors")
+                        if not Path(base_weights_path).exists():
+                            base_weights_path = config.model_dir
+                logger.info(f"Importing base model weights from {base_weights_path}...")
+                self.trainer.import_weights(base_weights_path)
                 logger.info(f"Loading checkpoint from step {self.start_step}...")
                 self.trainer.load_checkpoint(str(config.checkpoint_dir), self.start_step)
             else:

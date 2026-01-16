@@ -1,6 +1,7 @@
 #pragma once
 
 // Accessors + simple methods
+// Note: Container classes (AdamW8BitMomentumContainer, etc.) are defined in modular_model_fwd.h
 
 template<typename Block>
 float ModularTransformerModel<Block>::get_loss() const {
@@ -31,28 +32,72 @@ ITensorContainer& ModularTransformerModel<Block>::weights() {
 
 template<typename Block>
 ITensorContainer& ModularTransformerModel<Block>::opt_momentum() {
-    // 8-bit optimizer doesn't expose state as ITensorContainer
+    // Return appropriate container based on which optimizer is active
+    if (mNorMuonState && mNorMuonState->initialized) {
+        // NorMuon optimizer: return combined AdamW + NorMuon momentum
+        if (!mNorMuonMomentumContainer) {
+            mNorMuonMomentumContainer.emplace(
+                &mNorMuonState->adamw_state1, &mNorMuonState->adamw_absmax1,
+                &mNorMuonState->momentum_state, &mNorMuonState->momentum_absmax);
+        } else {
+            mNorMuonMomentumContainer->update_pointers(
+                &mNorMuonState->adamw_state1, &mNorMuonState->adamw_absmax1,
+                &mNorMuonState->momentum_state, &mNorMuonState->momentum_absmax);
+        }
+        return *mNorMuonMomentumContainer;
+    } else if (mAdamW8BitState && mAdamW8BitState->initialized) {
+        // 8-bit AdamW optimizer
+        if (!mAdamWMomentumContainer) {
+            mAdamWMomentumContainer.emplace(&mAdamW8BitState->state1, &mAdamW8BitState->absmax1);
+        } else {
+            mAdamWMomentumContainer->update_pointers(&mAdamW8BitState->state1, &mAdamW8BitState->absmax1);
+        }
+        return *mAdamWMomentumContainer;
+    }
+    // No optimizer state initialized
     static EmptyTensorContainer empty;
     return empty;
 }
 
 template<typename Block>
 ITensorContainer& ModularTransformerModel<Block>::opt_momentum_scales() {
-    // 8-bit optimizer doesn't use FP8 scales
+    // 8-bit quantized optimizers store scales in absmax tensors (included in momentum/variance)
     static EmptyTensorContainer empty;
     return empty;
 }
 
 template<typename Block>
 ITensorContainer& ModularTransformerModel<Block>::opt_variance() {
-    // 8-bit optimizer doesn't expose state as ITensorContainer
+    // Return appropriate container based on which optimizer is active
+    if (mNorMuonState && mNorMuonState->initialized) {
+        // NorMuon optimizer: return combined AdamW variance + NorMuon variance buffers
+        if (!mNorMuonVarianceContainer) {
+            mNorMuonVarianceContainer.emplace(
+                &mNorMuonState->adamw_state2, &mNorMuonState->adamw_absmax2,
+                &mNorMuonState->variance_buffers);
+        } else {
+            mNorMuonVarianceContainer->update_pointers(
+                &mNorMuonState->adamw_state2, &mNorMuonState->adamw_absmax2,
+                &mNorMuonState->variance_buffers);
+        }
+        return *mNorMuonVarianceContainer;
+    } else if (mAdamW8BitState && mAdamW8BitState->initialized) {
+        // 8-bit AdamW optimizer
+        if (!mAdamWVarianceContainer) {
+            mAdamWVarianceContainer.emplace(&mAdamW8BitState->state2, &mAdamW8BitState->absmax2);
+        } else {
+            mAdamWVarianceContainer->update_pointers(&mAdamW8BitState->state2, &mAdamW8BitState->absmax2);
+        }
+        return *mAdamWVarianceContainer;
+    }
+    // No optimizer state initialized
     static EmptyTensorContainer empty;
     return empty;
 }
 
 template<typename Block>
 ITensorContainer& ModularTransformerModel<Block>::opt_variance_scales() {
-    // 8-bit optimizer doesn't use FP8 scales
+    // 8-bit quantized optimizers store scales in absmax tensors (included in momentum/variance)
     static EmptyTensorContainer empty;
     return empty;
 }
