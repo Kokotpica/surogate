@@ -182,6 +182,10 @@ void load_checkpoint(std::string source, int step, IModel& model, DataLoader* lo
     // weights
     load_safetensors(source + fmt::format("/weights.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.weights(), false);
 
+    // Pre-allocate optimizer state buffers before loading.
+    // This ensures the 8-bit AdamW state tensors are allocated so load_safetensors can fill them.
+    model.prepare_optimizer_for_checkpoint_load();
+
     // load optimizer shards
     load_safetensors(source + fmt::format("/adam.m.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_momentum(), false);
     load_safetensors(source + fmt::format("/adam.v.shard_{:03}_of_{:03}.safetensors", comm.rank(), comm.world_size()), model.opt_variance(), false);
